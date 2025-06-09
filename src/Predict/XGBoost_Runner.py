@@ -7,17 +7,18 @@ from colorama import Fore, Style, init, deinit
 from src.Utils import Expected_Value
 from src.Utils import Kelly_Criterion as kc
 
-
-# from src.Utils.Dictionaries import team_index_current
-# from src.Utils.tools import get_json_data, to_data_frame, get_todays_games_json, create_todays_games
 init()
-xgb_ml = xgb.Booster()
-xgb_ml.load_model('Models/XGBoost_Models/XGBoost_68.7%_ML-4.json')
-xgb_uo = xgb.Booster()
-xgb_uo.load_model('Models/XGBoost_Models/XGBoost_53.7%_UO-9.json')
-
 
 def xgb_runner(data, todays_games_uo, frame_ml, games, home_team_odds, away_team_odds, kelly_criterion):
+    # Load the BETTER models
+    xgb_ml = xgb.Booster()
+    xgb_ml.load_model('Models/XGBoost_Models/XGBoost_68.9%_ML-3.json')  # Changed from 68.7% to 68.9%
+    xgb_uo = xgb.Booster()
+    xgb_uo.load_model('Models/XGBoost_Models/XGBoost_54.8%_UO-8.json')  # Changed from 53.7% to 54.8%
+    
+    # ... rest of your code stays the same
+
+    
     ml_predictions_array = []
 
     for row in data:

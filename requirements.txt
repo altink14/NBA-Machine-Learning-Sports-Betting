@@ -1,11 +1,29 @@
-colorama==0.4.6
-pandas==2.1.1
-sbrscrape==0.0.10
-tensorflow==2.14.0
-xgboost==2.0.0
-tqdm==4.66.1
-flask==3.0.0
-scikit-learn==1.3.1
-toml==0.10.2
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
+# requirements.txt
+
+# Core FastAPI and Server
+fastapi
+uvicorn[standard]
+python-dotenv
+
+# Data and ML libraries
+pandas
+numpy
+scikit-learn
+xgboost
+
+# External APIs and Services
+sbrscrape
+google-generativeai
+requests
+python-multipart
+
+# Utilities
+colorama
+tqdm
+toml
+
+# --- Temporarily Disabled ---
+# The tensorflow package requires complex C++ compilers on Windows.
+# It has been commented out to allow the server to start.
+# The application is designed to handle this by disabling the Neural Network model.
+# tensorflow==2.14.0

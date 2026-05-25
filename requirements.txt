@@ -16,6 +16,7 @@ sbrscrape
 google-generativeai
 requests
 python-multipart
+basketball-reference-scraper
 
 # Utilities
 colorama

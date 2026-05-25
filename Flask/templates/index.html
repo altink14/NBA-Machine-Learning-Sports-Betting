@@ -537,6 +537,26 @@
                 <i class="fas fa-sync-alt me-1"></i> Refresh Data
             </button>
         </div>
+
+        <!-- Navigation Tabs -->
+        <div class="mb-4">
+            <ul class="nav nav-pills" id="mainTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active rounded-pill px-4 py-2 me-2" id="picks-tab" data-bs-toggle="pill" data-bs-target="#picks-content" type="button" role="tab" aria-controls="picks-content" aria-selected="true">
+                        <i class="fas fa-basketball me-1"></i> Today's Picks
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link rounded-pill px-4 py-2" id="dashboard-tab" data-bs-toggle="pill" data-bs-target="#dashboard-content" type="button" role="tab" aria-controls="dashboard-content" aria-selected="false">
+                        <i class="fas fa-table me-1"></i> Standings & Metrics
+                    </button>
+                </li>
+            </ul>
+        </div>
+
+        <div class="tab-content" id="mainTabsContent">
+            <!-- TAB 1: TODAY'S PICKS -->
+            <div class="tab-pane fade show active" id="picks-content" role="tabpanel" aria-labelledby="picks-tab">
         
         <!-- Insights Section -->
         <div class="insights-section mb-5">
@@ -609,7 +629,7 @@
                     </div>
 
                     <!-- Away Team -->
-                    <div class="team-row mb-2">
+                    <div class="team-row mb-2 cursor-pointer" data-bs-toggle="modal" data-bs-target="#modal-{{ game['away_team']|replace(' ', '-')|lower }}">
                         <div class="confidence-indicator" id="away-confidence-{{ loop.index }}"></div>
                         <div class="team-logo-wrapper">
                             <img src="/static/img/team-logos/{{ game['away_team']|lower|replace(' ', '_') }}.png" 
@@ -642,7 +662,7 @@
                     </div>
 
                     <!-- Home Team -->
-                    <div class="team-row mb-3">
+                    <div class="team-row mb-3 cursor-pointer" data-bs-toggle="modal" data-bs-target="#modal-{{ game['home_team']|replace(' ', '-')|lower }}">
                         <div class="confidence-indicator" id="home-confidence-{{ loop.index }}"></div>
                         <div class="team-logo-wrapper">
                             <img src="/static/img/team-logos/{{ game['home_team']|lower|replace(' ', '_') }}.png" 
@@ -721,18 +741,119 @@
                     
                     <!-- Game actions -->
                     <div class="d-grid gap-2 d-md-flex justify-content-md-end mt-3">
-                        <a href="/team/{{ game['away_team'] }}" class="btn btn-sm btn-outline-light stats-btn">
-                            <i class="fas fa-chart-line me-1"></i> Stats
-                        </a>
-                        <a href="/analysis/{{ game['home_team'] }}/{{ game['away_team'] }}" class="btn btn-sm btn-primary-gradient analysis-btn">
-                            <i class="fas fa-search me-1"></i> Analysis
-                        </a>
+                        <button class="btn btn-sm btn-outline-light stats-btn" data-bs-toggle="modal" data-bs-target="#modal-{{ game['away_team']|replace(' ', '-')|lower }}">
+                            <i class="fas fa-users me-1"></i> {{ game['away_team']|truncate(10, true, '') }} Roster
+                        </button>
+                        <button class="btn btn-sm btn-outline-light stats-btn" data-bs-toggle="modal" data-bs-target="#modal-{{ game['home_team']|replace(' ', '-')|lower }}">
+                            <i class="fas fa-users me-1"></i> {{ game['home_team']|truncate(10, true, '') }} Roster
+                        </button>
+                        <button class="btn btn-sm btn-primary-gradient matchup-analysis-btn" data-home="{{ game['home_team'] }}" data-away="{{ game['away_team'] }}">
+                            <i class="fas fa-chart-bar me-1"></i> Matchup Analysis
+                        </button>
                     </div>
                 </div>
             </div>
             {% endfor %}
         </div>
-        
+            </div> <!-- End of TAB 1 picks-content -->
+
+            <!-- TAB 2: STANDINGS & METRICS -->
+            <div class="tab-pane fade" id="dashboard-content" role="tabpanel" aria-labelledby="dashboard-tab">
+                <div class="insights-section mb-4 p-4">
+                    <h3 class="h4 fw-bold mb-4" style="color: var(--text-primary);">🏀 NBA Conference Standings</h3>
+                    <div class="row">
+                        <!-- Eastern Conference -->
+                        <div class="col-lg-6 mb-4">
+                            <h4 class="h5 fw-bold mb-3 text-primary border-bottom border-gray-700 pb-2">Eastern Conference</h4>
+                            <div class="table-responsive">
+                                <table class="table table-hover text-white align-middle" style="font-size: 0.9rem;">
+                                    <thead>
+                                        <tr>
+                                            <th>Team</th>
+                                            <th>W</th>
+                                            <th>L</th>
+                                            <th>W%</th>
+                                            <th>GB</th>
+                                            <th>PPG</th>
+                                            <th>OPPG</th>
+                                            <th>SRS</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="east-standings-body">
+                                        <tr>
+                                            <td colspan="8" class="text-center py-4 text-secondary">
+                                                <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                                                Loading standings...
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <!-- Western Conference -->
+                        <div class="col-lg-6 mb-4">
+                            <h4 class="h5 fw-bold mb-3 text-success border-bottom border-gray-700 pb-2">Western Conference</h4>
+                            <div class="table-responsive">
+                                <table class="table table-hover text-white align-middle" style="font-size: 0.9rem;">
+                                    <thead>
+                                        <tr>
+                                            <th>Team</th>
+                                            <th>W</th>
+                                            <th>L</th>
+                                            <th>W%</th>
+                                            <th>GB</th>
+                                            <th>PPG</th>
+                                            <th>OPPG</th>
+                                            <th>SRS</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="west-standings-body">
+                                        <tr>
+                                            <td colspan="8" class="text-center py-4 text-secondary">
+                                                <div class="spinner-border spinner-border-sm text-success me-2" role="status"></div>
+                                                Loading standings...
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Advanced Ratings Dashboard -->
+                <div class="insights-section mb-4 p-4">
+                    <h3 class="h4 fw-bold mb-4" style="color: var(--text-primary);"><i class="fas fa-chart-line me-1 text-primary"></i> Team Advanced Ratings</h3>
+                    <div class="table-responsive">
+                        <table class="table table-hover text-white align-middle" style="font-size: 0.9rem;">
+                            <thead>
+                                <tr>
+                                    <th>Rank</th>
+                                    <th>Team</th>
+                                    <th>Offensive Rating</th>
+                                    <th>Defensive Rating</th>
+                                    <th>Net Rating</th>
+                                    <th>Pace</th>
+                                    <th>True Shooting %</th>
+                                    <th>Opponent eFG%</th>
+                                    <th>SRS</th>
+                                </tr>
+                            </thead>
+                            <tbody id="team-ratings-body">
+                                <tr>
+                                    <td colspan="9" class="text-center py-4 text-secondary">
+                                        <div class="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                                        Loading advanced metrics...
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div> <!-- End of TAB 2 dashboard-content -->
+        </div> <!-- End of tab-content mainTabsContent -->
+
         <!-- Model Information -->
         <div class="model-info text-center mt-5">
             <p class="mb-1">AI model trained on NBA data from 2007-08 season to present</p>
@@ -763,6 +884,77 @@
             </div>
         </div>
     </footer>
+
+    <!-- Matchup Analysis Modal -->
+    <div class="modal fade" id="matchup-modal" tabindex="-1" aria-labelledby="matchup-modal-label" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content text-white" style="background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(15px); border: 1px solid rgba(255,255,255,0.1); border-radius: 20px;">
+                <div class="modal-header border-bottom border-gray-700">
+                    <h5 class="modal-title fw-bold" id="matchup-modal-label">
+                        <i class="fas fa-chart-bar me-2 text-primary"></i> Team Matchup Analysis
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-4">
+                    <div id="matchup-loading" class="text-center py-5">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                        <h6 class="mt-3 text-secondary">Analyzing team statistics...</h6>
+                    </div>
+                    
+                    <div id="matchup-error" class="text-danger text-center py-4 d-none">
+                        Failed to load matchup analysis.
+                    </div>
+                    
+                    <div id="matchup-data" class="d-none">
+                        <!-- Head-to-Head Header -->
+                        <div class="row align-items-center text-center mb-4">
+                            <div class="col-5">
+                                <h4 class="fw-bold mb-1 text-primary" id="matchup-away-name">Away Team</h4>
+                                <span class="badge bg-primary" id="matchup-away-orating">Off: -</span>
+                            </div>
+                            <div class="col-2 fw-bold text-secondary fs-4">VS</div>
+                            <div class="col-5">
+                                <h4 class="fw-bold mb-1 text-success" id="matchup-home-name">Home Team</h4>
+                                <span class="badge bg-success" id="matchup-home-orating">Off: -</span>
+                            </div>
+                        </div>
+                        
+                        <!-- Advanced Ratings Comparison -->
+                        <h5 class="fw-bold mb-3 border-bottom border-gray-700 pb-2"><i class="fas fa-bolt text-warning me-1"></i> Advanced Metrics Comparison</h5>
+                        <div class="mb-4" id="matchup-advanced-comparison">
+                            <!-- Populated dynamically via JS -->
+                        </div>
+                        
+                        <!-- Traditional Stats Comparison -->
+                        <h5 class="fw-bold mb-3 border-bottom border-gray-700 pb-2"><i class="fas fa-list text-info me-1"></i> Per-Game Team Statistics</h5>
+                        <div class="table-responsive">
+                            <table class="table table-hover text-white align-middle" style="font-size: 0.9rem;">
+                                <thead>
+                                    <tr class="text-center">
+                                        <th class="text-start" style="width: 35%;" id="matchup-table-away-header">Away</th>
+                                        <th style="width: 30%;">Stat Category</th>
+                                        <th class="text-end" style="width: 35%;" id="matchup-table-home-header">Home</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="matchup-stats-body">
+                                    <!-- Populated dynamically via JS -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer border-top border-gray-700 justify-content-center">
+                    <button type="button" class="btn btn-secondary rounded-pill px-4" data-bs-dismiss="modal">Close Analysis</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Roster & Player Modals -->
+    {% include 'team_modal.html' %}
+    {% include 'player_modal.html' %}
 
     <!-- Loading Overlay Template -->
     <div id="loading-overlay" class="position-fixed top-0 start-0 w-100 h-100 d-none" style="background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(5px); z-index: 1000;">
@@ -906,7 +1098,199 @@
                     refreshPredictions();
                 });
             }
+
+            // Dashboard tab listener to fetch standings dynamically
+            const dashboardTab = document.getElementById('dashboard-tab');
+            if (dashboardTab) {
+                dashboardTab.addEventListener('click', function() {
+                    loadStandings();
+                });
+            }
+
+            // Click listener for matchup analysis buttons (delegated listener)
+            const gamesContainer = document.getElementById('games-container');
+            if (gamesContainer) {
+                gamesContainer.addEventListener('click', function(e) {
+                    const analysisBtn = e.target.closest('.matchup-analysis-btn');
+                    if (analysisBtn) {
+                        const home = analysisBtn.getAttribute('data-home');
+                        const away = analysisBtn.getAttribute('data-away');
+                        loadMatchup(home, away);
+                    }
+                });
+            }
         }
+
+        let standingsLoaded = false;
+        
+        function loadStandings() {
+            if (standingsLoaded) return;
+            
+            fetch('/api/standings')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        const eastBody = document.getElementById('east-standings-body');
+                        const westBody = document.getElementById('west-standings-body');
+                        const ratingsBody = document.getElementById('team-ratings-body');
+                        
+                        // 1. Populate East Standings
+                        eastBody.innerHTML = data.east.map((t, idx) => `
+                            <tr>
+                                <td class="fw-bold">${idx + 1}. ${t.team}</td>
+                                <td class="text-center">${t.wins}</td>
+                                <td class="text-center">${t.losses}</td>
+                                <td class="text-center">${t.win_pct.toFixed(3)}</td>
+                                <td class="text-center">${t.gb === 0 ? '—' : t.gb.toFixed(1)}</td>
+                                <td class="text-center">${t.ppg.toFixed(1)}</td>
+                                <td class="text-center">${t.oppg.toFixed(1)}</td>
+                                <td class="text-center fw-medium ${t.srs >= 0 ? 'text-success' : 'text-danger'}">${t.srs > 0 ? '+' : ''}${t.srs.toFixed(2)}</td>
+                            </tr>
+                        `).join('');
+                        
+                        // 2. Populate West Standings
+                        westBody.innerHTML = data.west.map((t, idx) => `
+                            <tr>
+                                <td class="fw-bold">${idx + 1}. ${t.team}</td>
+                                <td class="text-center">${t.wins}</td>
+                                <td class="text-center">${t.losses}</td>
+                                <td class="text-center">${t.win_pct.toFixed(3)}</td>
+                                <td class="text-center">${t.gb === 0 ? '—' : t.gb.toFixed(1)}</td>
+                                <td class="text-center">${t.ppg.toFixed(1)}</td>
+                                <td class="text-center">${t.oppg.toFixed(1)}</td>
+                                <td class="text-center fw-medium ${t.srs >= 0 ? 'text-success' : 'text-danger'}">${t.srs > 0 ? '+' : ''}${t.srs.toFixed(2)}</td>
+                            </tr>
+                        `).join('');
+                        
+                        // 3. Populate Team Advanced Ratings
+                        const allTeams = [...data.east, ...data.west].sort((a, b) => b.nrtg - a.nrtg);
+                        ratingsBody.innerHTML = allTeams.map((t, idx) => `
+                            <tr>
+                                <td class="text-center text-secondary">${idx + 1}</td>
+                                <td class="fw-bold">${t.team}</td>
+                                <td class="text-center">${t.ortg.toFixed(1)}</td>
+                                <td class="text-center">${t.drtg.toFixed(1)}</td>
+                                <td class="text-center fw-bold ${t.nrtg >= 0 ? 'text-success' : 'text-danger'}">${t.nrtg > 0 ? '+' : ''}${t.nrtg.toFixed(1)}</td>
+                                <td class="text-center">${t.pace.toFixed(1)}</td>
+                                <td class="text-center">${(t.ts_pct * 100).toFixed(1)}%</td>
+                                <td class="text-center">${(t.def_efg_pct * 100).toFixed(1)}%</td>
+                                <td class="text-center fw-medium ${t.srs >= 0 ? 'text-success' : 'text-danger'}">${t.srs > 0 ? '+' : ''}${t.srs.toFixed(2)}</td>
+                            </tr>
+                        `).join('');
+                        
+                        standingsLoaded = true;
+                    } else {
+                        throw new Error(data.error || 'Failed to parse standings');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading standings:', error);
+                    document.getElementById('east-standings-body').innerHTML = `<tr><td colspan="8" class="text-danger text-center py-3">Error: ${error.message}</td></tr>`;
+                    document.getElementById('west-standings-body').innerHTML = `<tr><td colspan="8" class="text-danger text-center py-3">Error: ${error.message}</td></tr>`;
+                });
+        }
+
+        function loadMatchup(homeTeam, awayTeam) {
+            const loading = document.getElementById('matchup-loading');
+            const errorEl = document.getElementById('matchup-error');
+            const dataEl = document.getElementById('matchup-data');
+            
+            loading.classList.remove('d-none');
+            errorEl.classList.add('d-none');
+            dataEl.classList.add('d-none');
+            
+            const matchupModal = new bootstrap.Modal(document.getElementById('matchup-modal'));
+            matchupModal.show();
+            
+            fetch(`/api/matchup/${encodeURIComponent(awayTeam)}/${encodeURIComponent(homeTeam)}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        const t1 = data.team1;
+                        const t2 = data.team2;
+                        
+                        document.getElementById('matchup-away-name').textContent = t1.team;
+                        document.getElementById('matchup-away-orating').textContent = `Off: ${t1.ortg.toFixed(1)} | Def: ${t1.drtg.toFixed(1)}`;
+                        
+                        document.getElementById('matchup-home-name').textContent = t2.team;
+                        document.getElementById('matchup-home-orating').textContent = `Off: ${t2.ortg.toFixed(1)} | Def: ${t2.drtg.toFixed(1)}`;
+                        
+                        document.getElementById('matchup-table-away-header').textContent = t1.team;
+                        document.getElementById('matchup-table-home-header').textContent = t2.team;
+                        
+                        const makeComparisonBar = (label, val1, val2, formatFn = (x) => x.toFixed(1), higherIsBetter = true) => {
+                            const diff = val1 - val2;
+                            const isVal1Better = higherIsBetter ? diff > 0 : diff < 0;
+                            const isVal2Better = higherIsBetter ? diff < 0 : diff > 0;
+                            const total = Math.max(val1, val2, 1);
+                            const pct1 = Math.round((val1 / total) * 100);
+                            const pct2 = Math.round((val2 / total) * 100);
+                            
+                            return `
+                                <div class="mb-3">
+                                    <div class="d-flex justify-content-between mb-1 small text-secondary">
+                                        <span class="${isVal1Better ? 'text-primary fw-bold' : ''}">${formatFn(val1)}</span>
+                                        <span class="text-white fw-medium">${label}</span>
+                                        <span class="${isVal2Better ? 'text-success fw-bold' : ''}">${formatFn(val2)}</span>
+                                    </div>
+                                    <div class="d-flex animate-bar" style="height: 8px; border-radius: 4px; overflow: hidden; background: rgba(255, 255, 255, 0.05);">
+                                        <div class="bg-primary" style="width: ${pct1}%; transition: width 0.8s ease-in-out;"></div>
+                                        <div style="width: 2px; background-color: rgba(255,255,255,0.2);"></div>
+                                        <div class="bg-success" style="width: ${pct2}%; transition: width 0.8s ease-in-out; margin-left: auto;"></div>
+                                    </div>
+                                </div>
+                            `;
+                        };
+                        
+                        const advancedComparison = document.getElementById('matchup-advanced-comparison');
+                        advancedComparison.innerHTML = `
+                            ${makeComparisonBar("Net Rating", t1.nrtg, t2.nrtg, (x) => (x > 0 ? '+' : '') + x.toFixed(1))}
+                            ${makeComparisonBar("Offensive Rating", t1.ortg, t2.ortg)}
+                            ${makeComparisonBar("Defensive Rating", t1.drtg, t2.drtg, (x) => x.toFixed(1), false)}
+                            ${makeComparisonBar("Pace (Possessions)", t1.pace, t2.pace)}
+                            ${makeComparisonBar("True Shooting %", t1.ts_pct * 100, t2.ts_pct * 100, (x) => x.toFixed(1) + '%')}
+                            ${makeComparisonBar("Opponent eFG%", t1.def_efg_pct * 100, t2.def_efg_pct * 100, (x) => x.toFixed(1) + '%', false)}
+                        `;
+                        
+                        const statsBody = document.getElementById('matchup-stats-body');
+                        const makeStatsRow = (category, v1, v2, format = (x) => x.toFixed(1), higherIsBetter = true) => {
+                            const isV1Better = higherIsBetter ? v1 > v2 : v1 < v2;
+                            const isV2Better = higherIsBetter ? v1 < v2 : v1 > v2;
+                            return `
+                                <tr class="text-center">
+                                    <td class="text-start ${isV1Better ? 'text-primary fw-bold' : 'text-secondary'}">${format(v1)}</td>
+                                    <td class="text-white-50 small fw-bold">${category}</td>
+                                    <td class="text-end ${isV2Better ? 'text-success fw-bold' : 'text-secondary'}">${format(v2)}</td>
+                                </tr>
+                            `;
+                        };
+                        
+                        statsBody.innerHTML = `
+                            ${makeStatsRow("Points Per Game", t1.pts, t2.pts)}
+                            ${makeStatsRow("Field Goal %", t1.fg_pct * 100, t2.fg_pct * 100, (x) => x.toFixed(1) + '%')}
+                            ${makeStatsRow("3-Point %", t1.fg3_pct * 100, t2.fg3_pct * 100, (x) => x.toFixed(1) + '%')}
+                            ${makeStatsRow("Free Throw %", t1.ft_pct * 100, t2.ft_pct * 100, (x) => x.toFixed(1) + '%')}
+                            ${makeStatsRow("Rebounds Per Game", t1.trb, t2.trb)}
+                            ${makeStatsRow("Assists Per Game", t1.ast, t2.ast)}
+                            ${makeStatsRow("Steals Per Game", t1.stl, t2.stl)}
+                            ${makeStatsRow("Blocks Per Game", t1.blk, t2.blk)}
+                            ${makeStatsRow("Turnovers Per Game", t1.tov, t2.tov, (x) => x.toFixed(1), false)}
+                        `;
+                        
+                        loading.classList.add('d-none');
+                        dataEl.classList.remove('d-none');
+                    } else {
+                        throw new Error(data.error || 'Failed to parse matchup');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading matchup:', error);
+                    loading.classList.add('d-none');
+                    errorEl.classList.remove('d-none');
+                    errorEl.textContent = `Error: ${error.message}`;
+                });
+        }
+
 
         // Theme toggle functionality
         function initThemeToggle() {

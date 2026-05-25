@@ -1,8 +1,8 @@
 from datetime import date
 import json
-from flask import Flask, render_template,jsonify
+from flask import Flask, render_template, jsonify
 from functools import lru_cache
-import subprocess, requests, re, time
+import subprocess, requests, re, time, sqlite3, os, unicodedata
 
 
 @lru_cache()
@@ -58,6 +58,136 @@ def get_ttl_hash(seconds=600):
 
 app = Flask(__name__)
 app.jinja_env.add_extension('jinja2.ext.loopcontrols')
+
+
+def get_bbr_db_connection():
+    db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "BasketballReference.sqlite")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def normalize_name(name):
+    if not name:
+        return ""
+    normalized = unicodedata.normalize('NFD', name)
+    return "".join([c for c in normalized if unicodedata.category(c) != 'Mn']).lower().strip()
+
+
+@app.route("/api/standings")
+def get_standings():
+    try:
+        conn = get_bbr_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.*, a.ortg, a.drtg, a.nrtg, a.pace
+            FROM team_standings s
+            LEFT JOIN team_advanced_stats a ON s.team = a.team
+            ORDER BY s.win_pct DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        standings = [dict(row) for row in rows]
+        
+        east = [t for t in standings if t["conference"] == "East"]
+        west = [t for t in standings if t["conference"] == "West"]
+        
+        return jsonify({
+            "success": True,
+            "east": east,
+            "west": west
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        })
+
+
+@app.route("/api/matchup/<team1>/<team2>")
+def get_matchup(team1, team2):
+    try:
+        conn = get_bbr_db_connection()
+        
+        def find_team_stats(team_name):
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT a.*, p.pts, p.ast, p.trb, p.stl, p.blk, p.tov, p.fg_pct, p.fg3_pct, p.ft_pct
+                FROM team_advanced_stats a
+                LEFT JOIN team_per_game_stats p ON a.team = p.team
+                WHERE a.team = ?
+            """, (team_name,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            
+            clean_name = team_name.replace("LA ", "Los Angeles ").replace("NY ", "New York ").strip()
+            cursor.execute("""
+                SELECT a.*, p.pts, p.ast, p.trb, p.stl, p.blk, p.tov, p.fg_pct, p.fg3_pct, p.ft_pct
+                FROM team_advanced_stats a
+                LEFT JOIN team_per_game_stats p ON a.team = p.team
+                WHERE a.team LIKE ? OR a.team LIKE ?
+            """, (f"%{team_name}%", f"%{clean_name}%"))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+            
+        t1_stats = find_team_stats(team1)
+        t2_stats = find_team_stats(team2)
+        conn.close()
+        
+        if not t1_stats or not t2_stats:
+            return jsonify({
+                "success": False,
+                "error": f"Stats not found for one or both teams: {team1} ({'found' if t1_stats else 'missing'}), {team2} ({'found' if t2_stats else 'missing'})"
+            })
+            
+        return jsonify({
+            "success": True,
+            "team1": t1_stats,
+            "team2": t2_stats
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        })
+
+
+@app.route("/api/player-summary/<player_name>")
+def get_player_summary(player_name):
+    try:
+        conn = get_bbr_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM player_stats")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        target = normalize_name(player_name)
+        matched_player = None
+        for row in rows:
+            db_name_norm = normalize_name(row["name"])
+            if db_name_norm == target or target in db_name_norm or db_name_norm in target:
+                matched_player = dict(row)
+                break
+                
+        if not matched_player:
+            return jsonify({
+                "success": False,
+                "error": f"Player {player_name} not found in database"
+            })
+            
+        return jsonify({
+            "success": True,
+            "player": matched_player
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        })
 
 
 @app.route("/")

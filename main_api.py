@@ -20,6 +20,109 @@ from src.Utils import Expected_Value, Kelly_Criterion as kc
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
 
+# --- MONKEY-PATCH FOR BASKETBALL-REFERENCE-SCRAPER ---
+import io
+original_read_html = pd.read_html
+def patched_read_html(io_or_html, *args, **kwargs):
+    if isinstance(io_or_html, str) and ("<table" in io_or_html or "<html" in io_or_html):
+        return original_read_html(io.StringIO(io_or_html), *args, **kwargs)
+    return original_read_html(io_or_html, *args, **kwargs)
+pd.read_html = patched_read_html
+
+try:
+    import basketball_reference_scraper.seasons as seasons
+    import basketball_reference_scraper.request_utils as request_utils
+    import basketball_reference_scraper.teams as teams
+    import basketball_reference_scraper.players as players
+    from bs4 import BeautifulSoup, Comment
+    from basketball_reference_scraper.request_utils import get_wrapper
+    import re
+    
+    def patched_get_selenium_wrapper(url, xpath):
+        match = re.search(r'@id="([^"]+)"', xpath)
+        if not match:
+            return None
+        table_id = match.group(1)
+        
+        r = request_utils.get_wrapper(url)
+        if r.status_code == 200:
+            html = r.content.decode('utf-8')
+            soup = BeautifulSoup(html, 'html.parser')
+            table = soup.find('table', id=table_id)
+            if table:
+                return f'<table>{table.decode_contents()}</table>'
+            for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+                if f'id="{table_id}"' in comment:
+                    comment_soup = BeautifulSoup(comment, 'html.parser')
+                    table = comment_soup.find('table', id=table_id)
+                    if table:
+                        return f'<table>{table.decode_contents()}</table>'
+            return None
+        return None
+
+    request_utils.get_selenium_wrapper = patched_get_selenium_wrapper
+    teams.get_selenium_wrapper = patched_get_selenium_wrapper
+    players.get_selenium_wrapper = patched_get_selenium_wrapper
+
+    
+    def patched_get_schedule(season, playoffs=False):
+        months = ['October', 'November', 'December', 'January', 'February', 'March',
+                'April', 'May', 'June']
+        if season==2020:
+            months = ['October-2019', 'November', 'December', 'January', 'February', 'March',
+                    'July', 'August', 'September', 'October-2020']
+        df = pd.DataFrame()
+        for month in months:
+            url = f'https://www.basketball-reference.com/leagues/NBA_{season}_games-{month.lower()}.html'
+            r = get_wrapper(url)
+            if r.status_code==200:
+                soup = BeautifulSoup(r.content, 'html.parser')
+                table = soup.find('table', attrs={'id': 'schedule'})
+                if table:
+                    month_df = pd.read_html(io.StringIO(str(table)))[0]
+                    df = pd.concat([df, month_df])
+
+        if df.empty:
+            return df
+
+        df = df.reset_index(drop=True)
+        df = df.iloc[:, [0, 2, 3, 4, 5]]
+        df.columns = ['DATE', 'VISITOR', 'VISITOR_PTS', 'HOME', 'HOME_PTS']
+
+        if season==2020:
+            df = df[df['DATE']!='Playoffs']
+            df['DATE'] = df['DATE'].apply(lambda x: pd.to_datetime(x))
+            df = df.sort_values(by='DATE')
+            df = df.reset_index(drop=True)
+            playoff_loc = df[df['DATE']==pd.to_datetime('2020-08-17')].head(n=1)
+            if len(playoff_loc.index)>0:
+                playoff_index = playoff_loc.index[0]
+            else:
+                playoff_index = len(df)
+            if playoffs:
+                df = df[playoff_index:]
+            else:
+                df = df[:playoff_index]
+        else:
+            if season == 1953:
+                df.drop_duplicates(subset=['DATE', 'HOME', 'VISITOR'], inplace=True)
+            playoff_loc = df[df['DATE']=='Playoffs']
+            if len(playoff_loc.index)>0:
+                playoff_index = playoff_loc.index[0]
+            else:
+                playoff_index = len(df)
+            if playoffs:
+                df = df[playoff_index+1:]
+            else:
+                df = df[:playoff_index]
+            df['DATE'] = df['DATE'].apply(lambda x: pd.to_datetime(x))
+        return df
+
+    seasons.get_schedule = patched_get_schedule
+    print("Successfully applied monkey-patches to basketball_reference_scraper")
+except Exception as e:
+    print(f"Failed to apply monkey-patches to basketball_reference_scraper: {e}")
+
 # Initialization
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,7 +132,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Betting Buddy API", version="1.1.1-stable-fixed")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -180,6 +283,25 @@ class PredictionRunner:
 def read_root():
     return { "message": "Welcome to the Betting Buddy API!", "status": "healthy" }
 
+# Health check endpoint for frontend monitoring
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "version": "1.1.1-stable-fixed",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+# Supported sportsbooks endpoint for frontend dropdown
+@app.get("/sportsbooks")
+def get_sportsbooks():
+    return {
+        "supported_sportsbooks": [
+            "fanduel", "draftkings", "betmgm",
+            "pointsbet", "caesars", "wynn", "bet_rivers_ny"
+        ]
+    }
+
 # This is the predictions endpoint for http://localhost:8000/predictions
 @app.get("/predictions")
 def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool = True):
@@ -203,6 +325,106 @@ async def chat_handler(chat_message: ChatMessage):
     except Exception as e:
         logger.error(f"An error occurred in chat_handler: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred with the AI assistant: {str(e)}")
+
+# --- Historical Data Endpoints ---
+@app.get("/api/historical/team-stats")
+def get_historical_team_stats(team: str, season: int):
+    try:
+        from basketball_reference_scraper.teams import get_team_stats
+        df = get_team_stats(team, season)
+        if isinstance(df, pd.Series):
+            return df.to_dict()
+        elif isinstance(df, pd.DataFrame):
+            return df.iloc[0].to_dict()
+        else:
+            return {"error": "Invalid data format returned."}
+    except Exception as e:
+        logger.error(f"Error fetching historical team stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/historical/matchup")
+def get_historical_matchup(team1: str, team2: str, season: int):
+    try:
+        from basketball_reference_scraper.seasons import get_schedule
+        schedule_df = get_schedule(season)
+        if schedule_df.empty:
+            return {"matchups": [], "win_percentage": {team1: 0, team2: 0}}
+        
+        t1 = team1.lower()
+        t2 = team2.lower()
+        
+        # Filter games involving both teams
+        filtered = schedule_df[
+            ((schedule_df['VISITOR'].str.lower().str.contains(t1)) & (schedule_df['HOME'].str.lower().str.contains(t2))) |
+            ((schedule_df['VISITOR'].str.lower().str.contains(t2)) & (schedule_df['HOME'].str.lower().str.contains(t1)))
+        ]
+        
+        matchups_list = []
+        team1_wins = 0
+        team2_wins = 0
+        total_games = 0
+        
+        for _, row in filtered.iterrows():
+            date_str = row['DATE'].strftime('%Y-%m-%d') if isinstance(row['DATE'], pd.Timestamp) else str(row['DATE'])
+            visitor = row['VISITOR']
+            home = row['HOME']
+            
+            try:
+                visitor_pts = int(row['VISITOR_PTS'])
+                home_pts = int(row['HOME_PTS'])
+            except (ValueError, TypeError):
+                continue
+                
+            total_games += 1
+            
+            # Determine winner
+            if visitor_pts > home_pts:
+                winner = visitor
+                winner_pts = visitor_pts
+                loser = home
+                loser_pts = home_pts
+            else:
+                winner = home
+                winner_pts = home_pts
+                loser = visitor
+                loser_pts = visitor_pts
+                
+            if t1 in winner.lower():
+                team1_wins += 1
+            elif t2 in winner.lower():
+                team2_wins += 1
+                
+            matchups_list.append({
+                "date": date_str,
+                "visitor": visitor,
+                "visitor_pts": visitor_pts,
+                "home": home,
+                "home_pts": home_pts,
+                "winner": winner,
+                "score_summary": f"{winner} {winner_pts} - {loser_pts} {loser}"
+            })
+            
+        win_pct1 = round((team1_wins / total_games) * 100, 1) if total_games > 0 else 0
+        win_pct2 = round((team2_wins / total_games) * 100, 1) if total_games > 0 else 0
+        
+        return {
+            "team1": team1.upper(),
+            "team2": team2.upper(),
+            "season": season,
+            "total_games": total_games,
+            "win_percentage": {
+                team1.upper(): win_pct1,
+                team2.upper(): win_pct2
+            },
+            "wins": {
+                team1.upper(): team1_wins,
+                team2.upper(): team2_wins
+            },
+            "matchups": matchups_list
+        }
+    except Exception as e:
+        logger.error(f"Error fetching historical matchup details: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run("main_api:app", host="0.0.0.0", port=8000, reload=True)

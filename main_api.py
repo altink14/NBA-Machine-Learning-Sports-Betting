@@ -288,7 +288,7 @@ class PredictionRunner:
         if not game_data_list:
             return np.array([]), [], pd.DataFrame(), [], [], []
             
-        frame_ml = pd.concat(game_data_list, axis=1).T
+        frame_ml = pd.DataFrame(game_data_list)
         
         # Columns to drop to match what XGBoost models expect
         cols_to_drop = [
@@ -390,12 +390,31 @@ def get_sportsbooks():
         ]
     }
 
+predictions_cache = {}
+
 # This is the predictions endpoint for http://localhost:8000/predictions
 @app.get("/predictions")
 def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool = True):
+    cache_key = f"{sportsbook}_{kelly_criterion}"
+    now = datetime.now()
+    
+    print(f"DEBUG_CACHE: checking cache_key='{cache_key}'. Current keys={list(predictions_cache.keys())}")
+    
+    if cache_key in predictions_cache:
+        cached_data, timestamp = predictions_cache[cache_key]
+        if now - timestamp < timedelta(minutes=5):
+            print(f"DEBUG_CACHE: HIT for cache_key='{cache_key}'")
+            return cached_data
+        else:
+            print(f"DEBUG_CACHE: EXPIRED for cache_key='{cache_key}'")
+    else:
+        print(f"DEBUG_CACHE: MISS for cache_key='{cache_key}'")
+            
     try:
         runner = PredictionRunner(sportsbook=sportsbook, kelly_criterion=kelly_criterion)
-        return runner.run_predictions()
+        res = runner.run_predictions()
+        predictions_cache[cache_key] = (res, now)
+        return res
     except Exception as e:
         logger.error(f"Error in /predictions endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal server error occurred.")

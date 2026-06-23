@@ -16,7 +16,10 @@ sbrscrape
 google-generativeai
 requests
 python-multipart
-basketball-reference-scraper
+
+# NBA Data Pipeline (Phase 1)
+nba-api>=1.11.4
+pbpstats>=1.3.11
 
 # Utilities
 colorama

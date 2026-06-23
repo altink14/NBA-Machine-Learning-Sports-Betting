@@ -10,32 +10,61 @@ class SbrOddsProvider:
     An intelligent odds provider that fetches NBA games.
     If no games are found for the current day, it automatically checks subsequent days.
     """
-    def __init__(self, sportsbook="fanduel"):
+    def __init__(self, sportsbook="fanduel", sport="NBA"):
         self.sportsbook = sportsbook
+        self.sport = sport
         self.games = self._fetch_games_with_fallback()
 
     def _fetch_games_with_fallback(self):
         """
-        Tries to fetch games for today, and if none are found,
-        iteratively checks the next few days.
+        Fetches games for the requested sport.
+        If the sport is NBA and none are found, falls back to WNBA.
         """
+        import sbrscrape
+        if "WNBA" not in sbrscrape.sport_dict:
+            sbrscrape.sport_dict["WNBA"] = "wnba-basketball"
+            
         today = datetime.now()
-        # Look up to 7 days in the future for the next available games
+        requested_sport = self.sport.upper()
+
+        # If sport is NBA, we check NBA first, then WNBA
+        if requested_sport == 'NBA':
+            # Check NBA for the next 7 days
+            for i in range(7):
+                check_date = today + timedelta(days=i)
+                logger.info(f"Checking for NBA games on: {check_date.strftime('%Y-%m-%d')}")
+                try:
+                    sb = Scoreboard(sport="NBA", date=check_date)
+                    if hasattr(sb, 'games') and sb.games:
+                        logger.info(f"Found {len(sb.games)} NBA games on {check_date.strftime('%Y-%m-%d')}.")
+                        for game in sb.games:
+                            game['game_start_time_utc'] = game.get('datetime')
+                            game['sport'] = 'NBA'
+                        return sb.games
+                except Exception as e:
+                    logger.error(f"Failed to fetch NBA games for {check_date.strftime('%Y-%m-%d')} due to an error: {e}")
+
+            # Fallback to WNBA
+            logger.info("No NBA games found. Falling back to WNBA...")
+            requested_sport = 'WNBA'
+
+        # Fetch the requested sport (could be WNBA, MLB, etc.)
+        logger.info(f"Checking for {requested_sport} games...")
         for i in range(7):
             check_date = today + timedelta(days=i)
-            logger.info(f"Checking for NBA games on: {check_date.strftime('%Y-%m-%d')}")
+            logger.info(f"Checking for {requested_sport} games on: {check_date.strftime('%Y-%m-%d')}")
             try:
-                sb = Scoreboard(sport="NBA", date=check_date)
+                sb = Scoreboard(sport=requested_sport, date=check_date)
                 if hasattr(sb, 'games') and sb.games:
-                    logger.info(f"Found {len(sb.games)} games on {check_date.strftime('%Y-%m-%d')}.")
-                    # Add game start time to each game object for the frontend
+                    logger.info(f"Found {len(sb.games)} {requested_sport} games on {check_date.strftime('%Y-%m-%d')}.")
                     for game in sb.games:
                         game['game_start_time_utc'] = game.get('datetime')
+                        game['sport'] = requested_sport
                     return sb.games
             except Exception as e:
-                logger.error(f"Failed to fetch games for {check_date.strftime('%Y-%m-%d')} due to an error: {e}")
+                logger.error(f"Failed to fetch {requested_sport} games for {check_date.strftime('%Y-%m-%d')} due to an error: {e}")
         
-        logger.warning("No games found within the next 7 days.")
+        logger.warning(f"No {requested_sport} games found within the next 7 days.")
         return []
 
     def get_odds(self):

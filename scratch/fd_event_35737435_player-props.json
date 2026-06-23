@@ -1,0 +1,1695 @@
+{
+  "layout": {
+    "defaultTab": 302,
+    "tabsDisplayOrder": [
+      302,
+      292,
+      260,
+      379,
+      168,
+      172,
+      170,
+      169,
+      171,
+      56,
+      26,
+      27,
+      202,
+      29,
+      204,
+      58
+    ],
+    "tabs": {
+      "26": {
+        "id": 26,
+        "title": "1st Quarter",
+        "cards": [
+          {
+            "id": 26
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "27": {
+        "id": 27,
+        "title": "2nd Quarter",
+        "cards": [
+          {
+            "id": 27
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "29": {
+        "id": 29,
+        "title": "4th Quarter",
+        "cards": [
+          {
+            "id": 29
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "56": {
+        "id": 56,
+        "title": "Half",
+        "cards": [
+          {
+            "id": 56
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "58": {
+        "id": 58,
+        "title": "Total Parlays",
+        "cards": [
+          {
+            "id": 58
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "168": {
+        "id": 168,
+        "title": "Player Points",
+        "cards": [
+          {
+            "id": 168
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "169": {
+        "id": 169,
+        "title": "Player Assists",
+        "cards": [
+          {
+            "id": 169
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "170": {
+        "id": 170,
+        "title": "Player Rebounds",
+        "cards": [
+          {
+            "id": 170
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "171": {
+        "id": 171,
+        "title": "Player Combos",
+        "cards": [
+          {
+            "id": 171
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "172": {
+        "id": 172,
+        "title": "Player Threes",
+        "cards": [
+          {
+            "id": 172
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "202": {
+        "id": 202,
+        "title": "3rd Quarter",
+        "cards": [
+          {
+            "id": 202
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "204": {
+        "id": 204,
+        "title": "Margin",
+        "cards": [
+          {
+            "id": 204
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "260": {
+        "id": 260,
+        "title": "Quick Bets",
+        "cards": [
+          {
+            "id": 260
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "292": {
+        "id": 292,
+        "title": "Popular",
+        "cards": [
+          {
+            "id": 292
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      },
+      "302": {
+        "id": 302,
+        "title": "Same Game Parlay\u2122",
+        "cards": [
+          {
+            "id": 302
+          }
+        ],
+        "isSameGameMulti": true,
+        "description": null
+      },
+      "379": {
+        "id": 379,
+        "title": "Game Specials",
+        "cards": [
+          {
+            "id": 379
+          }
+        ],
+        "isSameGameMulti": false,
+        "description": null
+      }
+    },
+    "cards": {
+      "26": {
+        "id": 26,
+        "type": "EVENT_CARD",
+        "title": "1st Quarter",
+        "marketTypes": [
+          "FIRST_QUARTER_WINNER_/_MATCH_WINNER_WNBA",
+          "1ST_QUARTER_TOTAL_POINTS_ODD_/_EVEN_WNBA",
+          "PLAYER_A_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_B_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_C_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_D_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_E_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_F_1ST_QUARTER_POINTS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "27": {
+        "id": 27,
+        "type": "EVENT_CARD",
+        "title": "2nd Quarter",
+        "marketTypes": [
+          "2ND_QUARTER_TOTAL_POINTS_ODD_/_EVEN_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "29": {
+        "id": 29,
+        "type": "EVENT_CARD",
+        "title": "4th Quarter",
+        "marketTypes": [
+          "4TH_QUARTER_TOTAL_POINTS_ODD_/_EVEN_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "56": {
+        "id": 56,
+        "type": "EVENT_CARD",
+        "title": "Half",
+        "marketTypes": [
+          "DOUBLE_RESULT_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "58": {
+        "id": 58,
+        "type": "EVENT_CARD",
+        "title": "Total Parlays",
+        "marketTypes": [
+          "MATCH_/_TOTAL_POINTS_DOUBLE_WNBA",
+          "LINE_/_TOTAL_DOUBLE_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": true,
+        "display": [
+          {
+            "marketLayoutTemplate": "SingleSelection",
+            "competitionId": 11295025,
+            "rows": [
+              {
+                "eventId": 35737435,
+                "marketIds": [
+                  "734.173562195"
+                ]
+              }
+            ]
+          },
+          {
+            "marketLayoutTemplate": "SingleSelection",
+            "competitionId": 11295025,
+            "rows": [
+              {
+                "eventId": 35737435,
+                "marketIds": [
+                  "734.173562187"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "168": {
+        "id": 168,
+        "type": "EVENT_CARD",
+        "title": "Player Points",
+        "marketTypes": [
+          "TO_SCORE_5+_POINTS_WNBA",
+          "TO_SCORE_10+_POINTS_WNBA",
+          "TO_SCORE_15+_POINTS_WNBA",
+          "TO_SCORE_20+_POINTS_WNBA",
+          "TO_SCORE_25+_POINTS_WNBA",
+          "TO_SCORE_30+_POINTS_WNBA",
+          "PLAYER_A_TOTAL_POINTS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_WNBA",
+          "PLAYER_C_TOTAL_POINTS_WNBA",
+          "PLAYER_D_TOTAL_POINTS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_WNBA",
+          "PLAYER_F_TOTAL_POINTS_WNBA",
+          "PLAYER_G_TOTAL_POINTS_WNBA",
+          "PLAYER_H_TOTAL_POINTS_WNBA",
+          "PLAYER_I_TOTAL_POINTS_WNBA",
+          "PLAYER_TO_SCORE_X+_POINTS_IN_EACH_QUARTER_WNBA",
+          "PLAYER_A_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_B_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_C_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_D_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_E_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_F_1ST_QUARTER_POINTS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "169": {
+        "id": 169,
+        "type": "EVENT_CARD",
+        "title": "Player Assists",
+        "marketTypes": [
+          "TO_RECORD_2+_ASSISTS_WNBA",
+          "TO_RECORD_4+_ASSISTS_WNBA",
+          "TO_RECORD_6+_ASSISTS_WNBA",
+          "TO_RECORD_8+_ASSISTS_WNBA",
+          "TO_RECORD_10+_ASSISTS_WNBA",
+          "TO_RECORD_12+_ASSISTS_WNBA",
+          "PLAYER_A_TOTAL_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_ASSISTS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "170": {
+        "id": 170,
+        "type": "EVENT_CARD",
+        "title": "Player Rebounds",
+        "marketTypes": [
+          "TO_RECORD_4+_REBOUNDS_WNBA",
+          "TO_RECORD_6+_REBOUNDS_WNBA",
+          "TO_RECORD_8+_REBOUNDS_WNBA",
+          "TO_RECORD_10+_REBOUNDS_WNBA",
+          "TO_RECORD_12+_REBOUNDS_WNBA",
+          "TO_RECORD_14+_REBOUNDS_WNBA",
+          "TO_RECORD_16+_REBOUNDS_WNBA",
+          "PLAYER_A_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_B_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_C_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_D_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_E_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_F_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_G_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_H_TOTAL_REBOUNDS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "171": {
+        "id": 171,
+        "type": "EVENT_CARD",
+        "title": "Player Combos",
+        "marketTypes": [
+          "TO_RECORD_A_DOUBLE_DOUBLE_WNBA",
+          "PLAYER_A_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_C_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_D_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_F_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_G_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_A_TOTAL_POINTS_+_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_+_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_+_ASSISTS_WNBA",
+          "PLAYER_A_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_C_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_D_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_G_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_H_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_A_TOTAL_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_H_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "172": {
+        "id": 172,
+        "type": "EVENT_CARD",
+        "title": "Player Threes",
+        "marketTypes": [
+          "1+_MADE_THREES_WNBA",
+          "2+_MADE_THREES_WNBA",
+          "3+_MADE_THREES_WNBA",
+          "4+_MADE_THREES_WNBA",
+          "5+_MADE_THREES_WNBA",
+          "PLAYER_A_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_B_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_C_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_D_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_E_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "202": {
+        "id": 202,
+        "type": "EVENT_CARD",
+        "title": "3rd Quarter",
+        "marketTypes": [
+          "3RD_QUARTER_TOTAL_POINTS_ODD_/_EVEN_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "204": {
+        "id": 204,
+        "type": "EVENT_CARD",
+        "title": "Margin",
+        "marketTypes": [
+          "WIN_MARGIN_WNBA",
+          "WINNING_MARGIN_(FOUR_BANDS)_WNBA",
+          "MARGIN_OF_VICTORY_12_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "260": {
+        "id": 260,
+        "type": "EVENT_CARD",
+        "title": "Quick Bets",
+        "marketTypes": [
+          "PLAYER_TO_SCORE_IN_THE_FIRST_3_MINUTES_WNBA",
+          "PLAYER_TO_SCORE_3+_POINTS_IN_THE_FIRST_3_MINUTES_WNBA",
+          "PLAYER_TO_SCORE_5+_POINTS_IN_THE_FIRST_3_MINUTES_WNBA",
+          "METHOD_OF_FIRST_BASKET_WNBA",
+          "FIRST_BASKET_(SAME_GAME_MULTIS)_WNBA",
+          "FIRST_TEAM_BASKET_SCORER_WNBA",
+          "BOTH_TEAMS_TO_SCORE_IN_THE_FIRST_MINUTE_WNBA",
+          "2X3_(2_OR_MORE_3S_IN_FIRST_3_MINUTES)_WNBA",
+          "TOTAL_POINTS_SCORED_IN_FIRST_MINUTE_OF_GAME_WNBA",
+          "PLAYER_A_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_B_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_C_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_D_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_E_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_F_1ST_QUARTER_POINTS_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "292": {
+        "id": 292,
+        "type": "EVENT_CARD",
+        "title": "Popular",
+        "marketTypes": [
+          "BIG_3",
+          "PLAYER_TO_SCORE_IN_THE_FIRST_3_MINUTES_WNBA",
+          "PLAYER_TO_SCORE_3+_POINTS_IN_THE_FIRST_3_MINUTES_WNBA",
+          "PLAYER_TO_SCORE_5+_POINTS_IN_THE_FIRST_3_MINUTES_WNBA",
+          "PLAYER_TO_SCORE_X+_POINTS_IN_EACH_QUARTER_WNBA",
+          "GAME_SPECIALS_-_POPULAR_WNBA",
+          "TEAM_TO_SCORE_100_POINTS_WNBA",
+          "DOUBLE_RESULT_WNBA",
+          "CORRECT_SCORE_WNBA",
+          "WINNING_AT_END_OF_EVERY_QUARTER_WNBA",
+          "TO_SCORE_5+_POINTS_WNBA",
+          "TO_SCORE_10+_POINTS_WNBA",
+          "TO_SCORE_15+_POINTS_WNBA",
+          "TO_SCORE_20+_POINTS_WNBA",
+          "TO_SCORE_25+_POINTS_WNBA",
+          "TO_SCORE_30+_POINTS_WNBA",
+          "1+_MADE_THREES_WNBA",
+          "2+_MADE_THREES_WNBA",
+          "3+_MADE_THREES_WNBA",
+          "4+_MADE_THREES_WNBA",
+          "5+_MADE_THREES_WNBA",
+          "TO_RECORD_4+_REBOUNDS_WNBA",
+          "TO_RECORD_6+_REBOUNDS_WNBA",
+          "TO_RECORD_8+_REBOUNDS_WNBA",
+          "TO_RECORD_10+_REBOUNDS_WNBA",
+          "TO_RECORD_12+_REBOUNDS_WNBA",
+          "TO_RECORD_14+_REBOUNDS_WNBA",
+          "TO_RECORD_16+_REBOUNDS_WNBA",
+          "TO_RECORD_2+_ASSISTS_WNBA",
+          "TO_RECORD_4+_ASSISTS_WNBA",
+          "TO_RECORD_6+_ASSISTS_WNBA",
+          "TO_RECORD_8+_ASSISTS_WNBA",
+          "TO_RECORD_10+_ASSISTS_WNBA",
+          "TO_RECORD_12+_ASSISTS_WNBA",
+          "TO_RECORD_A_DOUBLE_DOUBLE_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "302": {
+        "id": 302,
+        "type": "EVENT_CARD",
+        "title": "Same Game Parlay\u2122",
+        "marketTypes": [
+          "BIG_3",
+          "FIRST_BASKET_(SAME_GAME_MULTIS)_WNBA",
+          "FIRST_TEAM_BASKET_SCORER_WNBA",
+          "TO_SCORE_5+_POINTS_WNBA",
+          "TO_SCORE_10+_POINTS_WNBA",
+          "TO_SCORE_15+_POINTS_WNBA",
+          "TO_SCORE_20+_POINTS_WNBA",
+          "TO_SCORE_25+_POINTS_WNBA",
+          "TO_SCORE_30+_POINTS_WNBA",
+          "1+_MADE_THREES_WNBA",
+          "2+_MADE_THREES_WNBA",
+          "3+_MADE_THREES_WNBA",
+          "4+_MADE_THREES_WNBA",
+          "5+_MADE_THREES_WNBA",
+          "TO_RECORD_4+_REBOUNDS_WNBA",
+          "TO_RECORD_6+_REBOUNDS_WNBA",
+          "TO_RECORD_8+_REBOUNDS_WNBA",
+          "TO_RECORD_10+_REBOUNDS_WNBA",
+          "TO_RECORD_12+_REBOUNDS_WNBA",
+          "TO_RECORD_14+_REBOUNDS_WNBA",
+          "TO_RECORD_16+_REBOUNDS_WNBA",
+          "TO_RECORD_2+_ASSISTS_WNBA",
+          "TO_RECORD_4+_ASSISTS_WNBA",
+          "TO_RECORD_6+_ASSISTS_WNBA",
+          "TO_RECORD_8+_ASSISTS_WNBA",
+          "TO_RECORD_10+_ASSISTS_WNBA",
+          "TO_RECORD_12+_ASSISTS_WNBA",
+          "TO_RECORD_A_DOUBLE_DOUBLE_WNBA",
+          "PLAYER_A_TOTAL_POINTS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_WNBA",
+          "PLAYER_C_TOTAL_POINTS_WNBA",
+          "PLAYER_D_TOTAL_POINTS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_WNBA",
+          "PLAYER_F_TOTAL_POINTS_WNBA",
+          "PLAYER_G_TOTAL_POINTS_WNBA",
+          "PLAYER_H_TOTAL_POINTS_WNBA",
+          "PLAYER_I_TOTAL_POINTS_WNBA",
+          "PLAYER_A_TOTAL_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_ASSISTS_WNBA",
+          "PLAYER_A_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_B_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_C_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_D_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_E_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_F_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_G_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_H_TOTAL_REBOUNDS_WNBA",
+          "PLAYER_A_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_B_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_C_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_D_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "PLAYER_E_TOTAL_MADE_3_POINT_FIELD_GOALS_WNBA",
+          "MARGIN_OF_VICTORY_12_WNBA",
+          "WINNING_MARGIN_(FOUR_BANDS)_WNBA",
+          "WIN_MARGIN_WNBA",
+          "TOTAL_POINTS_ODDS_/_EVEN_WNBA",
+          "FIRST_QUARTER_WINNER_/_MATCH_WINNER_WNBA",
+          "PLAYER_A_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_C_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_D_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_F_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_G_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_H_TOTAL_POINTS_+_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_A_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_C_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_D_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_G_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_H_TOTAL_POINTS_+_REBOUNDS_WNBA",
+          "PLAYER_A_TOTAL_POINTS_+_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_POINTS_+_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_POINTS_+_ASSISTS_WNBA",
+          "PLAYER_A_TOTAL_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_B_TOTAL_REBOUNDS_+_ASSISTS_WNBA",
+          "PLAYER_E_TOTAL_REBOUNDS_+_ASSISTS_WNBA",
+          "DOUBLE_RESULT_WNBA",
+          "PLAYER_A_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_B_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_C_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_D_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_E_1ST_QUARTER_POINTS_WNBA",
+          "PLAYER_F_1ST_QUARTER_POINTS_WNBA"
+        ],
+        "isSameGameMulti": true,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      },
+      "379": {
+        "id": 379,
+        "type": "EVENT_CARD",
+        "title": "Game Specials",
+        "marketTypes": [
+          "GAME_SPECIALS_-_POPULAR_WNBA"
+        ],
+        "isSameGameMulti": false,
+        "attachmentsDependent": true,
+        "attachmentsFullyLoaded": false
+      }
+    },
+    "marketBlurbs": {
+      "competitions": {
+        "11295025": {
+          "TO_MAKE_PLAYOFFS": [
+            "WNBA - To Make the 2022 Playoffs"
+          ],
+          "CORRECT_GAME_SCORE": [
+            "All Bets are Action"
+          ],
+          "FIRST_BASKET": [
+            "The winner is deemed to be the player who scores the first point of the game (including free throws)"
+          ],
+          "TOP_POINTS_SCORER": [
+            "All In Betting. Dead Heat Rules Apply. Others available on request"
+          ],
+          "WNBA_FINALS_MVP": [
+            "All in betting. Other selections on request."
+          ],
+          "FIRST_BASKET_(SAME_GAME_MULTIS)": [
+            "The winner is deemed to be the player who scores the first point of the game (including free throws)"
+          ],
+          "FIRST_BASKET_/_WINNER_DOUBLE_WNBA": [
+            "The winning selection is the player who scores the first point and the game winning team"
+          ],
+          "FIRST_BASKET_(SAME_GAME_MULTIS)_WNBA": [
+            "The winner is deemed to be the player who scores the first point of the game (including free throws)"
+          ],
+          "1ST_QUARTER_WINNER_WNBA": [
+            "Graded on which team scores the most points in the listed quarter only and not the entire game before or after said quarter"
+          ],
+          "2ND_QUARTER_WINNER_WNBA": [
+            "Graded on which team scores the most points in the listed quarter only and not the entire game before or after said quarter"
+          ],
+          "3RD_QUARTER_WINNER_WNBA": [
+            "Graded on which team scores the most points in the listed quarter only and not the entire game before or after said quarter"
+          ],
+          "4TH_QUARTER_WINNER_WNBA": [
+            "Graded on which team scores the most points in the listed quarter only and not the entire game before or after said quarter"
+          ],
+          "RESULT_END_OF_3RD_QUARTER_WNBA": [
+            "Settled on result at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "DOUBLE_RESULT_WNBA": [
+            "Resulted on score at half time and full time, inclusive of overtime."
+          ],
+          "FIRST_TEAM_BASKET_SCORER": [
+            "The winners are deemed to be the players who score the first point of the game from each team (including free throws)"
+          ],
+          "4TH_QUARTER_MARGIN": [
+            "Refers to the results from the specified quarter only."
+          ],
+          "CORRECT_SCORE_WNBA": [
+            "All Bets are Action"
+          ],
+          "2ND_QUARTER_MARGIN_WNBA": [
+            "Refers to the results from the specified quarter only."
+          ],
+          "3RD_QUARTER_MARGIN_WNBA": [
+            "Refers to the results from the specified quarter only."
+          ],
+          "4TH_QUARTER_MARGIN_WNBA": [
+            "Refers to the results from the specified quarter only."
+          ],
+          "END_3RD_QTR_AWAY_TEAM_TOT_PTS_ODD/EVEN_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QUARTER_TRI-BET_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QUARTER_TOTAL_POINTS_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QUARTER_MARGIN_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QUARTER_MARGIN_(EXACT)_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QUARTER_HANDICAP_WNBA": [
+            "Settled on line at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QTR_TOTAL_POINTS_ODD/EVEN_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_3RD_QTR_HOME_TEAM_TOT_PTS_ODD/EVEN_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QTR_-_LINE_/_TOTAL_DOUBLE_WNBA": [
+            "Settled on spread and total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "END_OF_3RD_QTR_-_WINNER_/_TOTAL_DOUBLE_WNBA": [
+            "Settled on total points at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "RESULT_END_OF_3RD_QUARTER_(3-WAY)_WNBA": [
+            "Settled on result at end of 3rd quarter, result inclusive of the 1st, 2nd, 3rd quarter combined."
+          ],
+          "NEXT_WIN": [
+            "All in betting. Other selections added on request."
+          ],
+          "COMMISSIONERS_CUP_MVP": [
+            "All-in betting. Other selections available on request"
+          ],
+          "DAILY_MOST_POINTS": [
+            "All in betting. Dead-heat rules apply"
+          ],
+          "DAILY_MOST_REBOUNDS": [
+            "All in betting. Dead-heat rules apply"
+          ],
+          "DAILY_MOST_ASSISTS": [
+            "All in betting. Dead-heat rules apply"
+          ],
+          "PLAYER_WITH_MOST_THREE_POINT_FGS": [
+            "All In Betting. Dead Heat Rules Apply"
+          ],
+          "PLAYER_WITH_MOST_ASSISTS_WNBA": [
+            "All In Betting. Dead Heat Rules Apply"
+          ],
+          "PLAYER_WITH_MOST_REBOUNDS_WNBA": [
+            "All In Betting. Dead Heat Rules Apply"
+          ],
+          "PLAYER_TO_SCORE_IN_NEXT_MINUTE": [
+            "A Player must take the court (for any duration of time) within the specified interval for bets to have action."
+          ],
+          "METHOD_OF_FIRST_BASKET_WNBA": [
+            "Will be settled as per the play description from WNBA.com",
+            "This market refers to how the first point of the game will be scored.",
+            "\"Other\" refers to all other non-listed scoring methods, such as a 2 point jump shot."
+          ],
+          "DAILY_THREES_MADE_LEADER": [
+            "All in betting. Dead-heat rules apply"
+          ],
+          "LARGEST_COMEBACK": [
+            "Resulting as the largest number of points the winning team was down by at any point in the game"
+          ],
+          "STAT_LEADER_PARLAYS_WNBA": [
+            "All In Betting. Dead Heat Rules Apply."
+          ],
+          "PLAYER_TO_SCORE_IN_THE_FIRST_3_MINUTES_WNBA": [
+            "Combine up to 3 selections in a parlay"
+          ],
+          "FIRST_TEAM_BASKET_SCORER_WNBA": [
+            "The two winners will be each player to score the first point of the game for their respective team (including free throws)"
+          ],
+          "TOP_1ST_QUARTER_POINTS_SCORER": [
+            "All In Betting Rules Apply."
+          ],
+          "TOP_1ST_QUARTER_POINTS_SCORER_WNBA": [
+            "All In Betting Rules Apply."
+          ],
+          "WNBA_MVP": [
+            "All In Betting Rules Apply."
+          ],
+          "WNBA_DEFENSIVE_PLAYER_OF_THE_YEAR": [
+            "All In Betting Rules Apply."
+          ],
+          "WNBA_COACH_OF_THE_YEAR": [
+            "All In Betting Rules Apply."
+          ],
+          "TOP_POINTS_SCORER_WNBA": [
+            "All-in Betting. Dead Heat Rules Apply. Other players available upon request."
+          ],
+          "HIGHEST_POINTS_AVERAGE": [
+            "Winner will be the player with the highest points per game average for the WNBA 2025 Regular Season. Player must play at least 28 games. All in Betting, Dead Heat Rules apply."
+          ],
+          "NEXT_LOSS": [
+            "All-In Betting. Other Selections Available Upon Request."
+          ],
+          "WIRE_TO_WIRE": [
+            "The winner needs to lead the game at the end of every quarter. If neither team does, the winning bet is \"Any other result\"."
+          ],
+          "WIRE_TO_WIRE_WNBA": [
+            "The winner needs to lead the game at the end of every quarter. If neither team does, the winning bet is \"Any other result\"."
+          ],
+          "WINNING_AT_END_OF_EVERY_QUARTER_WNBA": [
+            "The winner needs to lead the game at the end of every quarter. If neither team does, the winning bet is \"Any other result\"."
+          ],
+          "TO_SCORE_10+_POINTS": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_SCORE_20+_POINTS": [
+            "Tap a player name or icon for stats and more betting options",
+            "Combine Selections into a Parlay"
+          ],
+          "TO_SCORE_25+_POINTS": [
+            "Tap a player name or icon for stats and more betting options",
+            "Combine Selections into a Parlay"
+          ],
+          "TO_SCORE_15+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_SCORE_25+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options",
+            "Combine Selections into a Parlay"
+          ],
+          "TO_SCORE_10+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_SCORE_20+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options",
+            "Combine Selections into a Parlay"
+          ],
+          "TO_SCORE_30+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_SCORE_35+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_SCORE_40+_POINTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "1+_MADE_THREES_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "2+_MADE_THREES_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "3+_MADE_THREES_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "4+_MADE_THREES_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "5+_MADE_THREES_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "6+_MADE_THREES_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_4+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_6+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_8+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_10+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_12+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_14+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_16+_REBOUNDS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_2+_ASSISTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_4+_ASSISTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_6+_ASSISTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_8+_ASSISTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_10+_ASSISTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "TO_RECORD_12+_ASSISTS_WNBA": [
+            "Tap a player name or icon for stats and more betting options"
+          ],
+          "4TH_QUARTER_HANDICAP_WNBA": [
+            "Graded on which team covers the spread in the listed quarter only and not the entire game before or after said quarter"
+          ],
+          "3RD_QUARTER_HANDICAP_WNBA": [
+            "Graded on which team covers the spread in the listed quarter only and not the entire game before or after said quarter."
+          ],
+          "2ND_QUARTER_HANDICAP_WNBA": [
+            "Graded on which team covers the spread in the listed quarter only and not the entire game before or after said quarter."
+          ],
+          "PLAYER_RACE_TO_10_POINTS": [
+            "Market is void if an unlisted player gets to 10 points first."
+          ]
+        }
+      },
+      "markets": {}
+    },
+    "promotions": {},
+    "page": {
+      "eventTypeId": 7522,
+      "competitionId": "11295025",
+      "eventId": 35737435
+    }
+  },
+  "attachments": {
+    "eventTypes": {
+      "7522": {
+        "eventTypeId": 7522,
+        "name": "Basketball"
+      }
+    },
+    "events": {
+      "35737435": {
+        "competitionId": 11295025,
+        "inPlay": false,
+        "eventId": 35737435,
+        "key": "EVENT:35737435",
+        "name": "Washington Mystics @ Minnesota Lynx",
+        "eventTypeId": 7522,
+        "countryCode": "GB",
+        "timezone": "GMT",
+        "openDate": "2026-06-21T22:00:00.000Z",
+        "videoAvailable": false,
+        "primaryMarketId": "734.173465748"
+      }
+    },
+    "competitions": {
+      "11295025": {
+        "key": "COMP:11295025",
+        "name": "WNBA",
+        "competitionId": 11295025,
+        "eventId": 28235033,
+        "eventTypeId": 7522,
+        "region": "USA"
+      }
+    },
+    "markets": {
+      "734.173465749": {
+        "marketId": "734.173465749",
+        "eventTypeId": 7522,
+        "competitionId": 11295025,
+        "eventId": 35737435,
+        "marketName": "Moneyline",
+        "marketTime": "2026-06-21T22:00:00.000Z",
+        "marketType": "MONEY_LINE",
+        "bspMarket": false,
+        "sgmMarket": true,
+        "inPlay": false,
+        "numberOfRunners": 2,
+        "numberOfActiveRunners": 2,
+        "numberOfWinners": 1,
+        "sortPriority": 0,
+        "bettingType": "ODDS",
+        "marketStatus": "OPEN",
+        "runners": [
+          {
+            "selectionId": 1519950,
+            "handicap": 0,
+            "runnerName": "Washington Mystics",
+            "sortPriority": 1,
+            "result": {
+              "type": "AWAY"
+            },
+            "runnerStatus": "ACTIVE",
+            "logo": "https://assets.sportsbook.fanduel.com/images/team/wnba/washington_mystics.png",
+            "nameAbbr": "WAS Mystics",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 630,
+                "americanOddsInt": 630
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 7.3
+                },
+                "fractionalOdds": {
+                  "numerator": 63,
+                  "denominator": 10
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 540,
+                  "americanOddsInt": 540
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 6.4
+                  },
+                  "fractionalOdds": {
+                    "numerator": 54,
+                    "denominator": 10
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 1519953,
+            "handicap": 0,
+            "runnerName": "Minnesota Lynx",
+            "sortPriority": 2,
+            "result": {
+              "type": "HOME"
+            },
+            "runnerStatus": "ACTIVE",
+            "logo": "https://assets.sportsbook.fanduel.com/images/team/wnba/minnesota_lynx.png",
+            "nameAbbr": "MIN Lynx",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": -1050,
+                "americanOddsInt": -1050
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 1.095238095238095
+                },
+                "fractionalOdds": {
+                  "numerator": 10,
+                  "denominator": 105
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": -850,
+                  "americanOddsInt": -850
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 1.117647058823529
+                  },
+                  "fractionalOdds": {
+                    "numerator": 10,
+                    "denominator": 85
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "canTurnInPlay": true,
+        "associatedMarkets": [
+          {
+            "eventId": 35737435,
+            "eventTypeId": 7522,
+            "externalMarketId": "42.586715678"
+          }
+        ],
+        "isSuperSubEnabled": false,
+        "shouldDisplayStatsInRunner": true,
+        "eachwayAvailable": false,
+        "legTypes": [
+          "SIMPLE_SELECTION"
+        ]
+      },
+      "734.173465748": {
+        "marketId": "734.173465748",
+        "eventTypeId": 7522,
+        "competitionId": 11295025,
+        "eventId": 35737435,
+        "marketName": "Spread Betting",
+        "marketTime": "2026-06-21T22:00:00.000Z",
+        "marketType": "MATCH_HANDICAP_(2-WAY)",
+        "bspMarket": false,
+        "sgmMarket": true,
+        "inPlay": false,
+        "numberOfRunners": 2,
+        "numberOfActiveRunners": 2,
+        "numberOfWinners": 1,
+        "sortPriority": 1,
+        "bettingType": "MOVING_HANDICAP",
+        "marketStatus": "OPEN",
+        "runners": [
+          {
+            "selectionId": 1519950,
+            "handicap": 14.5,
+            "runnerName": "Washington Mystics",
+            "sortPriority": 1,
+            "result": {
+              "type": "AWAY"
+            },
+            "runnerStatus": "ACTIVE",
+            "logo": "https://assets.sportsbook.fanduel.com/images/team/wnba/washington_mystics.png",
+            "nameAbbr": "WAS Mystics",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": -108,
+                "americanOddsInt": -108
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 1.925925925925926
+                },
+                "fractionalOdds": {
+                  "numerator": 100,
+                  "denominator": 108
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": -110,
+                  "americanOddsInt": -110
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 1.909090909090909
+                  },
+                  "fractionalOdds": {
+                    "numerator": 100,
+                    "denominator": 110
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 1519953,
+            "handicap": -14.5,
+            "runnerName": "Minnesota Lynx",
+            "sortPriority": 2,
+            "result": {
+              "type": "HOME"
+            },
+            "runnerStatus": "ACTIVE",
+            "logo": "https://assets.sportsbook.fanduel.com/images/team/wnba/minnesota_lynx.png",
+            "nameAbbr": "MIN Lynx",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": -112,
+                "americanOddsInt": -112
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 1.892857142857143
+                },
+                "fractionalOdds": {
+                  "numerator": 100,
+                  "denominator": 112
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": -110,
+                  "americanOddsInt": -110
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 1.909090909090909
+                  },
+                  "fractionalOdds": {
+                    "numerator": 100,
+                    "denominator": 110
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "canTurnInPlay": true,
+        "associatedMarkets": [
+          {
+            "eventId": 35737435,
+            "eventTypeId": 7522,
+            "externalMarketId": "42.586715676"
+          }
+        ],
+        "isSuperSubEnabled": false,
+        "shouldDisplayStatsInRunner": true,
+        "eachwayAvailable": false,
+        "legTypes": [
+          "SIMPLE_SELECTION"
+        ]
+      },
+      "734.173562184": {
+        "marketId": "734.173562184",
+        "eventTypeId": 7522,
+        "competitionId": 11295025,
+        "eventId": 35737435,
+        "marketName": "Total Points",
+        "marketTime": "2026-06-21T22:00:00.000Z",
+        "marketType": "TOTAL_POINTS_(OVER/UNDER)",
+        "bspMarket": false,
+        "sgmMarket": true,
+        "inPlay": false,
+        "numberOfRunners": 2,
+        "numberOfActiveRunners": 2,
+        "numberOfWinners": 1,
+        "sortPriority": 2,
+        "bettingType": "MOVING_HANDICAP",
+        "marketStatus": "OPEN",
+        "runners": [
+          {
+            "selectionId": 7017823,
+            "handicap": 170.5,
+            "runnerName": "Over",
+            "sortPriority": 1,
+            "result": {
+              "type": "OVER"
+            },
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": -106,
+                "americanOddsInt": -106
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 1.943396226415094
+                },
+                "fractionalOdds": {
+                  "numerator": 100,
+                  "denominator": 106
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": -110,
+                  "americanOddsInt": -110
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 1.909090909090909
+                  },
+                  "fractionalOdds": {
+                    "numerator": 100,
+                    "denominator": 110
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 7017824,
+            "handicap": 170.5,
+            "runnerName": "Under",
+            "sortPriority": 2,
+            "result": {
+              "type": "UNDER"
+            },
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": -114,
+                "americanOddsInt": -114
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 1.87719298245614
+                },
+                "fractionalOdds": {
+                  "numerator": 100,
+                  "denominator": 114
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": -110,
+                  "americanOddsInt": -110
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 1.909090909090909
+                  },
+                  "fractionalOdds": {
+                    "numerator": 100,
+                    "denominator": 110
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "canTurnInPlay": true,
+        "associatedMarkets": [
+          {
+            "eventId": 35737435,
+            "eventTypeId": 7522,
+            "externalMarketId": "42.586881403"
+          }
+        ],
+        "isSuperSubEnabled": false,
+        "shouldDisplayStatsInRunner": true,
+        "eachwayAvailable": false,
+        "legTypes": [
+          "SIMPLE_SELECTION"
+        ]
+      },
+      "734.173562195": {
+        "marketId": "734.173562195",
+        "eventTypeId": 7522,
+        "competitionId": 11295025,
+        "eventId": 35737435,
+        "marketName": "Moneyline / Total Points Parlay",
+        "marketTime": "2026-06-21T22:00:00.000Z",
+        "marketType": "MATCH_/_TOTAL_POINTS_DOUBLE_WNBA",
+        "bspMarket": false,
+        "sgmMarket": false,
+        "inPlay": false,
+        "numberOfRunners": 4,
+        "numberOfActiveRunners": 4,
+        "numberOfWinners": 1,
+        "sortPriority": 6,
+        "bettingType": "ODDS",
+        "marketStatus": "OPEN",
+        "runners": [
+          {
+            "selectionId": 20518657,
+            "handicap": 0,
+            "runnerName": "Washington Mystics / Over 168.5",
+            "sortPriority": 1,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 1300,
+                "americanOddsInt": 1300
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 14
+                },
+                "fractionalOdds": {
+                  "numerator": 13,
+                  "denominator": 1
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 1200,
+                  "americanOddsInt": 1200
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 13
+                  },
+                  "fractionalOdds": {
+                    "numerator": 12,
+                    "denominator": 1
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 20518654,
+            "handicap": 0,
+            "runnerName": "Washington Mystics / Under 168.5",
+            "sortPriority": 2,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 1300,
+                "americanOddsInt": 1300
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 14
+                },
+                "fractionalOdds": {
+                  "numerator": 13,
+                  "denominator": 1
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 1000,
+                  "americanOddsInt": 1000
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 11
+                  },
+                  "fractionalOdds": {
+                    "numerator": 10,
+                    "denominator": 1
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 69351617,
+            "handicap": 0,
+            "runnerName": "Minnesota Lynx / Over 168.5",
+            "sortPriority": 3,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": -110,
+                "americanOddsInt": -110
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 1.909090909090909
+                },
+                "fractionalOdds": {
+                  "numerator": 100,
+                  "denominator": 110
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 110,
+                  "americanOddsInt": 110
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 2.1
+                  },
+                  "fractionalOdds": {
+                    "numerator": 110,
+                    "denominator": 100
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 69351608,
+            "handicap": 0,
+            "runnerName": "Minnesota Lynx / Under 168.5",
+            "sortPriority": 4,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 140,
+                "americanOddsInt": 140
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 2.4
+                },
+                "fractionalOdds": {
+                  "numerator": 140,
+                  "denominator": 100
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 115,
+                  "americanOddsInt": 115
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 2.15
+                  },
+                  "fractionalOdds": {
+                    "numerator": 115,
+                    "denominator": 100
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "canTurnInPlay": true,
+        "associatedMarkets": [
+          {
+            "eventId": 35737435,
+            "eventTypeId": 7522,
+            "externalMarketId": "42.586881388"
+          }
+        ],
+        "isSuperSubEnabled": false,
+        "shouldDisplayStatsInRunner": true,
+        "eachwayAvailable": false,
+        "legTypes": [
+          "SIMPLE_SELECTION"
+        ]
+      },
+      "734.173562187": {
+        "marketId": "734.173562187",
+        "eventTypeId": 7522,
+        "competitionId": 11295025,
+        "eventId": 35737435,
+        "marketName": "Spread / Total Parlay",
+        "marketTime": "2026-06-21T22:00:00.000Z",
+        "marketType": "LINE_/_TOTAL_DOUBLE_WNBA",
+        "bspMarket": false,
+        "sgmMarket": false,
+        "inPlay": false,
+        "numberOfRunners": 4,
+        "numberOfActiveRunners": 4,
+        "numberOfWinners": 1,
+        "sortPriority": 5,
+        "bettingType": "ODDS",
+        "marketStatus": "OPEN",
+        "runners": [
+          {
+            "selectionId": 72446277,
+            "handicap": 0,
+            "runnerName": "Washington Mystics +11.5/Over 168.5",
+            "sortPriority": 1,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 310,
+                "americanOddsInt": 310
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 4.1
+                },
+                "fractionalOdds": {
+                  "numerator": 31,
+                  "denominator": 10
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 340,
+                  "americanOddsInt": 340
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 4.4
+                  },
+                  "fractionalOdds": {
+                    "numerator": 34,
+                    "denominator": 10
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 72446278,
+            "handicap": 0,
+            "runnerName": "Washington Mystics +11.5/Under 168.5",
+            "sortPriority": 2,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 400,
+                "americanOddsInt": 400
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 5
+                },
+                "fractionalOdds": {
+                  "numerator": 40,
+                  "denominator": 10
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 360,
+                  "americanOddsInt": 360
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 4.6
+                  },
+                  "fractionalOdds": {
+                    "numerator": 36,
+                    "denominator": 10
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 69955489,
+            "handicap": 0,
+            "runnerName": "Minnesota Lynx -11.5/Over 168.5",
+            "sortPriority": 3,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 180,
+                "americanOddsInt": 180
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 2.8
+                },
+                "fractionalOdds": {
+                  "numerator": 180,
+                  "denominator": 100
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 200,
+                  "americanOddsInt": 200
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 3
+                  },
+                  "fractionalOdds": {
+                    "numerator": 200,
+                    "denominator": 100
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "selectionId": 69955539,
+            "handicap": 0,
+            "runnerName": "Minnesota Lynx -11.5/Under 168.5",
+            "sortPriority": 4,
+            "result": {},
+            "runnerStatus": "ACTIVE",
+            "winRunnerOdds": {
+              "americanDisplayOdds": {
+                "americanOdds": 240,
+                "americanOddsInt": 240
+              },
+              "trueOdds": {
+                "decimalOdds": {
+                  "decimalOdds": 3.4
+                },
+                "fractionalOdds": {
+                  "numerator": 24,
+                  "denominator": 10
+                }
+              }
+            },
+            "previousWinRunnerOdds": [
+              {
+                "americanDisplayOdds": {
+                  "americanOdds": 200,
+                  "americanOddsInt": 200
+                },
+                "trueOdds": {
+                  "decimalOdds": {
+                    "decimalOdds": 3
+                  },
+                  "fractionalOdds": {
+                    "numerator": 200,
+                    "denominator": 100
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "canTurnInPlay": true,
+        "associatedMarkets": [
+          {
+            "eventId": 35737435,
+            "eventTypeId": 7522,
+            "externalMarketId": "42.586881387"
+          }
+        ],
+        "isSuperSubEnabled": false,
+        "shouldDisplayStatsInRunner": true,
+        "eachwayAvailable": false,
+        "legTypes": [
+          "SIMPLE_SELECTION"
+        ]
+      }
+    }
+  }
+}

@@ -42,6 +42,7 @@ _DDL = [
         game_date       TEXT,
         traditional_json TEXT,                  -- raw JSON blob (boxscoretraditionalv2)
         advanced_json    TEXT,                  -- raw JSON blob (boxscoreadvancedv2)
+        pbp_json        TEXT,                   -- cache-first Play-by-Play event JSON
         PRIMARY KEY (game_id)
     )
     """,

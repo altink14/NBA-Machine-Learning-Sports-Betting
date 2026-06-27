@@ -1,0 +1,29 @@
+Scanning for Basketball-Reference references...
+
+--- Scanning Backend ---
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\NBA-Machine-Learning-Sports-Betting\src\Utils\nba_computed_derivatives.py:11 (Term: basketball-reference) -> - https://www.basketball-reference.com/about/ratings.html  (formula documentation)
+
+--- Scanning Web Frontend ---
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\tsconfig.tsbuildinfo:1 (Term: bbref_data) -> {"fileNames":["./node_modules/typescript/lib/lib.es5.d.ts","./node_modules/typescript/lib/lib.es2015.d.ts","./node_modul
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\tsconfig.tsbuildinfo:1 (Term: bbref_) -> {"fileNames":["./node_modules/typescript/lib/lib.es5.d.ts","./node_modules/typescript/lib/lib.es2015.d.ts","./node_modul
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\injuries\page.tsx:9 (Term: bbref_data) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\injuries\page.tsx:9 (Term: bbref_) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\inside-the-game\page.tsx:22 (Term: bbref_data) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\inside-the-game\page.tsx:22 (Term: bbref_) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\pulse\page.tsx:8 (Term: bbref_data) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\pulse\page.tsx:8 (Term: bbref_) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\refs\page.tsx:19 (Term: bbref_data) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\refs\page.tsx:19 (Term: bbref_) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\value\page.tsx:8 (Term: bbref_data) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\app\(app)\stats\value\page.tsx:8 (Term: bbref_) -> import bbrefDataRaw from '@/lib/bbref_data_deep.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\components\dashboard\PicksPropsDashboard.tsx:19 (Term: bbref_data) -> import bbrefData from '@/lib/bbref_data.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\components\dashboard\PicksPropsDashboard.tsx:19 (Term: bbref_) -> import bbrefData from '@/lib/bbref_data.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\components\dashboard\RecommendationStrip.tsx:8 (Term: bbref_data) -> import bbrefData from '@/lib/bbref_data.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\components\dashboard\RecommendationStrip.tsx:8 (Term: bbref_) -> import bbrefData from '@/lib/bbref_data.json';
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\components\dashboard\RecommendationStrip.tsx:318 (Term: basketball-reference) -> // --- BASKETBALL-REFERENCE SEARCH & MERGE LOGIC ---
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\lib\player_ids.json:10 (Term: antetgi01) -> "Giannis Antetokounmpo": "antetgi01",
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\lib\player_ids.json:15 (Term: brunsja01) -> "Jalen Brunson": "brunsja01",
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\lib\player_ids.json:35 (Term: jamesle01) -> "LeBron James": "jamesle01",
+MATCH: c:\Users\altin\OneDrive\Documents\GitHub\basic-saas-starter\src\lib\player_ids.json:47 (Term: townska01) -> "Karl-Anthony Towns": "townska01",
+
+Scan complete. Total matches found: 22

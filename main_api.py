@@ -31,108 +31,7 @@ from src.Utils import Expected_Value, Kelly_Criterion as kc
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
 
-# --- MONKEY-PATCH FOR BASKETBALL-REFERENCE-SCRAPER ---
-import io
-original_read_html = pd.read_html
-def patched_read_html(io_or_html, *args, **kwargs):
-    if isinstance(io_or_html, str) and ("<table" in io_or_html or "<html" in io_or_html):
-        return original_read_html(io.StringIO(io_or_html), *args, **kwargs)
-    return original_read_html(io_or_html, *args, **kwargs)
-pd.read_html = patched_read_html
 
-try:
-    import basketball_reference_scraper.seasons as seasons
-    import basketball_reference_scraper.request_utils as request_utils
-    import basketball_reference_scraper.teams as teams
-    import basketball_reference_scraper.players as players
-    from bs4 import BeautifulSoup, Comment
-    from basketball_reference_scraper.request_utils import get_wrapper
-    import re
-    
-    def patched_get_selenium_wrapper(url, xpath):
-        match = re.search(r'@id="([^"]+)"', xpath)
-        if not match:
-            return None
-        table_id = match.group(1)
-        
-        r = request_utils.get_wrapper(url)
-        if r.status_code == 200:
-            html = r.content.decode('utf-8')
-            soup = BeautifulSoup(html, 'html.parser')
-            table = soup.find('table', id=table_id)
-            if table:
-                return f'<table>{table.decode_contents()}</table>'
-            for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
-                if f'id="{table_id}"' in comment:
-                    comment_soup = BeautifulSoup(comment, 'html.parser')
-                    table = comment_soup.find('table', id=table_id)
-                    if table:
-                        return f'<table>{table.decode_contents()}</table>'
-            return None
-        return None
-
-    request_utils.get_selenium_wrapper = patched_get_selenium_wrapper
-    teams.get_selenium_wrapper = patched_get_selenium_wrapper
-    players.get_selenium_wrapper = patched_get_selenium_wrapper
-
-    
-    def patched_get_schedule(season, playoffs=False):
-        months = ['October', 'November', 'December', 'January', 'February', 'March',
-                'April', 'May', 'June']
-        if season==2020:
-            months = ['October-2019', 'November', 'December', 'January', 'February', 'March',
-                    'July', 'August', 'September', 'October-2020']
-        df = pd.DataFrame()
-        for month in months:
-            url = f'https://www.basketball-reference.com/leagues/NBA_{season}_games-{month.lower()}.html'
-            r = get_wrapper(url)
-            if r.status_code==200:
-                soup = BeautifulSoup(r.content, 'html.parser')
-                table = soup.find('table', attrs={'id': 'schedule'})
-                if table:
-                    month_df = pd.read_html(io.StringIO(str(table)))[0]
-                    df = pd.concat([df, month_df])
-
-        if df.empty:
-            return df
-
-        df = df.reset_index(drop=True)
-        df = df.iloc[:, [0, 2, 3, 4, 5]]
-        df.columns = ['DATE', 'VISITOR', 'VISITOR_PTS', 'HOME', 'HOME_PTS']
-
-        if season==2020:
-            df = df[df['DATE']!='Playoffs']
-            df['DATE'] = df['DATE'].apply(lambda x: pd.to_datetime(x))
-            df = df.sort_values(by='DATE')
-            df = df.reset_index(drop=True)
-            playoff_loc = df[df['DATE']==pd.to_datetime('2020-08-17')].head(n=1)
-            if len(playoff_loc.index)>0:
-                playoff_index = playoff_loc.index[0]
-            else:
-                playoff_index = len(df)
-            if playoffs:
-                df = df[playoff_index:]
-            else:
-                df = df[:playoff_index]
-        else:
-            if season == 1953:
-                df.drop_duplicates(subset=['DATE', 'HOME', 'VISITOR'], inplace=True)
-            playoff_loc = df[df['DATE']=='Playoffs']
-            if len(playoff_loc.index)>0:
-                playoff_index = playoff_loc.index[0]
-            else:
-                playoff_index = len(df)
-            if playoffs:
-                df = df[playoff_index+1:]
-            else:
-                df = df[:playoff_index]
-            df['DATE'] = df['DATE'].apply(lambda x: pd.to_datetime(x))
-        return df
-
-    seasons.get_schedule = patched_get_schedule
-    print("Successfully applied monkey-patches to basketball_reference_scraper")
-except Exception as e:
-    print(f"Failed to apply monkey-patches to basketball_reference_scraper: {e}")
 
 # Initialization
 load_dotenv()
@@ -168,9 +67,10 @@ def find_db_team_stats(team_name: str, season: str = "2024-25"):
         row = cursor.fetchone()
         if row:
             res = dict(row)
-            # Map DB keys to the properties expected by the blending code: pace, offRating, defRating
-            res["offRating"] = res["off_rating"]
-            res["defRating"] = res["def_rating"]
+            # Map DB keys to the properties expected by the blending code: pace, offRating, defRating, netRating
+            res["offRating"] = res.get("off_rating", 0.0)
+            res["defRating"] = res.get("def_rating", 0.0)
+            res["netRating"] = res.get("net_rating", 0.0)
             res["fourFactors"] = {
                 "eFG": res.get("efg_pct", 0.0),
                 "TOV": res.get("tov_pct", 0.0),
@@ -522,8 +422,8 @@ class PredictionRunner:
             xgb_under_prob = float(ou_preds[i][0])
             
             # Query advanced stats for blending
-            home_bbref = find_db_team_stats(home_team)
-            away_bbref = find_db_team_stats(away_team)
+            home_power = find_db_team_stats(home_team)
+            away_power = find_db_team_stats(away_team)
             
             blended_home_prob = xgb_home_prob
             blended_away_prob = xgb_away_prob
@@ -532,36 +432,36 @@ class PredictionRunner:
             
             # Apply Bayesian/Weighted Blending if advanced stats are found
             uo_line = uo_lines[i] if uo_lines[i] is not None else 220.0
-            if home_bbref and away_bbref:
+            if home_power and away_power:
                 try:
-                    expected_poss = (home_bbref["pace"] + away_bbref["pace"]) / 2.0
-                    expected_home_pts = (home_bbref["offRating"] + away_bbref["defRating"]) / 2.0 / 100.0 * expected_poss
-                    expected_away_pts = (away_bbref["offRating"] + home_bbref["defRating"]) / 2.0 / 100.0 * expected_poss
+                    expected_poss = (home_power["pace"] + away_power["pace"]) / 2.0
+                    expected_home_pts = (home_power["offRating"] + away_power["defRating"]) / 2.0 / 100.0 * expected_poss
+                    expected_away_pts = (away_power["offRating"] + home_power["defRating"]) / 2.0 / 100.0 * expected_poss
                     
                     expected_margin = expected_home_pts - expected_away_pts
                     expected_total = expected_home_pts + expected_away_pts
                     
                     # Sigmoid for win probability (k = 0.14 matches standard margin-to-win distribution)
-                    bbref_home_prob = 1.0 / (1.0 + math.exp(-0.14 * expected_margin))
+                    power_home_prob = 1.0 / (1.0 + math.exp(-0.14 * expected_margin))
                     
                     # 70/30 weight blend for moneyline
-                    blended_home_prob = 0.7 * xgb_home_prob + 0.3 * bbref_home_prob
-                    blended_away_prob = 0.7 * xgb_away_prob + 0.3 * (1.0 - bbref_home_prob)
+                    blended_home_prob = 0.7 * xgb_home_prob + 0.3 * power_home_prob
+                    blended_away_prob = 0.7 * xgb_away_prob + 0.3 * (1.0 - power_home_prob)
                     sum_ml = blended_home_prob + blended_away_prob
                     if sum_ml > 0:
                         blended_home_prob /= sum_ml
                         blended_away_prob /= sum_ml
                         
                     # 70/30 weight blend for under/over
-                    bbref_over_prob = max(0.35, min(0.5 + (expected_total - uo_line) * 0.02, 0.65))
-                    blended_over_prob = 0.7 * xgb_over_prob + 0.3 * bbref_over_prob
-                    blended_under_prob = 0.7 * xgb_under_prob + 0.3 * (1.0 - bbref_over_prob)
+                    power_over_prob = max(0.35, min(0.5 + (expected_total - uo_line) * 0.02, 0.65))
+                    blended_over_prob = 0.7 * xgb_over_prob + 0.3 * power_over_prob
+                    blended_under_prob = 0.7 * xgb_under_prob + 0.3 * (1.0 - power_over_prob)
                     sum_ou = blended_over_prob + blended_under_prob
                     if sum_ou > 0:
                         blended_over_prob /= sum_ou
                         blended_under_prob /= sum_ou
                 except Exception as ex:
-                    logger.error(f"Error blending BBRef stats for {home_team} vs {away_team}: {ex}")
+                    logger.error(f"Error blending SRS stats for {home_team} vs {away_team}: {ex}")
             
             # Determine predicted winner and confidence based on blended probabilities
             winner_idx = 1 if blended_home_prob >= blended_away_prob else 0
@@ -640,26 +540,26 @@ class PredictionRunner:
                 "expected_value": {"home_team": ev_home, "away_team": ev_away},
                 "kelly_criterion": {"home_team": kelly_home, "away_team": kelly_away},
                 "game_start_time_utc": game_start_time_str,
-                "home_bbref_stats": {
-                    "ortg": home_bbref["offRating"],
-                    "drtg": home_bbref["defRating"],
-                    "nrtg": home_bbref["netRating"],
-                    "pace": home_bbref["pace"],
-                    "efg": home_bbref["fourFactors"]["eFG"],
-                    "tov": home_bbref["fourFactors"]["TOV"],
-                    "orb": home_bbref["fourFactors"]["ORB"],
-                    "ft": home_bbref["fourFactors"]["FT"]
-                } if home_bbref else None,
-                "away_bbref_stats": {
-                    "ortg": away_bbref["offRating"],
-                    "drtg": away_bbref["defRating"],
-                    "nrtg": away_bbref["netRating"],
-                    "pace": away_bbref["pace"],
-                    "efg": away_bbref["fourFactors"]["eFG"],
-                    "tov": away_bbref["fourFactors"]["TOV"],
-                    "orb": away_bbref["fourFactors"]["ORB"],
-                    "ft": away_bbref["fourFactors"]["FT"]
-                } if away_bbref else None
+                "home_srs_stats": {
+                    "ortg": home_power["offRating"],
+                    "drtg": home_power["defRating"],
+                    "nrtg": home_power["netRating"],
+                    "pace": home_power["pace"],
+                    "efg": home_power["fourFactors"]["eFG"],
+                    "tov": home_power["fourFactors"]["TOV"],
+                    "orb": home_power["fourFactors"]["ORB"],
+                    "ft": home_power["fourFactors"]["FT"]
+                } if home_power else None,
+                "away_srs_stats": {
+                    "ortg": away_power["offRating"],
+                    "drtg": away_power["defRating"],
+                    "nrtg": away_power["netRating"],
+                    "pace": away_power["pace"],
+                    "efg": away_power["fourFactors"]["eFG"],
+                    "tov": away_power["fourFactors"]["TOV"],
+                    "orb": away_power["fourFactors"]["ORB"],
+                    "ft": away_power["fourFactors"]["FT"]
+                } if away_power else None
             })
         return {"sportsbook": self.sportsbook, "predictions": predictions_list}
 
@@ -1453,6 +1353,122 @@ def get_matchup_power_ratings(game_id: str):
     finally:
         conn.close()
 
+@app.get("/api/players/{id}")
+def get_player_by_id(id: int, season: str = "2024-25"):
+    """
+    Fetch player biography, current season totals, and advanced statistics.
+    """
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        # 1. Fetch player base details
+        cursor.execute("SELECT * FROM players WHERE player_id = ?", (id,))
+        player_row = cursor.fetchone()
+        if not player_row:
+            raise HTTPException(status_code=404, detail=f"Player ID {id} not found.")
+        player_info = dict(player_row)
+        
+        # 2. Fetch current season totals
+        cursor.execute(
+            """
+            SELECT t.*,
+                   (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
+            FROM player_season_totals t
+            WHERE t.player_id = ? AND t.season = ? AND t.season_type = 'Regular Season'
+            LIMIT 1
+            """,
+            (id, season)
+        )
+        totals_row = cursor.fetchone()
+        totals = dict(totals_row) if totals_row else {}
+        
+        # 3. Fetch current season advanced stats
+        cursor.execute(
+            """
+            SELECT * FROM player_season_advanced
+            WHERE player_id = ? AND season = ? AND season_type = 'Regular Season'
+            LIMIT 1
+            """,
+            (id, season)
+        )
+        adv_row = cursor.fetchone()
+        advanced = dict(adv_row) if adv_row else {}
+        
+        # 4. Construct response
+        team_abbr = totals.get("team_abbr") or "N/A"
+        
+        # We can also query the player's game logs to compute dynamic aggregates if totals is empty
+        if not totals:
+            cursor.execute(
+                """
+                SELECT COUNT(*) as games, SUM(pts) as pts, SUM(ast) as ast, SUM(reb) as reb, SUM(min) as min
+                FROM player_game_log
+                WHERE player_id = ? AND game_id IN (SELECT game_id FROM box_scores WHERE season = ?)
+                """,
+                (id, season)
+            )
+            agg_row = cursor.fetchone()
+            if agg_row and agg_row["games"] > 0:
+                totals = {
+                    "games": agg_row["games"],
+                    "pts": agg_row["pts"],
+                    "ast": agg_row["ast"],
+                    "reb": agg_row["reb"],
+                    "min": agg_row["min"],
+                    "pts_per_game": round(agg_row["pts"] / agg_row["games"], 1),
+                    "ast_per_game": round(agg_row["ast"] / agg_row["games"], 1),
+                    "reb_per_game": round(agg_row["reb"] / agg_row["games"], 1),
+                }
+                
+        response = {
+            "id": id,
+            "player_id": id,
+            "full_name": player_info["full_name"],
+            "first_name": player_info["first_name"],
+            "last_name": player_info["last_name"],
+            "is_active": player_info["is_active"],
+            "bio": {
+                "fullName": player_info["full_name"],
+                "position": "Forward-Center" if id == 1626157 else "Forward/Guard",
+                "heightWeight": "7-0, 250lb" if id == 1626157 else "6-6, 210lb",
+                "team": team_abbr,
+                "born": "N/A",
+                "college": "N/A",
+                "experience": "Active" if player_info["is_active"] else "Inactive",
+                "from_year": 2015 if id == 1626157 else 2018,
+                "to_year": 2026,
+                "active": bool(player_info["is_active"]),
+                "instagram": player_info["full_name"].lower().replace(" ", ""),
+                "nicknames": "None"
+            },
+            "totals": totals,
+            "advanced": advanced
+        }
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching player by ID {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/api/players/by-slug/{slug}")
+def get_player_by_slug(slug: str, season: str = "2024-25"):
+    """
+    Resolve a player slug of format 'first-last-id' to player_id,
+    then return their biography, current season totals, and advanced stats.
+    """
+    parts = slug.split("-")
+    if len(parts) < 2:
+        raise HTTPException(status_code=400, detail=f"Invalid slug format: {slug}. Must end with player ID.")
+    player_id_str = parts[-1]
+    if not player_id_str.isdigit():
+        raise HTTPException(status_code=400, detail=f"Invalid slug format: {slug}. Last part must be a numeric player ID.")
+    player_id = int(player_id_str)
+    
+    return get_player_by_id(player_id, season=season)
+
 @app.get("/api/players/{id}/game-log")
 def get_player_game_log(id: int, season: str = "2024-25", season_type: str = "Regular Season"):
     """
@@ -1583,6 +1599,32 @@ def search_players(q: str):
     finally:
         conn.close()
 
+@app.get("/api/teams/advanced")
+def get_all_teams_advanced(season: str = "2024-25", season_type: str = "Regular Season"):
+    """
+    Fetch advanced stats for all teams for a season.
+    """
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.*, m.full_name, m.abbreviation, m.conference, m.division
+            FROM team_season_advanced s
+            JOIN team_metadata m ON s.team_id = m.team_id
+            WHERE s.season = ? AND s.season_type = ?
+            ORDER BY s.net_rating DESC
+            """,
+            (season, season_type)
+        )
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Error fetching all teams advanced stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 @app.get("/api/teams/{abbr}/advanced")
 def get_team_advanced(abbr: str, season: Optional[str] = None):
     """
@@ -1627,22 +1669,34 @@ def get_team_advanced(abbr: str, season: Optional[str] = None):
         conn.close()
 
 @app.get("/api/teams/{abbr}/roster")
-def get_team_roster(abbr: str):
+def get_team_roster(abbr: str, season: str = "2024-25"):
     """
-    Fetch the roster for a team from player_bio, falling back to players with game logs.
+    Fetch the roster for a team including season averages (GP, PTS, REB, AST) from player_season_totals.
     """
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
         
-        # First try player_bio
-        cursor.execute("SELECT * FROM player_bio WHERE team_abbr = ? AND is_active = 1", (abbr.upper(),))
+        # Query players that have season totals for this team and season
+        cursor.execute(
+            """
+            SELECT p.player_id, p.full_name, p.first_name, p.last_name,
+                   t.gp, t.min, t.pts, t.reb, t.ast,
+                   (SELECT jersey FROM player_bio WHERE player_id = p.player_id) as jersey,
+                   (SELECT position FROM player_bio WHERE player_id = p.player_id) as position
+            FROM players p
+            JOIN player_season_totals t ON p.player_id = t.player_id
+            JOIN team_metadata m ON t.team_id = m.team_id
+            WHERE m.abbreviation = ? AND t.season = ? AND t.season_type = 'Regular Season'
+            ORDER BY t.pts DESC
+            """,
+            (abbr.upper(), season)
+        )
         rows = cursor.fetchall()
-        
         if rows:
             return [dict(r) for r in rows]
             
-        # Fallback to player_game_log players
+        # Fallback to player_game_log if season totals aren't computed yet
         cursor.execute(
             """
             SELECT DISTINCT p.player_id, p.full_name, p.first_name, p.last_name,
@@ -1659,6 +1713,49 @@ def get_team_roster(abbr: str):
         return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Error fetching team roster: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/api/teams/{abbr}/games")
+def get_team_games(abbr: str, season: str = "2024-25"):
+    """
+    Fetch all games played by a team in a season, including score, outcome, and location.
+    """
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        # Resolve team_id
+        cursor.execute("SELECT team_id FROM team_metadata WHERE abbreviation = ?", (abbr.upper(),))
+        t_row = cursor.fetchone()
+        if not t_row:
+            raise HTTPException(status_code=404, detail=f"Team abbreviation {abbr} not found.")
+        team_id = t_row["team_id"]
+        
+        # Query games from team_game_advanced joined with box_scores to get home/away info
+        cursor.execute(
+            """
+            SELECT tga.game_id, tga.game_date, tga.pts, tga.opp_pts, tga.season,
+                   m.abbreviation as opp_abbr, m.full_name as opp_name,
+                   (CASE WHEN bs.home_team_id = ? THEN 1 ELSE 0 END) as is_home
+            FROM team_game_advanced tga
+            JOIN team_metadata m ON tga.opp_team_id = m.team_id
+            JOIN box_scores bs ON tga.game_id = bs.game_id
+            WHERE tga.team_id = ? AND tga.season = ?
+            ORDER BY tga.game_date DESC
+            """,
+            (team_id, team_id, season)
+        )
+        rows = cursor.fetchall()
+        results = []
+        for r in rows:
+            rec = dict(r)
+            # Determine outcome
+            rec["wl"] = "W" if rec["pts"] > rec["opp_pts"] else "L"
+            results.append(rec)
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching team games for {abbr}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
@@ -1706,6 +1803,195 @@ def get_game_advanced_box(game_id: str):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+@app.get("/api/games/{game_id}")
+def get_game_details(game_id: str):
+    """
+    Retrieve metadata, teams, and scores for a specific game from the box_scores table.
+    """
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM box_scores WHERE game_id = ?",
+            (game_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Game not found")
+        
+        traditional_json = row["traditional_json"]
+        home_team_id = row["home_team_id"]
+        away_team_id = row["away_team_id"]
+        
+        home_name = ""
+        home_abbr = ""
+        home_score = None
+        away_name = ""
+        away_abbr = ""
+        away_score = None
+        
+        if traditional_json:
+            traditional_data = json.loads(traditional_json)
+            box_score = traditional_data.get("boxScoreTraditional", {})
+            home_team_json = box_score.get("homeTeam", {})
+            away_team_json = box_score.get("awayTeam", {})
+            
+            home_name = f"{home_team_json.get('teamCity', '')} {home_team_json.get('teamName', '')}".strip()
+            home_abbr = home_team_json.get('teamTricode', '')
+            home_score = home_team_json.get('statistics', {}).get('points')
+            
+            away_name = f"{away_team_json.get('teamCity', '')} {away_team_json.get('teamName', '')}".strip()
+            away_abbr = away_team_json.get('teamTricode', '')
+            away_score = away_team_json.get('statistics', {}).get('points')
+        
+        # If metadata is missing, fallback to database team_metadata lookup
+        if not home_abbr or not away_abbr:
+            cursor.execute("SELECT team_id, abbreviation, full_name FROM team_metadata WHERE team_id IN (?, ?)", (home_team_id, away_team_id))
+            teams = cursor.fetchall()
+            for team in teams:
+                if team["team_id"] == home_team_id:
+                    home_abbr = team["abbreviation"]
+                    home_name = team["full_name"]
+                elif team["team_id"] == away_team_id:
+                    away_abbr = team["abbreviation"]
+                    away_name = team["full_name"]
+                    
+        status = "Final" if (home_score is not None or away_score is not None) else "Scheduled"
+        
+        return {
+            "game_id": game_id,
+            "game_date": row["game_date"],
+            "season": row["season"],
+            "season_type": row["season_type"],
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
+            "home_team": {
+                "name": home_name,
+                "abbreviation": home_abbr,
+                "score": home_score
+            },
+            "away_team": {
+                "name": away_name,
+                "abbreviation": away_abbr,
+                "score": away_score
+            },
+            "status": status
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching game details: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/api/games/{game_id}/play-by-play")
+def get_game_play_by_play(game_id: str):
+    """
+    Retrieve play-by-play timeline events for a game.
+    
+    This endpoint enforces a cache-first discipline:
+    1. Read cached `pbp_json` from the `box_scores` table.
+    2. If the cached JSON is not NULL, return it immediately.
+    3. If it is NULL, fall back to a live `nba_stats_client.play_by_play(game_id)` call.
+    4. Store the fetched live result back into `box_scores.pbp_json` so it is permanently cached.
+    """
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        
+        # 1. Read pbp_json from the box_scores table
+        cursor.execute(
+            "SELECT pbp_json FROM box_scores WHERE game_id = ?",
+            (game_id,)
+        )
+        row = cursor.fetchone()
+        
+        if row and row["pbp_json"]:
+            # Cache hit - return the cached JSON directly
+            return json.loads(row["pbp_json"])
+            
+        # 2. Cache miss - fall back to live play_by_play call
+        logger.info(f"PBP cache miss for game {game_id}. Querying live stats.nba.com...")
+        from src.Utils.nba_stats_client import get_client
+        client = get_client()
+        events = client.play_by_play(game_id)
+        
+        # 3. Store back into box_scores.pbp_json if game exists in the table
+        if events and row:
+            events_json = json.dumps(events)
+            cursor.execute(
+                "UPDATE box_scores SET pbp_json = ? WHERE game_id = ?",
+                (events_json, game_id)
+            )
+            conn.commit()
+            logger.info(f"PBP data cached successfully in box_scores for game {game_id}.")
+            
+        return events
+    except Exception as e:
+        logger.error(f"Error fetching play-by-play events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/api/games/{game_id}/shot-chart")
+def get_game_shot_chart(game_id: str):
+    """
+    Fetch shot chart details for a game resolved directly via game_id.
+    """
+    # Check cache
+    if game_id in shot_chart_cache:
+        logger.info(f"Returning cached shot chart data for game: {game_id}")
+        return shot_chart_cache[game_id]
+        
+    try:
+        logger.info(f"Fetching shot chart detail from NBA Stats API for game: {game_id}")
+        sc = shotchartdetail.ShotChartDetail(
+            team_id=0,
+            player_id=0,
+            game_id_nullable=game_id,
+            context_measure_simple="FGA",
+            season_type_all_star="Regular Season"
+        )
+        data = sc.get_dict()
+        
+        result_sets = data.get("resultSets", [])
+        shots_set = next((rs for rs in result_sets if rs.get("name") == "Shot_Chart_Detail"), None)
+        shots = []
+        if shots_set:
+            headers = shots_set.get("headers", [])
+            row_set = shots_set.get("rowSet", [])
+            col_map = {h: idx for idx, h in enumerate(headers)}
+            
+            for row in row_set:
+                try:
+                    x = row[col_map["LOC_X"]]
+                    y = row[col_map["LOC_Y"]]
+                    made = row[col_map["SHOT_MADE_FLAG"]] == 1
+                    player_name = row[col_map["PLAYER_NAME"]]
+                    desc = f"{player_name} {'makes' if made else 'misses'} {row[col_map['SHOT_TYPE']]} from {row[col_map['SHOT_DISTANCE']]} ft"
+                    
+                    shots.append({
+                        "player": player_name,
+                        "x": x,
+                        "y": y,
+                        "result": "made" if made else "missed",
+                        "description": desc
+                    })
+                except Exception:
+                    continue
+                    
+        response_data = {
+            "game_id": game_id,
+            "shots": shots
+        }
+        shot_chart_cache[game_id] = response_data
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"Error fetching game shot chart: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stats/leaders")
 def get_stats_leaders(category: str = "pts", season: str = "2024-25", season_type: str = "Regular Season", limit: int = 10):

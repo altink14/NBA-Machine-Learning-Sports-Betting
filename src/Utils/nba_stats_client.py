@@ -22,7 +22,7 @@ from nba_api.stats.endpoints import (
     scoreboardv3,
     boxscoretraditionalv3,
     boxscoreadvancedv3,
-    playbyplayv2,
+    playbyplayv3,
     leaguedashteamstats,
     commonallplayers,
     commonteamroster,
@@ -181,11 +181,9 @@ class NBAStatsClient:
     def play_by_play(self, game_id: str) -> List[Dict]:
         params = {
             "game_id": game_id,
-            "start_period": 0,
-            "end_period": 10,
         }
-        raw = self._fetch("playbyplayv2", playbyplayv2.PlayByPlayV2, params, ttl=_COMPLETED_GAME_TTL)
-        return self._parse_result_set(raw, "PlayByPlay")
+        raw = self._fetch("playbyplayv3", playbyplayv3.PlayByPlayV3, params, ttl=_COMPLETED_GAME_TTL)
+        return raw.get("game", {}).get("actions", [])
 
     def league_dash_team_stats(
         self,

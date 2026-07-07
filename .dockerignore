@@ -1,0 +1,12 @@
+venv/
+.git/
+Data/*.sqlite
+Data/*.sqlite-shm
+Data/*.sqlite-wal
+Data/nba_cache/
+__pycache__/
+*.pyc
+.env
+Flask/
+node_modules/
+daily_update.log

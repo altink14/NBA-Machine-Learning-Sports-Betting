@@ -309,7 +309,8 @@ def process_game(
     season: str = "2024-25",
     season_type: str = "Regular Season",
     db_path: str = "Data/TeamData.sqlite",
-    overwrite: bool = False
+    overwrite: bool = False,
+    game_date_hint: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Run pipeline ETL for a single game using V3 box score endpoints.
@@ -369,18 +370,24 @@ def process_game(
         team_b.opp_team_id = team_a.team_id
         team_b.opp_pts = team_a.pts
 
-        # Fetch/use game header metadata for date
-        summary_sets = client.boxscore_summary(game_id)
-        game_date_est = None
-        for key in ("GameSummary", "GameHeader"):
-            if key in summary_sets and len(summary_sets[key]) > 0:
-                game_date_est = summary_sets[key][0].get("GAME_DATE_EST", None)
-                if game_date_est:
-                    break
-        if game_date_est:
-            # "2024-10-22T00:00:00" -> "2024-10-22"
-            game_date = game_date_est.split("T")[0]
+        # Game date: prefer the caller-provided hint (backfill already knows it
+        # from the league game log). BoxScoreSummaryV2 stopped returning data
+        # for games on/after 2025-04-10, so it is only a guarded fallback.
+        game_date = None
+        if game_date_hint:
+            game_date = str(game_date_hint).split("T")[0]
         else:
+            try:
+                summary_sets = client.boxscore_summary(game_id)
+                for key in ("GameSummary", "GameHeader"):
+                    if key in summary_sets and len(summary_sets[key]) > 0:
+                        game_date_est = summary_sets[key][0].get("GAME_DATE_EST", None)
+                        if game_date_est:
+                            game_date = game_date_est.split("T")[0]
+                            break
+            except Exception as exc:
+                logger.warning("boxscore_summary unavailable for %s (%s); using fallback date.", game_id, exc)
+        if not game_date:
             game_date = datetime.now().strftime("%Y-%m-%d")
 
         # Save raw JSONs to database

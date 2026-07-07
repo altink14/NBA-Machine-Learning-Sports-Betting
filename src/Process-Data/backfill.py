@@ -48,10 +48,13 @@ def backfill_games(
     game_log_rows = client.league_game_log(season=season, season_type=season_type, player_or_team="T")
     
     unique_game_ids: Set[str] = set()
+    game_dates: Dict[str, str] = {}
     for row in game_log_rows:
         if "GAME_ID" in row:
             unique_game_ids.add(row["GAME_ID"])
-            
+            if row.get("GAME_DATE"):
+                game_dates[row["GAME_ID"]] = row["GAME_DATE"]
+
     game_ids = sorted(list(unique_game_ids))
     logger.info("Found %d unique games to process for %s.", len(game_ids), season)
     
@@ -68,7 +71,8 @@ def backfill_games(
                 season=season,
                 season_type=season_type,
                 db_path=db_path,
-                overwrite=overwrite
+                overwrite=overwrite,
+                game_date_hint=game_dates.get(game_id)
             )
             if res.get("status") == "cached":
                 cached_count += 1

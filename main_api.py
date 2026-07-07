@@ -40,7 +40,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- DATABASE-BACKED ADVANCED STATS LOOKUP (REPLACES BBREF) ---
-def find_db_team_stats(team_name: str, season: str = "2024-25"):
+# Latest season with complete data in the stats database.
+# Bump each fall once the new season's games start flowing in.
+CURRENT_SEASON = "2025-26"
+
+def find_db_team_stats(team_name: str, season: str = CURRENT_SEASON):
     """
     Lookup team season advanced statistics (pace, offensive rating, defensive rating)
     from SQLite database to blend with predictions.
@@ -1367,7 +1371,7 @@ def get_active_players():
 player_shot_chart_cache = {}
 
 @app.get("/api/player-shot-chart")
-def get_player_shot_chart(player_id: int, season: str = "2024-25"):
+def get_player_shot_chart(player_id: int, season: str = CURRENT_SEASON):
     cache_key = f"{player_id}_{season}"
     if cache_key in player_shot_chart_cache:
         logger.info(f"Returning cached player shot chart for key: {cache_key}")
@@ -1737,7 +1741,7 @@ def search_players(q: str):
         conn.close()
 
 @app.get("/api/players/{id}")
-def get_player_by_id(id: int, season: str = "2024-25"):
+def get_player_by_id(id: int, season: str = CURRENT_SEASON):
     """
     Fetch player biography, current season totals, and advanced statistics.
     """
@@ -1972,7 +1976,7 @@ def get_player_by_id(id: int, season: str = "2024-25"):
         conn.close()
 
 @app.get("/api/players/by-slug/{slug}")
-def get_player_by_slug(slug: str, season: str = "2024-25"):
+def get_player_by_slug(slug: str, season: str = CURRENT_SEASON):
     """
     Resolve a player slug of format 'first-last-id' to player_id,
     then return their biography, current season totals, and advanced stats.
@@ -1988,7 +1992,7 @@ def get_player_by_slug(slug: str, season: str = "2024-25"):
     return get_player_by_id(player_id, season=season)
 
 @app.get("/api/players/{id}/game-log")
-def get_player_game_log(id: int, season: str = "2024-25", season_type: str = "Regular Season"):
+def get_player_game_log(id: int, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Fetch a player's individual game log from player_game_log table.
     """
@@ -2025,7 +2029,7 @@ def get_player_game_log(id: int, season: str = "2024-25", season_type: str = "Re
         conn.close()
 
 @app.get("/api/players/{id}/splits")
-def get_player_splits_api(id: int, season: str = "2024-25", season_type: str = "Regular Season"):
+def get_player_splits_api(id: int, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Fetch player splits (Location, Wins/Losses, Month) from player_splits table.
     """
@@ -2090,7 +2094,7 @@ def get_player_career(id: int):
         conn.close()
 
 @app.get("/api/teams/advanced")
-def get_all_teams_advanced(season: str = "2024-25", season_type: str = "Regular Season"):
+def get_all_teams_advanced(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Fetch advanced stats for all teams for a season.
     """
@@ -2159,7 +2163,7 @@ def get_team_advanced(abbr: str, season: Optional[str] = None):
         conn.close()
 
 @app.get("/api/teams/{abbr}/roster")
-def get_team_roster(abbr: str, season: str = "2024-25"):
+def get_team_roster(abbr: str, season: str = CURRENT_SEASON):
     """
     Fetch the roster for a team including season averages (GP, PTS, REB, AST) from player_season_totals.
     """
@@ -2208,7 +2212,7 @@ def get_team_roster(abbr: str, season: str = "2024-25"):
         conn.close()
 
 @app.get("/api/teams/{abbr}/games")
-def get_team_games(abbr: str, season: str = "2024-25"):
+def get_team_games(abbr: str, season: str = CURRENT_SEASON):
     """
     Fetch all games played by a team in a season, including score, outcome, and location.
     """
@@ -2484,7 +2488,7 @@ def get_game_shot_chart(game_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stats/leaders")
-def get_stats_leaders(category: str = "pts", season: str = "2024-25", season_type: str = "Regular Season", limit: int = 10):
+def get_stats_leaders(category: str = "pts", season: str = CURRENT_SEASON, season_type: str = "Regular Season", limit: int = 10):
     """
     Fetch league leaders for a specific stat category.
     """
@@ -2517,7 +2521,7 @@ def get_stats_leaders(category: str = "pts", season: str = "2024-25", season_typ
         conn.close()
 
 @app.get("/api/stats/standings")
-def get_stats_standings(season: str = "2024-25", season_type: str = "Regular Season"):
+def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Fetch league standings compiled from team_season_advanced and team_metadata.
     """

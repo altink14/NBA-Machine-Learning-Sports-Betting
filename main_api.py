@@ -1140,6 +1140,82 @@ def get_player_highs(id: int):
         conn.close()
 
 
+# --- Game Finder: Stathead-style queries over the game-log archive ---
+@app.get("/api/finder/player-games")
+def finder_player_games(
+    min_pts: Optional[int] = None,
+    min_reb: Optional[int] = None,
+    min_ast: Optional[int] = None,
+    min_stl: Optional[int] = None,
+    min_blk: Optional[int] = None,
+    min_fg3m: Optional[int] = None,
+    season: Optional[str] = None,
+    season_type: Optional[str] = None,
+    player: Optional[str] = None,
+    opponent: Optional[str] = None,
+    sort: str = "pts",
+    limit: int = 100,
+):
+    """
+    Find individual player games matching stat thresholds across the whole
+    archive. Example: min_pts=40&season_type=Playoffs -> every 40-point
+    playoff game we have.
+    """
+    sortable = {"pts", "reb", "ast", "stl", "blk", "fg3m", "game_date"}
+    if sort not in sortable:
+        raise HTTPException(status_code=400, detail=f"sort must be one of {sorted(sortable)}")
+    limit = max(1, min(int(limit), 200))
+
+    where = ["1=1"]
+    params: list = []
+    for col, val in (("pts", min_pts), ("reb", min_reb), ("ast", min_ast),
+                     ("stl", min_stl), ("blk", min_blk), ("fg3m", min_fg3m)):
+        if val is not None:
+            where.append(f"g.{col} >= ?")
+            params.append(int(val))
+    if season:
+        where.append("t.season = ?")
+        params.append(season)
+    if season_type:
+        where.append("t.season_type = ?")
+        params.append(season_type)
+    if player:
+        where.append("p.full_name LIKE ?")
+        params.append(f"%{player}%")
+    if opponent:
+        where.append("om.abbreviation = ?")
+        params.append(opponent.upper())
+
+    conn = get_db_conn()
+    try:
+        query = f"""
+            SELECT g.game_id, g.game_date, g.player_id, p.full_name,
+                   g.min, g.pts, g.reb, g.ast, g.stl, g.blk, g.fg3m, g.fgm, g.fga,
+                   t.season, t.season_type, t.pts AS team_pts, t.opp_pts,
+                   m.abbreviation AS team_abbr, om.abbreviation AS opp_abbr
+            FROM player_game_log g
+            JOIN players p ON p.player_id = g.player_id
+            JOIN team_game_advanced t ON t.game_id = g.game_id AND t.team_id = g.team_id
+            JOIN team_metadata m ON m.team_id = g.team_id
+            JOIN team_metadata om ON om.team_id = t.opp_team_id
+            WHERE {" AND ".join(where)}
+            ORDER BY g.{sort} DESC, g.game_date DESC
+            LIMIT ?
+        """
+        rows = conn.execute(query, params + [limit]).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["won"] = (d.pop("team_pts") or 0) > (d.pop("opp_pts") or 0)
+            results.append(d)
+        return {"count": len(results), "limit": limit, "results": results}
+    except Exception as e:
+        logger.error(f"Error in game finder: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Player awards (official, via stats.nba.com; cached per player) ---
 def _ensure_player_awards(conn, player_id: int) -> None:
     conn.execute(

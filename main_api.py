@@ -2491,28 +2491,59 @@ def get_game_shot_chart(game_id: str):
 def get_stats_leaders(category: str = "pts", season: str = CURRENT_SEASON, season_type: str = "Regular Season", limit: int = 10):
     """
     Fetch league leaders for a specific stat category.
+
+    Counting stats (pts, ast, ...) are returned as season totals ordered by
+    the total — clients divide by gp for per-game boards. Percentage stats
+    (fg_pct, fg3_pct, ft_pct) are ordered by the percentage itself with
+    basketball-reference-style qualification minimums so a 3-for-3 bench
+    stint can't lead the league.
     """
-    allowed_categories = ["pts", "ast", "reb", "stl", "blk", "min", "fg3m", "tov", "pf"]
-    if category.lower() not in allowed_categories:
-        raise HTTPException(status_code=400, detail=f"Category must be one of {allowed_categories}")
-        
+    counting_categories = ["pts", "ast", "reb", "stl", "blk", "min", "fg3m", "tov", "pf"]
+    # category -> (attempts column, minimum attempts to qualify, per 82-game season)
+    pct_categories = {
+        "fg_pct": ("fga", 300),
+        "fg3_pct": ("fg3a", 82),
+        "ft_pct": ("fta", 125),
+    }
+    cat = category.lower()
+    if cat not in counting_categories and cat not in pct_categories:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Category must be one of {counting_categories + list(pct_categories)}"
+        )
+
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
-        
-        # Safely interpolate category using allowed check above to prevent SQL injection
-        query = f"""
-            SELECT t.*, p.full_name,
-                   (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
-            FROM player_season_totals t
-            JOIN players p ON t.player_id = p.player_id
-            WHERE t.season = ? AND t.season_type = ?
-            ORDER BY t.{category.lower()} DESC
-            LIMIT ?
-        """
-        cursor.execute(query, (season, season_type, limit))
+
+        # Category names are validated against the allowlists above, so the
+        # f-string interpolation cannot inject SQL.
+        if cat in pct_categories:
+            attempts_col, min_attempts = pct_categories[cat]
+            query = f"""
+                SELECT t.*, p.full_name,
+                       (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
+                FROM player_season_totals t
+                JOIN players p ON t.player_id = p.player_id
+                WHERE t.season = ? AND t.season_type = ?
+                  AND t.{attempts_col} >= ? AND t.{cat} IS NOT NULL
+                ORDER BY t.{cat} DESC
+                LIMIT ?
+            """
+            cursor.execute(query, (season, season_type, min_attempts, limit))
+        else:
+            query = f"""
+                SELECT t.*, p.full_name,
+                       (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
+                FROM player_season_totals t
+                JOIN players p ON t.player_id = p.player_id
+                WHERE t.season = ? AND t.season_type = ?
+                ORDER BY t.{cat} DESC
+                LIMIT ?
+            """
+            cursor.execute(query, (season, season_type, limit))
         rows = cursor.fetchall()
-        
+
         return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Error fetching stats leaders: {e}", exc_info=True)

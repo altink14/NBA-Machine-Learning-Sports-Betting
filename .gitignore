@@ -110,3 +110,6 @@ venv.bak/
 Data/nba_cache/
 *.sqlite-shm
 *.sqlite-wal
+
+# Databases are data artifacts, not source - bootstrapped from release snapshots
+Data/*.sqlite

@@ -1140,6 +1140,214 @@ def get_player_highs(id: int):
         conn.close()
 
 
+# --- Player awards (official, via stats.nba.com; cached per player) ---
+def _ensure_player_awards(conn, player_id: int) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_awards (
+            player_id INTEGER,
+            description TEXT,
+            all_nba_team_number TEXT,
+            season TEXT,
+            team TEXT,
+            fetched_at TEXT,
+            PRIMARY KEY (player_id, description, season, all_nba_team_number)
+        )
+        """
+    )
+    row = conn.execute(
+        "SELECT MAX(fetched_at) FROM player_awards WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    # Refresh at most weekly; award histories change rarely.
+    if row and row[0] and row[0] > (datetime.utcnow() - timedelta(days=7)).isoformat():
+        return
+    from nba_api.stats.endpoints import playerawards
+    data = playerawards.PlayerAwards(player_id=player_id).get_dict()
+    rs = data["resultSets"][0]
+    idx = {h: i for i, h in enumerate(rs["headers"])}
+    now = datetime.utcnow().isoformat()
+    conn.execute("DELETE FROM player_awards WHERE player_id = ?", (player_id,))
+    for r in rs["rowSet"]:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO player_awards
+            (player_id, description, all_nba_team_number, season, team, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                player_id,
+                r[idx["DESCRIPTION"]],
+                str(r[idx["ALL_NBA_TEAM_NUMBER"]] or ""),
+                r[idx["SEASON"]],
+                r[idx["TEAM"]],
+                now,
+            ),
+        )
+    conn.commit()
+
+
+@app.get("/api/players/{id}/awards")
+def get_player_awards(id: int):
+    """Official award history: description, season, All-NBA/All-Defense team number."""
+    conn = get_db_conn()
+    try:
+        try:
+            _ensure_player_awards(conn, id)
+        except Exception as exc:
+            logger.warning(f"Award fetch failed for {id} (serving cache if any): {exc}")
+        rows = conn.execute(
+            """
+            SELECT description, all_nba_team_number, season, team
+            FROM player_awards WHERE player_id = ?
+            ORDER BY season DESC, description
+            """,
+            (id,),
+        ).fetchall()
+        awards = [dict(r) for r in rows]
+        # Grouped summary for chip rendering: {"All-NBA": ["2024-25 (1st)", ...]}
+        summary = {}
+        for a in awards:
+            key = a["description"]
+            label = a["season"] or ""
+            n = a["all_nba_team_number"]
+            if n and n not in ("0", "", "None", "(null)"):
+                suffix = {"1": "1st", "2": "2nd", "3": "3rd"}.get(n, n)
+                label = f"{label} ({suffix})" if label else suffix
+            summary.setdefault(key, []).append(label)
+        return {"player_id": id, "count": len(awards), "awards": awards, "summary": summary}
+    except Exception as e:
+        logger.error(f"Error fetching awards for {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# --- Team coaching staff (cached per team+season) ---
+@app.get("/api/teams/{abbr}/coaches")
+def get_team_coaches(abbr: str, season: str = CURRENT_SEASON):
+    conn = get_db_conn()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS team_coaches (
+                team_id INTEGER, season TEXT, coach_id INTEGER,
+                coach_name TEXT, coach_type TEXT, sort_sequence INTEGER,
+                fetched_at TEXT,
+                PRIMARY KEY (team_id, season, coach_id)
+            )
+            """
+        )
+        team_row = conn.execute(
+            "SELECT team_id FROM team_metadata WHERE abbreviation = ?", (abbr.upper(),)
+        ).fetchone()
+        if not team_row:
+            raise HTTPException(status_code=404, detail=f"Unknown team {abbr}")
+        team_id = team_row[0]
+
+        cached = conn.execute(
+            "SELECT MAX(fetched_at) FROM team_coaches WHERE team_id = ? AND season = ?",
+            (team_id, season),
+        ).fetchone()
+        if not (cached and cached[0] and cached[0] > (datetime.utcnow() - timedelta(days=7)).isoformat()):
+            try:
+                from nba_api.stats.endpoints import commonteamroster
+                data = commonteamroster.CommonTeamRoster(team_id=team_id, season=season).get_dict()
+                coaches_rs = next((r for r in data["resultSets"] if r["name"] == "Coaches"), None)
+                if coaches_rs:
+                    idx = {h: i for i, h in enumerate(coaches_rs["headers"])}
+                    now = datetime.utcnow().isoformat()
+                    conn.execute(
+                        "DELETE FROM team_coaches WHERE team_id = ? AND season = ?", (team_id, season)
+                    )
+                    for r in coaches_rs["rowSet"]:
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO team_coaches
+                            (team_id, season, coach_id, coach_name, coach_type, sort_sequence, fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                team_id, season,
+                                r[idx["COACH_ID"]],
+                                r[idx["COACH_NAME"]],
+                                r[idx["COACH_TYPE"]] if "COACH_TYPE" in idx else "",
+                                r[idx["SORT_SEQUENCE"]] if "SORT_SEQUENCE" in idx else 0,
+                                now,
+                            ),
+                        )
+                    conn.commit()
+            except Exception as exc:
+                logger.warning(f"Coach fetch failed for {abbr} {season} (serving cache): {exc}")
+
+        rows = conn.execute(
+            """
+            SELECT coach_id, coach_name, coach_type, sort_sequence
+            FROM team_coaches WHERE team_id = ? AND season = ?
+            ORDER BY sort_sequence, coach_id
+            """,
+            (team_id, season),
+        ).fetchall()
+        return {"team": abbr.upper(), "season": season, "coaches": [dict(r) for r in rows]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching coaches for {abbr}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# --- Franchise year-by-year (grows automatically as seasons backfill) ---
+@app.get("/api/teams/{abbr}/franchise")
+def get_franchise_history(abbr: str):
+    """
+    Year-by-year record for a franchise across every season in the archive:
+    regular-season record + ratings, plus playoff record when applicable.
+    """
+    conn = get_db_conn()
+    try:
+        team_row = conn.execute(
+            "SELECT team_id, full_name FROM team_metadata WHERE abbreviation = ?",
+            (abbr.upper(),),
+        ).fetchone()
+        if not team_row:
+            raise HTTPException(status_code=404, detail=f"Unknown team {abbr}")
+        team_id, full_name = team_row[0], team_row[1]
+
+        rows = conn.execute(
+            """
+            SELECT season, season_type, games, wins, losses, win_pct,
+                   pace, off_rating, def_rating, net_rating, srs
+            FROM team_season_advanced
+            WHERE team_id = ?
+            ORDER BY season DESC
+            """,
+            (team_id,),
+        ).fetchall()
+
+        seasons = {}
+        for r in rows:
+            d = dict(r)
+            entry = seasons.setdefault(d["season"], {"season": d["season"]})
+            if d["season_type"] == "Playoffs":
+                entry["playoffs"] = {"wins": d["wins"], "losses": d["losses"]}
+            else:
+                entry["regular"] = {
+                    k: d[k] for k in
+                    ("games", "wins", "losses", "win_pct", "pace",
+                     "off_rating", "def_rating", "net_rating", "srs")
+                }
+        out = sorted(seasons.values(), key=lambda x: x["season"], reverse=True)
+        return {"team": abbr.upper(), "full_name": full_name, "seasons": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching franchise history for {abbr}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Draft history (official NBA draft records via stats.nba.com) ---
 def _ensure_draft_history(conn) -> None:
     """Populate the draft_history table once from the NBA's official feed."""

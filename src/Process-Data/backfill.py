@@ -402,29 +402,48 @@ def backfill_players(
         raise
 
 
+# Conference/division are stable league facts nba_api's static list doesn't carry.
+TEAM_CONFERENCE_DIVISION = {
+    "ATL": ("East", "Southeast"), "BOS": ("East", "Atlantic"), "BKN": ("East", "Atlantic"),
+    "CHA": ("East", "Southeast"), "CHI": ("East", "Central"), "CLE": ("East", "Central"),
+    "DET": ("East", "Central"), "IND": ("East", "Central"), "MIA": ("East", "Southeast"),
+    "MIL": ("East", "Central"), "NYK": ("East", "Atlantic"), "ORL": ("East", "Southeast"),
+    "PHI": ("East", "Atlantic"), "TOR": ("East", "Atlantic"), "WAS": ("East", "Southeast"),
+    "DAL": ("West", "Southwest"), "DEN": ("West", "Northwest"), "GSW": ("West", "Pacific"),
+    "HOU": ("West", "Southwest"), "LAC": ("West", "Pacific"), "LAL": ("West", "Pacific"),
+    "MEM": ("West", "Southwest"), "MIN": ("West", "Northwest"), "NOP": ("West", "Southwest"),
+    "OKC": ("West", "Northwest"), "PHX": ("West", "Pacific"), "POR": ("West", "Northwest"),
+    "SAC": ("West", "Pacific"), "SAS": ("West", "Southwest"), "UTA": ("West", "Northwest"),
+}
+
+
 def backfill_metadata(db_path: str) -> None:
     """Populate team_metadata table with team descriptions using nba_stats_client."""
     conn = get_connection(db_path)
     cursor = conn.cursor()
-    
+
     logger.info("Backfilling team metadata table...")
     try:
         from nba_api.stats.static import teams as nba_teams
         team_list = nba_teams.get_teams()
         timestamp = datetime.utcnow().isoformat()
-        
+
         for team in team_list:
+            conference, division = TEAM_CONFERENCE_DIVISION.get(team["abbreviation"], (None, None))
             conn.execute(
                 """
                 INSERT INTO team_metadata (
-                    team_id, full_name, abbreviation, nickname, city, state, year_founded, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    team_id, full_name, abbreviation, nickname, city, state, year_founded,
+                    conference, division, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id) DO UPDATE SET
                     full_name=excluded.full_name,
                     abbreviation=excluded.abbreviation,
                     nickname=excluded.nickname,
                     city=excluded.city,
                     state=excluded.state,
+                    conference=excluded.conference,
+                    division=excluded.division,
                     fetched_at=excluded.fetched_at
                 """,
                 (
@@ -435,6 +454,8 @@ def backfill_metadata(db_path: str) -> None:
                     team["city"],
                     team["state"],
                     team["year_founded"],
+                    conference,
+                    division,
                     timestamp
                 )
             )

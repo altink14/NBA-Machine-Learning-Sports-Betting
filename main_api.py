@@ -165,6 +165,104 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
     finally:
         conn.close()
 
+# --- Prediction track record ---
+def _ensure_prediction_log_schema(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logged_at TEXT NOT NULL,
+            log_date TEXT NOT NULL,
+            sport TEXT NOT NULL,
+            sportsbook TEXT NOT NULL,
+            game_key TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            game_start_time_utc TEXT,
+            home_ml REAL,
+            away_ml REAL,
+            ou_line REAL,
+            predicted_winner TEXT,
+            winner_confidence REAL,
+            ou_prediction TEXT,
+            ou_confidence REAL,
+            ev_home REAL,
+            ev_away REAL,
+            model TEXT,
+            actual_winner TEXT,
+            actual_total REAL,
+            UNIQUE (log_date, sportsbook, game_key)
+        )
+        """
+    )
+
+def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None:
+    """
+    Persist each model prediction (one row per game/book/day, latest wins).
+    This is the raw material for a public track-record page: predictions are
+    recorded BEFORE games happen; actual_winner/actual_total get filled in
+    later by a grading pass.
+    """
+    predictions = result.get("predictions") or []
+    if not predictions:
+        return
+    conn = _odds_snapshot_conn()
+    try:
+        _ensure_prediction_log_schema(conn)
+        now = datetime.utcnow()
+        for p in predictions:
+            home = p.get("home_team")
+            away = p.get("away_team")
+            if not home or not away:
+                continue
+            ev = p.get("expected_value") or {}
+            conn.execute(
+                """
+                INSERT INTO predictions_log (
+                    logged_at, log_date, sport, sportsbook, game_key,
+                    home_team, away_team, game_start_time_utc,
+                    home_ml, away_ml, ou_line,
+                    predicted_winner, winner_confidence, ou_prediction, ou_confidence,
+                    ev_home, ev_away, model
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(log_date, sportsbook, game_key) DO UPDATE SET
+                    logged_at=excluded.logged_at,
+                    home_ml=excluded.home_ml,
+                    away_ml=excluded.away_ml,
+                    ou_line=excluded.ou_line,
+                    predicted_winner=excluded.predicted_winner,
+                    winner_confidence=excluded.winner_confidence,
+                    ou_prediction=excluded.ou_prediction,
+                    ou_confidence=excluded.ou_confidence,
+                    ev_home=excluded.ev_home,
+                    ev_away=excluded.ev_away,
+                    model=excluded.model
+                """,
+                (
+                    now.isoformat(),
+                    now.strftime("%Y-%m-%d"),
+                    sport,
+                    sportsbook,
+                    f"{home}:{away}",
+                    home,
+                    away,
+                    p.get("game_start_time_utc"),
+                    p.get("home_odds"),
+                    p.get("away_odds"),
+                    p.get("under_over_line") if isinstance(p.get("under_over_line"), (int, float)) else None,
+                    p.get("predicted_winner"),
+                    p.get("winner_confidence"),
+                    p.get("under_over_prediction"),
+                    p.get("under_over_confidence"),
+                    ev.get("home_team"),
+                    ev.get("away_team"),
+                    p.get("model"),
+                )
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
 # PredictionRunner Class
 class PredictionRunner:
     def __init__(self, sportsbook: str, kelly_criterion: bool, sport: str = 'NBA'):
@@ -681,6 +779,10 @@ def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool 
         runner = PredictionRunner(sportsbook=sportsbook, kelly_criterion=kelly_criterion, sport=sport)
         res = runner.run_predictions()
         predictions_cache[cache_key] = (res, now)
+        try:
+            log_predictions(res, sportsbook, sport)
+        except Exception as exc:
+            logger.warning(f"Prediction logging failed (non-fatal): {exc}")
         return res
     except Exception as e:
         logger.error(f"Error in /predictions endpoint: {e}", exc_info=True)
@@ -826,6 +928,31 @@ def get_line_movements(sportsbook: str = 'fanduel', sport: str = 'NBA', hours: i
         return {"sportsbook": sportsbook, "sport": sport, "window_hours": hours, "movements": movements}
     except Exception as e:
         logger.error(f"Error in /api/line-movements: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# --- Prediction track record endpoint ---
+@app.get("/api/prediction-log")
+def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
+    """Model predictions recorded before games, newest first (transparency page source)."""
+    conn = _odds_snapshot_conn()
+    try:
+        _ensure_prediction_log_schema(conn)
+        since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        if sportsbook:
+            rows = conn.execute(
+                "SELECT * FROM predictions_log WHERE log_date >= ? AND sportsbook = ? ORDER BY logged_at DESC",
+                (since, sportsbook)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM predictions_log WHERE log_date >= ? ORDER BY logged_at DESC",
+                (since,)
+            ).fetchall()
+        return {"days": days, "count": len(rows), "predictions": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Error in /api/prediction-log: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()

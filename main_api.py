@@ -989,6 +989,104 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
     finally:
         conn.close()
 
+# --- Draft history (official NBA draft records via stats.nba.com) ---
+def _ensure_draft_history(conn) -> None:
+    """Populate the draft_history table once from the NBA's official feed."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS draft_history (
+            person_id INTEGER,
+            player_name TEXT,
+            season INTEGER,
+            round_number INTEGER,
+            round_pick INTEGER,
+            overall_pick INTEGER,
+            team_id INTEGER,
+            team_city TEXT,
+            team_name TEXT,
+            team_abbreviation TEXT,
+            organization TEXT,
+            organization_type TEXT,
+            fetched_at TEXT,
+            PRIMARY KEY (season, overall_pick, person_id)
+        )
+        """
+    )
+    count = conn.execute("SELECT COUNT(*) FROM draft_history").fetchone()[0]
+    if count > 0:
+        return
+    logger.info("Fetching full NBA draft history from stats.nba.com (one-time)...")
+    from nba_api.stats.endpoints import drafthistory
+    data = drafthistory.DraftHistory(league_id="00").get_dict()
+    rs = data["resultSets"][0]
+    idx = {h: i for i, h in enumerate(rs["headers"])}
+    now = datetime.utcnow().isoformat()
+    for row in rs["rowSet"]:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO draft_history (
+                person_id, player_name, season, round_number, round_pick,
+                overall_pick, team_id, team_city, team_name, team_abbreviation,
+                organization, organization_type, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row[idx["PERSON_ID"]], row[idx["PLAYER_NAME"]], row[idx["SEASON"]],
+                row[idx["ROUND_NUMBER"]], row[idx["ROUND_PICK"]], row[idx["OVERALL_PICK"]],
+                row[idx["TEAM_ID"]], row[idx["TEAM_CITY"]], row[idx["TEAM_NAME"]],
+                row[idx["TEAM_ABBREVIATION"]], row[idx["ORGANIZATION"]],
+                row[idx["ORGANIZATION_TYPE"]], now,
+            ),
+        )
+    conn.commit()
+    logger.info("Stored %d historical draft picks.", conn.execute("SELECT COUNT(*) FROM draft_history").fetchone()[0])
+
+
+@app.get("/api/draft/years")
+def get_draft_years():
+    """All draft years on record, newest first."""
+    conn = get_db_conn()
+    try:
+        _ensure_draft_history(conn)
+        rows = conn.execute(
+            "SELECT season, COUNT(*) as picks FROM draft_history GROUP BY season ORDER BY season DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Error fetching draft years: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/api/draft/{year}")
+def get_draft_class(year: int):
+    """
+    Full draft class for a year: every pick in order, flagged with whether the
+    player exists in our stats database (so the UI can link to their page).
+    """
+    conn = get_db_conn()
+    try:
+        _ensure_draft_history(conn)
+        rows = conn.execute(
+            """
+            SELECT d.*,
+                   CASE WHEN p.player_id IS NOT NULL THEN 1 ELSE 0 END AS in_database
+            FROM draft_history d
+            LEFT JOIN players p ON p.player_id = d.person_id
+            WHERE d.season = ?
+            ORDER BY d.overall_pick ASC
+            """,
+            (year,),
+        ).fetchall()
+        return {"year": year, "count": len(rows), "picks": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Error fetching draft class {year}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Historical Data Endpoints ---
 @app.get("/api/historical/team-stats")
 def get_historical_team_stats(team: str, season: int):

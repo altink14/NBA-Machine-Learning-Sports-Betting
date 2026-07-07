@@ -1,6 +1,7 @@
 # main_api.py
 # FINAL STABLE VERSION - Corrected endpoint routing and data handling.
 import glob
+import re
 import os
 from typing import List, Dict, Any, Optional, Tuple, Union
 import uvicorn
@@ -988,6 +989,156 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+# --- Box scores by date (the daily scores archive) ---
+@app.get("/api/games/by-date/{game_date}")
+def get_games_by_date(game_date: str):
+    """
+    All games on a calendar date (YYYY-MM-DD) with final scores, from the
+    local box-score archive. Also returns the nearest earlier/later dates
+    that have games so the UI can page through the calendar.
+    """
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", game_date):
+        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.game_id, t.game_date, t.season, t.season_type,
+                   t.team_id, t.opp_team_id, t.pts, t.opp_pts,
+                   m.full_name AS team_name, m.abbreviation AS team_abbr,
+                   om.full_name AS opp_name, om.abbreviation AS opp_abbr,
+                   b.home_team_id
+            FROM team_game_advanced t
+            JOIN team_metadata m ON m.team_id = t.team_id
+            JOIN team_metadata om ON om.team_id = t.opp_team_id
+            JOIN box_scores b ON b.game_id = t.game_id
+            WHERE t.game_date = ?
+            ORDER BY t.game_id
+            """,
+            (game_date,),
+        ).fetchall()
+
+        games = {}
+        for r in rows:
+            d = dict(r)
+            gid = d["game_id"]
+            side = "home" if d["team_id"] == d["home_team_id"] else "away"
+            g = games.setdefault(gid, {
+                "game_id": gid, "game_date": d["game_date"],
+                "season": d["season"], "season_type": d["season_type"],
+            })
+            g[side] = {
+                "team_id": d["team_id"], "name": d["team_name"],
+                "abbr": d["team_abbr"], "pts": d["pts"],
+            }
+
+        prev_row = conn.execute(
+            "SELECT MAX(game_date) FROM team_game_advanced WHERE game_date < ?", (game_date,)
+        ).fetchone()
+        next_row = conn.execute(
+            "SELECT MIN(game_date) FROM team_game_advanced WHERE game_date > ?", (game_date,)
+        ).fetchone()
+
+        return {
+            "date": game_date,
+            "games": sorted(games.values(), key=lambda g: g["game_id"]),
+            "prev_date": prev_row[0] if prev_row else None,
+            "next_date": next_row[0] if next_row else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching games for {game_date}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# --- Rookies: a draft class's first-season stats ---
+@app.get("/api/stats/rookies")
+def get_rookies(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    Players drafted in the season's start year, joined with their stats for
+    that season. Undrafted first-year players are not detectable from draft
+    records, so this is explicitly the drafted rookie class.
+    """
+    try:
+        draft_year = int(season.split("-")[0])
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="Season must look like 2025-26")
+    conn = get_db_conn()
+    try:
+        _ensure_draft_history(conn)
+        rows = conn.execute(
+            """
+            SELECT d.person_id AS player_id, d.player_name AS full_name,
+                   d.overall_pick, d.round_number, d.team_abbreviation AS drafted_by,
+                   d.organization,
+                   t.gp, t.gs, t.min, t.pts, t.reb, t.ast, t.stl, t.blk, t.tov,
+                   t.fg_pct, t.fg3_pct, t.ft_pct,
+                   (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) AS team_abbr
+            FROM draft_history d
+            LEFT JOIN player_season_totals t
+                   ON t.player_id = d.person_id AND t.season = ? AND t.season_type = ?
+            WHERE d.season = ?
+            ORDER BY d.overall_pick ASC
+            """,
+            (season, season_type, draft_year),
+        ).fetchall()
+        return {"season": season, "draft_year": draft_year, "rookies": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.error(f"Error fetching rookies for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# --- Career highs from the game-log archive ---
+@app.get("/api/players/{id}/highs")
+def get_player_highs(id: int):
+    """
+    Career-high performances across every game log we have, per stat:
+    the value, the date, and the opponent. Depth grows as more seasons
+    are backfilled — honest label handled client-side.
+    """
+    conn = get_db_conn()
+    try:
+        stats = ["pts", "reb", "ast", "stl", "blk", "fg3m", "min"]
+        highs = {}
+        for stat in stats:
+            row = conn.execute(
+                f"""
+                SELECT g.{stat} AS value, g.game_date, g.game_id,
+                       (SELECT abbreviation FROM team_metadata WHERE team_id = t.opp_team_id) AS opp_abbr,
+                       t.season, t.season_type
+                FROM player_game_log g
+                JOIN team_game_advanced t ON t.game_id = g.game_id AND t.team_id = g.team_id
+                WHERE g.player_id = ? AND g.{stat} IS NOT NULL
+                ORDER BY g.{stat} DESC, g.game_date ASC
+                LIMIT 1
+                """,
+                (id,),
+            ).fetchone()
+            if row and row["value"] is not None:
+                highs[stat] = dict(row)
+        span = conn.execute(
+            "SELECT MIN(game_date), MAX(game_date), COUNT(*) FROM player_game_log WHERE player_id = ?",
+            (id,),
+        ).fetchone()
+        return {
+            "player_id": id,
+            "highs": highs,
+            "games_covered": span[2] if span else 0,
+            "from_date": span[0] if span else None,
+            "to_date": span[1] if span else None,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching highs for player {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 
 # --- Draft history (official NBA draft records via stats.nba.com) ---
 def _ensure_draft_history(conn) -> None:

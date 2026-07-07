@@ -71,10 +71,20 @@ def snapshot_todays_odds() -> None:
         logger.warning("Odds snapshot ping skipped (API not running?): %s", exc)
 
 
+def grade_logged_predictions() -> None:
+    """Fill in final scores for yesterday's logged predictions."""
+    try:
+        from grade_predictions import grade
+        grade()
+    except Exception as exc:
+        logger.warning("Prediction grading failed (non-fatal): %s", exc)
+
+
 def main() -> int:
     season = current_season(date.today())
     logger.info("=== Daily update starting for season %s ===", season)
     ok = run_backfill(season)
+    grade_logged_predictions()
     snapshot_todays_odds()
     logger.info("=== Daily update finished (%s) ===", "OK" if ok else "WITH ERRORS")
     return 0 if ok else 1

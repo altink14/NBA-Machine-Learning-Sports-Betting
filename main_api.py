@@ -950,7 +950,35 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
                 "SELECT * FROM predictions_log WHERE log_date >= ? ORDER BY logged_at DESC",
                 (since,)
             ).fetchall()
-        return {"days": days, "count": len(rows), "predictions": [dict(r) for r in rows]}
+
+        predictions = [dict(r) for r in rows]
+
+        # Honest topline: only graded predictions count toward the record
+        graded = [p for p in predictions if p.get("actual_winner")]
+        ml_correct = sum(1 for p in graded if p.get("predicted_winner") == p.get("actual_winner"))
+        ou_graded = [
+            p for p in graded
+            if p.get("actual_total") is not None and p.get("ou_line") is not None and p.get("ou_prediction")
+        ]
+        ou_correct = sum(
+            1 for p in ou_graded
+            if (p["actual_total"] > p["ou_line"] and p["ou_prediction"].upper() == "OVER")
+            or (p["actual_total"] < p["ou_line"] and p["ou_prediction"].upper() == "UNDER")
+        )
+
+        return {
+            "days": days,
+            "count": len(predictions),
+            "summary": {
+                "graded": len(graded),
+                "moneyline_correct": ml_correct,
+                "moneyline_pct": round(100 * ml_correct / len(graded), 1) if graded else None,
+                "ou_graded": len(ou_graded),
+                "ou_correct": ou_correct,
+                "ou_pct": round(100 * ou_correct / len(ou_graded), 1) if ou_graded else None,
+            },
+            "predictions": predictions,
+        }
     except Exception as e:
         logger.error(f"Error in /api/prediction-log: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

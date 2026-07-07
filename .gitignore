@@ -105,3 +105,8 @@ venv.bak/
 
 .idea
 .DS_Store
+
+# NBA API response cache and SQLite journals (regenerated at runtime)
+Data/nba_cache/
+*.sqlite-shm
+*.sqlite-wal

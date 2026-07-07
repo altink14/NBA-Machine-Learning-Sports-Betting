@@ -1,5 +1,6 @@
 # main_api.py
 # FINAL STABLE VERSION - Corrected endpoint routing and data handling.
+import glob
 import os
 from typing import List, Dict, Any, Optional, Tuple, Union
 import uvicorn
@@ -9,9 +10,7 @@ import xgboost as xgb
 import sqlite3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from dotenv import load_dotenv
-import google.generativeai as genai
 import logging
 import json
 from datetime import datetime, timedelta
@@ -19,11 +18,12 @@ from datetime import datetime, timedelta
 # nba_api imports
 try:
     from nba_api.stats.static import players as nba_players
-    from nba_api.stats.endpoints import shotchartdetail, leaguedashplayerstats
+    from nba_api.stats.endpoints import shotchartdetail, leaguedashplayerstats, commonplayerinfo
 except ImportError:
     nba_players = None
     shotchartdetail = None
     leaguedashplayerstats = None
+    commonplayerinfo = None
 
 # Local Imports
 from src.DataProviders.SbrOddsProvider import SbrOddsProvider
@@ -95,17 +95,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class ChatMessage(BaseModel):
-    message: str
-
-# AI Configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.critical("GEMINI_API_KEY not found! Chatbot will be disabled.")
-    genai.configure(api_key="DUMMY_KEY_FOR_STARTUP")
-else:
-    genai.configure(api_key=GEMINI_API_KEY)
-
 # PredictionRunner Class
 class PredictionRunner:
     def __init__(self, sportsbook: str, kelly_criterion: bool, sport: str = 'NBA'):
@@ -138,11 +127,16 @@ class PredictionRunner:
             raise HTTPException(status_code=500, detail="Server configuration error: Could not load team stats.")
 
     def _load_schedule(self):
+        # Use the most recent season's schedule file (nba-<year>-UTC.csv)
+        schedule_files = sorted(glob.glob(os.path.join(self.project_root, 'Data', 'nba-*-UTC.csv')), reverse=True)
+        if not schedule_files:
+            logger.error("No schedule file (Data/nba-*-UTC.csv) found.")
+            return None
         try:
-            path = os.path.join(self.project_root, 'Data', 'nba-2024-UTC.csv')
-            return pd.read_csv(path, parse_dates=['Date'], date_format='%d/%m/%Y %H:%M')
-        except FileNotFoundError:
-            logger.error("Schedule file nba-2024-UTC.csv not found.")
+            logger.info(f"Loading schedule from: {os.path.basename(schedule_files[0])}")
+            return pd.read_csv(schedule_files[0], parse_dates=['Date'], date_format='%d/%m/%Y %H:%M')
+        except Exception as e:
+            logger.error(f"Failed to load schedule file {schedule_files[0]}: {e}")
             return None
 
     def _load_xgboost_models(self):
@@ -617,20 +611,6 @@ def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool 
     except Exception as e:
         logger.error(f"Error in /predictions endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
-
-# This is the chat endpoint for http://localhost:8000/api/chat
-@app.post("/api/chat")
-async def chat_handler(chat_message: ChatMessage):
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "DUMMY_KEY_FOR_STARTUP":
-        raise HTTPException(status_code=503, detail="Chatbot is currently unavailable.")
-    try:
-        logger.info(f"Received chat message: {chat_message.message}")
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        response = await model.generate_content_async(chat_message.message)
-        return {"response": response.text}
-    except Exception as e:
-        logger.error(f"An error occurred in chat_handler: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred with the AI assistant: {str(e)}")
 
 # --- Historical Data Endpoints ---
 @app.get("/api/historical/team-stats")
@@ -1367,6 +1347,118 @@ def get_player_by_id(id: int, season: str = "2024-25"):
         if not player_row:
             raise HTTPException(status_code=404, detail=f"Player ID {id} not found.")
         player_info = dict(player_row)
+
+        # 1b. Cache-first player biography lookup from player_bio table
+        cursor.execute("SELECT * FROM player_bio WHERE player_id = ?", (id,))
+        bio_row = cursor.fetchone()
+        
+        bio_data = {}
+        if bio_row:
+            bio_data = dict(bio_row)
+            
+        # Check if cache miss or fetched_at is NULL
+        if not bio_data or not bio_data.get("fetched_at"):
+            # TODO: Potential thundering herd at scale — 100 concurrent uncached profile hits = 100 parallel CommonPlayerInfo calls queueing under the rate limiter. Acceptable for launch; add a per-player in-flight lock before scaling.
+            if not commonplayerinfo:
+                logger.warning("nba_api commonplayerinfo not imported, skipping live bio fetch")
+            else:
+                try:
+                    logger.info(f"Cache miss: Fetching player bio from NBA stats API for player ID {id}")
+                    # Fetch from CommonPlayerInfo
+                    info = commonplayerinfo.CommonPlayerInfo(player_id=id)
+                    df = info.get_data_frames()[0]
+                    if not df.empty:
+                        row_data = df.iloc[0].to_dict()
+                        
+                        # Prepare fields
+                        jersey = row_data.get("JERSEY")
+                        position = row_data.get("POSITION")
+                        height = row_data.get("HEIGHT")
+                        weight = row_data.get("WEIGHT")
+                        birth_date = row_data.get("BIRTHDATE")
+                        if birth_date and "T" in birth_date:
+                            birth_date = birth_date.split("T")[0]
+                        country = row_data.get("COUNTRY")
+                        school = row_data.get("SCHOOL")
+                        
+                        draft_year = row_data.get("DRAFT_YEAR")
+                        try:
+                            draft_year = int(draft_year) if str(draft_year).isdigit() else None
+                        except:
+                            draft_year = None
+                            
+                        draft_round = row_data.get("DRAFT_ROUND")
+                        try:
+                            draft_round = int(draft_round) if str(draft_round).isdigit() else None
+                        except:
+                            draft_round = None
+                            
+                        draft_number = row_data.get("DRAFT_NUMBER")
+                        try:
+                            draft_number = int(draft_number) if str(draft_number).isdigit() else None
+                        except:
+                            draft_number = None
+                            
+                        exp = row_data.get("SEASON_EXP")
+                        try:
+                            years_experience = int(exp) if str(exp).isdigit() else 0
+                        except:
+                            years_experience = 0
+                            
+                        team_id = row_data.get("TEAM_ID")
+                        try:
+                            team_id = int(team_id) if str(team_id).isdigit() else None
+                        except:
+                            team_id = None
+                            
+                        team_abbr = row_data.get("TEAM_ABBREVIATION")
+                        team_name = row_data.get("TEAM_NAME")
+                        is_active = 1 if row_data.get("ROSTERSTATUS") == "Active" else 0
+                        fetched_at = datetime.utcnow().isoformat()
+                        
+                        # Insert/Update player_bio table (upsert)
+                        cursor.execute(
+                            """
+                            INSERT INTO player_bio (
+                                player_id, full_name, first_name, last_name, team_id, team_abbr,
+                                jersey, position, height, weight, birth_date, country, school,
+                                draft_year, draft_round, draft_number, years_experience, is_active, fetched_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(player_id) DO UPDATE SET
+                                full_name=excluded.full_name,
+                                first_name=excluded.first_name,
+                                last_name=excluded.last_name,
+                                team_id=excluded.team_id,
+                                team_abbr=excluded.team_abbr,
+                                jersey=excluded.jersey,
+                                position=excluded.position,
+                                height=excluded.height,
+                                weight=excluded.weight,
+                                birth_date=excluded.birth_date,
+                                country=excluded.country,
+                                school=excluded.school,
+                                draft_year=excluded.draft_year,
+                                draft_round=excluded.draft_round,
+                                draft_number=excluded.draft_number,
+                                years_experience=excluded.years_experience,
+                                is_active=excluded.is_active,
+                                fetched_at=excluded.fetched_at
+                            """,
+                            (
+                                id, player_info["full_name"], player_info["first_name"], player_info["last_name"],
+                                team_id, team_abbr, jersey, position, height, weight, birth_date, country, school,
+                                draft_year, draft_round, draft_number, years_experience, is_active, fetched_at
+                            )
+                        )
+                        conn.commit()
+                        
+                        # Re-read from db
+                        cursor.execute("SELECT * FROM player_bio WHERE player_id = ?", (id,))
+                        updated_row = cursor.fetchone()
+                        if updated_row:
+                            bio_data = dict(updated_row)
+                except Exception as e:
+                    logger.error(f"Error fetching CommonPlayerInfo for player ID {id}: {e}", exc_info=True)
         
         # 2. Fetch current season totals
         cursor.execute(
@@ -1395,9 +1487,8 @@ def get_player_by_id(id: int, season: str = "2024-25"):
         advanced = dict(adv_row) if adv_row else {}
         
         # 4. Construct response
-        team_abbr = totals.get("team_abbr") or "N/A"
+        team_abbr = totals.get("team_abbr") or bio_data.get("team_abbr") or "N/A"
         
-        # We can also query the player's game logs to compute dynamic aggregates if totals is empty
         if not totals:
             cursor.execute(
                 """
@@ -1420,6 +1511,27 @@ def get_player_by_id(id: int, season: str = "2024-25"):
                     "reb_per_game": round(agg_row["reb"] / agg_row["games"], 1),
                 }
                 
+        # Format properties
+        bio_position = bio_data.get("position") or "Forward/Guard"
+        bio_height = bio_data.get("height") or "N/A"
+        bio_weight = bio_data.get("weight") or "N/A"
+        bio_height_weight = f"{bio_height}, {bio_weight}lb" if (bio_height != "N/A" and bio_weight != "N/A") else f"{bio_height}"
+        if bio_weight != "N/A" and "lb" not in str(bio_weight).lower() and str(bio_weight).isdigit():
+            bio_height_weight = f"{bio_height}, {bio_weight}lb"
+            
+        bio_born = bio_data.get("birth_date") or "N/A"
+        bio_college = bio_data.get("school") or "N/A"
+        
+        bio_draft_year = bio_data.get("draft_year")
+        bio_draft_round = bio_data.get("draft_round")
+        bio_draft_number = bio_data.get("draft_number")
+        
+        exp_val = bio_data.get("years_experience")
+        if exp_val is not None:
+            bio_exp = f"{exp_val} Years" if exp_val > 0 else "Rookie"
+        else:
+            bio_exp = "Active" if player_info["is_active"] else "Inactive"
+            
         response = {
             "id": id,
             "player_id": id,
@@ -1429,14 +1541,17 @@ def get_player_by_id(id: int, season: str = "2024-25"):
             "is_active": player_info["is_active"],
             "bio": {
                 "fullName": player_info["full_name"],
-                "position": "Forward-Center" if id == 1626157 else "Forward/Guard",
-                "heightWeight": "7-0, 250lb" if id == 1626157 else "6-6, 210lb",
+                "position": bio_position,
+                "heightWeight": bio_height_weight,
                 "team": team_abbr,
-                "born": "N/A",
-                "college": "N/A",
-                "experience": "Active" if player_info["is_active"] else "Inactive",
-                "from_year": 2015 if id == 1626157 else 2018,
-                "to_year": 2026,
+                "born": bio_born,
+                "college": bio_college,
+                "experience": bio_exp,
+                "jersey": bio_data.get("jersey") or "N/A",
+                "country": bio_data.get("country") or "N/A",
+                "draft_year": bio_draft_year,
+                "draft_round": bio_draft_round,
+                "draft_number": bio_draft_number,
                 "active": bool(player_info["is_active"]),
                 "instagram": player_info["full_name"].lower().replace(" ", ""),
                 "nicknames": "None"

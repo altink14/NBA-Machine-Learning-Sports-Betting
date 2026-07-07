@@ -4,7 +4,22 @@ Two services: this repo (FastAPI backend) → **Railway**, the frontend
 (`basic-saas-starter`) → **Vercel**. Both deploy from GitHub branch
 `bettingbuddy2.0` / `bettingbuddy-2.0`.
 
-## 1. Backend → Railway (~5 min)
+## 0. Free option: Render (recommended to start)
+
+1. https://render.com → sign in with GitHub → **New → Blueprint** →
+   select `altink14/NBA-Machine-Learning-Sports-Betting` (branch
+   `bettingbuddy2.0`). The `render.yaml` configures everything, including
+   `DB_SNAPSHOT_URL` — just click Apply.
+2. Wait for the first deploy (build + 47MB snapshot download), then hit
+   `https://<render-url>/health`.
+3. Free-tier tradeoffs: sleeps after 15 idle minutes (first request after
+   that takes ~60-90s while it wakes and re-downloads the snapshot), and
+   512MB RAM. If it ever OOMs under load, either upgrade ($7/mo, which
+   also kills cold starts) or move to Hugging Face Spaces (free, 16GB).
+4. After the frontend deploys, set `CORS_ORIGINS` to the Vercel URL in
+   the Render dashboard.
+
+## 1. Backend → Railway (paid alternative, ~$5/mo, no cold starts)
 
 1. https://railway.app → sign in with GitHub → **New Project → Deploy from
    GitHub repo** → `altink14/NBA-Machine-Learning-Sports-Betting`, branch

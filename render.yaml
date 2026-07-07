@@ -1,0 +1,20 @@
+# Render blueprint — free-tier deployment.
+# Free instances have no persistent disk and sleep after 15 idle minutes;
+# bootstrap_db.py re-downloads the 47MB database snapshot on every boot,
+# so no disk is needed. Upgrade to a paid instance later to kill cold starts.
+services:
+  - type: web
+    name: bettingbuddy-api
+    runtime: docker
+    plan: free
+    branch: bettingbuddy2.0
+    healthCheckPath: /health
+    envVars:
+      - key: DB_SNAPSHOT_URL
+        value: https://github.com/altink14/NBA-Machine-Learning-Sports-Betting/releases/download/db-snapshot-v1/db-snapshot.tar.gz
+      - key: PORT
+        value: "8000"
+      - key: DEFAULT_SPORTSBOOK
+        value: fanduel
+      # Set CORS_ORIGINS to your Vercel URL in the Render dashboard after
+      # the frontend deploys, e.g. https://bettingbuddy.vercel.app

@@ -10,6 +10,7 @@ import xgboost as xgb
 import sqlite3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import logging
 import json
@@ -27,7 +28,7 @@ except ImportError:
 
 # Local Imports
 from src.DataProviders.SbrOddsProvider import SbrOddsProvider
-from src.Utils import Expected_Value, Kelly_Criterion as kc
+from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
 
@@ -95,6 +96,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Odds snapshots (real line-movement tracking) ---
+ODDS_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data', 'OddsData.sqlite')
+
+def _odds_snapshot_conn():
+    conn = sqlite3.connect(ODDS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS odds_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at TEXT NOT NULL,
+            sport TEXT NOT NULL,
+            sportsbook TEXT NOT NULL,
+            game_key TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            home_ml REAL,
+            away_ml REAL,
+            ou_line REAL,
+            game_start_time_utc TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_odds_snapshots_lookup ON odds_snapshots (sportsbook, sport, game_key, captured_at)"
+    )
+    return conn
+
+def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> None:
+    """Persist current lines; only writes a row when a game's lines changed since the last snapshot."""
+    if not odds_data:
+        return
+    conn = _odds_snapshot_conn()
+    try:
+        captured_at = datetime.utcnow().isoformat()
+        for game_key, game in odds_data.items():
+            try:
+                home_team, away_team = game_key.split(":", 1)
+                home_ml = game.get(home_team, {}).get('money_line_odds')
+                away_ml = game.get(away_team, {}).get('money_line_odds')
+                ou_line = game.get('under_over_odds')
+                start = game.get('game_start_time_utc')
+                start_str = start.isoformat() if isinstance(start, datetime) else (start or None)
+
+                last = conn.execute(
+                    """
+                    SELECT home_ml, away_ml, ou_line FROM odds_snapshots
+                    WHERE sportsbook = ? AND sport = ? AND game_key = ?
+                    ORDER BY captured_at DESC LIMIT 1
+                    """,
+                    (sportsbook, sport, game_key)
+                ).fetchone()
+                if last and last["home_ml"] == home_ml and last["away_ml"] == away_ml and last["ou_line"] == ou_line:
+                    continue
+
+                conn.execute(
+                    """
+                    INSERT INTO odds_snapshots
+                        (captured_at, sport, sportsbook, game_key, home_team, away_team, home_ml, away_ml, ou_line, game_start_time_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (captured_at, sport, sportsbook, game_key, home_team, away_team, home_ml, away_ml, ou_line, start_str)
+                )
+            except Exception as exc:
+                logger.warning(f"Skipping odds snapshot for {game_key}: {exc}")
+        conn.commit()
+    finally:
+        conn.close()
+
 # PredictionRunner Class
 class PredictionRunner:
     def __init__(self, sportsbook: str, kelly_criterion: bool, sport: str = 'NBA'):
@@ -155,6 +225,10 @@ class PredictionRunner:
         odds_data = self.odds_provider.get_odds()
         if not odds_data:
             return {"error": f"No odds data found from {self.sportsbook}.", "predictions": []}
+        try:
+            snapshot_odds(odds_data, self.sportsbook, self.sport)
+        except Exception as exc:
+            logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
         games_list = create_todays_games_from_odds(odds_data)
         if not games_list:
             return {"error": "No valid games processed from odds data.", "predictions": []}
@@ -611,6 +685,150 @@ def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool 
     except Exception as e:
         logger.error(f"Error in /predictions endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
+
+# --- Parlay Evaluation ---
+class ParlayLeg(BaseModel):
+    home_team: str
+    away_team: str
+    market: str  # 'moneyline' | 'over_under'
+    pick: str    # team name, or 'over' / 'under'
+    odds: float  # American odds for this leg
+    model_prob: Optional[float] = None  # 0-1; auto-filled from today's predictions when omitted
+
+class ParlayRequest(BaseModel):
+    legs: List[ParlayLeg]
+    sportsbook: str = 'fanduel'
+
+def _model_prob_from_prediction(leg: ParlayLeg, prediction: Dict[str, Any]) -> Optional[float]:
+    """Derive the model's probability for this leg from a /predictions game entry."""
+    market = leg.market.lower().replace("-", "_")
+    if market == "moneyline":
+        conf = prediction.get("winner_confidence")
+        winner = prediction.get("predicted_winner")
+        if conf is None or not winner:
+            return None
+        p = float(conf) / 100.0
+        return p if leg.pick.strip().lower() == str(winner).strip().lower() else 1.0 - p
+    if market in ("over_under", "total"):
+        conf = prediction.get("under_over_confidence")
+        side = prediction.get("under_over_prediction")
+        if conf is None or not side:
+            return None
+        p = float(conf) / 100.0
+        return p if leg.pick.strip().lower() == str(side).strip().lower() else 1.0 - p
+    return None
+
+@app.post("/api/parlay/evaluate")
+def evaluate_parlay_endpoint(request: ParlayRequest):
+    """
+    Evaluate a parlay ticket: combined odds, model probability, EV, Kelly stake,
+    and correlation warnings. Legs without an explicit model_prob are enriched
+    from the cached model predictions for today's games when available.
+    """
+    # Reuse a fresh-enough predictions cache entry (any kelly variant) for enrichment.
+    cached_predictions: List[Dict[str, Any]] = []
+    now = datetime.now()
+    for kelly_variant in (True, False):
+        entry = predictions_cache.get(f"{request.sportsbook}_{kelly_variant}_NBA")
+        if entry and now - entry[1] < timedelta(minutes=5):
+            cached_predictions = entry[0].get("predictions", []) or []
+            break
+
+    def find_prediction(leg: ParlayLeg) -> Optional[Dict[str, Any]]:
+        for pred in cached_predictions:
+            if (str(pred.get("home_team", "")).strip().lower() == leg.home_team.strip().lower()
+                    and str(pred.get("away_team", "")).strip().lower() == leg.away_team.strip().lower()):
+                return pred
+        return None
+
+    legs_payload = []
+    for leg in request.legs:
+        model_prob = leg.model_prob
+        if model_prob is None:
+            pred = find_prediction(leg)
+            if pred:
+                model_prob = _model_prob_from_prediction(leg, pred)
+        legs_payload.append({
+            "home_team": leg.home_team,
+            "away_team": leg.away_team,
+            "market": leg.market,
+            "pick": leg.pick,
+            "odds": leg.odds,
+            "model_prob": model_prob,
+        })
+
+    try:
+        result = parlay.evaluate_parlay(legs_payload)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not cached_predictions and any(l["model_prob"] is None for l in legs_payload):
+        result["note"] = (
+            "No live model predictions were available (call /predictions first during the "
+            "season); legs without an explicit model_prob used bookmaker implied probability."
+        )
+    return result
+
+# --- Line movements (from real odds snapshots) ---
+@app.get("/api/line-movements")
+def get_line_movements(sportsbook: str = 'fanduel', sport: str = 'NBA', hours: int = 48):
+    """
+    Real line movement per upcoming game, computed from stored odds snapshots.
+    A game appears once at least one snapshot exists; movement is meaningful
+    once the lines have changed at least once.
+    """
+    conn = _odds_snapshot_conn()
+    try:
+        since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        rows = conn.execute(
+            """
+            SELECT * FROM odds_snapshots
+            WHERE sportsbook = ? AND sport = ? AND captured_at >= ?
+            ORDER BY game_key, captured_at ASC
+            """,
+            (sportsbook, sport, since)
+        ).fetchall()
+
+        games: Dict[str, List[sqlite3.Row]] = {}
+        for r in rows:
+            games.setdefault(r["game_key"], []).append(r)
+
+        movements = []
+        for game_key, snaps in games.items():
+            first, last = snaps[0], snaps[-1]
+            movements.append({
+                "game_key": game_key,
+                "home_team": last["home_team"],
+                "away_team": last["away_team"],
+                "game_start_time_utc": last["game_start_time_utc"],
+                "opening": {
+                    "captured_at": first["captured_at"],
+                    "home_ml": first["home_ml"],
+                    "away_ml": first["away_ml"],
+                    "ou_line": first["ou_line"],
+                },
+                "current": {
+                    "captured_at": last["captured_at"],
+                    "home_ml": last["home_ml"],
+                    "away_ml": last["away_ml"],
+                    "ou_line": last["ou_line"],
+                },
+                "snapshots": [
+                    {
+                        "captured_at": s["captured_at"],
+                        "home_ml": s["home_ml"],
+                        "away_ml": s["away_ml"],
+                        "ou_line": s["ou_line"],
+                    }
+                    for s in snaps
+                ],
+            })
+        return {"sportsbook": sportsbook, "sport": sport, "window_hours": hours, "movements": movements}
+    except Exception as e:
+        logger.error(f"Error in /api/line-movements: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
 # --- Historical Data Endpoints ---
 @app.get("/api/historical/team-stats")
@@ -1333,6 +1551,36 @@ def get_matchup_power_ratings(game_id: str):
     finally:
         conn.close()
 
+# NOTE: must be registered before /api/players/{id} or FastAPI matches
+# the literal path segment "search" as an id.
+@app.get("/api/players/search")
+def search_players(q: str):
+    """
+    Search players by name.
+    """
+    if not q or len(q) < 2:
+        return []
+
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT player_id, full_name, first_name, last_name, is_active FROM players WHERE full_name LIKE ? LIMIT 25",
+            (f"%{q}%",)
+        )
+        rows = cursor.fetchall()
+
+        results = []
+        for r in rows:
+            results.append(dict(r))
+
+        return results
+    except Exception as e:
+        logger.error(f"Error searching players: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 @app.get("/api/players/{id}")
 def get_player_by_id(id: int, season: str = "2024-25"):
     """
@@ -1682,34 +1930,6 @@ def get_player_career(id: int):
         return results
     except Exception as e:
         logger.error(f"Error fetching player career stats: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-@app.get("/api/players/search")
-def search_players(q: str):
-    """
-    Search players by name.
-    """
-    if not q or len(q) < 2:
-        return []
-        
-    conn = get_db_conn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT player_id, full_name, first_name, last_name, is_active FROM players WHERE full_name LIKE ? LIMIT 25",
-            (f"%{q}%",)
-        )
-        rows = cursor.fetchall()
-        
-        results = []
-        for r in rows:
-            results.append(dict(r))
-            
-        return results
-    except Exception as e:
-        logger.error(f"Error searching players: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()

@@ -1140,6 +1140,206 @@ def get_player_highs(id: int):
         conn.close()
 
 
+# --- Official full-career stats (stats.nba.com playercareerstats, cached) ---
+CAREER_STAT_COLS = [
+    "season", "team_abbr", "player_age", "gp", "gs", "min", "fgm", "fga", "fg_pct",
+    "fg3m", "fg3a", "fg3_pct", "ftm", "fta", "ft_pct", "oreb", "dreb", "reb",
+    "ast", "stl", "blk", "tov", "pf", "pts",
+]
+
+
+def _ensure_career_official(conn, player_id: int) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS player_career_official (
+            player_id INTEGER,
+            season TEXT,
+            season_type TEXT,
+            team_abbr TEXT,
+            player_age REAL,
+            gp INTEGER, gs INTEGER, min REAL,
+            fgm INTEGER, fga INTEGER, fg_pct REAL,
+            fg3m INTEGER, fg3a INTEGER, fg3_pct REAL,
+            ftm INTEGER, fta INTEGER, ft_pct REAL,
+            oreb INTEGER, dreb INTEGER, reb INTEGER,
+            ast INTEGER, stl INTEGER, blk INTEGER, tov INTEGER, pf INTEGER, pts INTEGER,
+            is_career_total INTEGER DEFAULT 0,
+            fetched_at TEXT,
+            PRIMARY KEY (player_id, season, season_type, team_abbr, is_career_total)
+        )
+        """
+    )
+    row = conn.execute(
+        "SELECT MAX(fetched_at) FROM player_career_official WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    if row and row[0] and row[0] > (datetime.utcnow() - timedelta(days=7)).isoformat():
+        return
+
+    from nba_api.stats.endpoints import playercareerstats
+    data = playercareerstats.PlayerCareerStats(player_id=player_id, per_mode36="Totals").get_dict()
+    sets = {rs["name"]: rs for rs in data["resultSets"]}
+    now = datetime.utcnow().isoformat()
+
+    def rows_from(set_name, season_type, is_total):
+        rs = sets.get(set_name)
+        if not rs:
+            return []
+        idx = {h: i for i, h in enumerate(rs["headers"])}
+        out = []
+        for r in rs["rowSet"]:
+            def g(col, default=None):
+                i = idx.get(col)
+                return r[i] if i is not None else default
+            out.append((
+                player_id,
+                g("SEASON_ID", "CAREER") if not is_total else "CAREER",
+                season_type,
+                g("TEAM_ABBREVIATION", "TOT") or "TOT",
+                g("PLAYER_AGE"),
+                g("GP"), g("GS"), g("MIN"),
+                g("FGM"), g("FGA"), g("FG_PCT"),
+                g("FG3M"), g("FG3A"), g("FG3_PCT"),
+                g("FTM"), g("FTA"), g("FT_PCT"),
+                g("OREB"), g("DREB"), g("REB"),
+                g("AST"), g("STL"), g("BLK"), g("TOV"), g("PF"), g("PTS"),
+                1 if is_total else 0,
+                now,
+            ))
+        return out
+
+    all_rows = (
+        rows_from("SeasonTotalsRegularSeason", "Regular Season", False)
+        + rows_from("SeasonTotalsPostSeason", "Playoffs", False)
+        + rows_from("CareerTotalsRegularSeason", "Regular Season", True)
+        + rows_from("CareerTotalsPostSeason", "Playoffs", True)
+    )
+    if not all_rows:
+        # Endpoint returned nothing (happens for a few ids) — record the
+        # attempt so we don't hammer the API, but keep any old rows.
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO player_career_official
+            (player_id, season, season_type, team_abbr, is_career_total, fetched_at, gp)
+            VALUES (?, '__EMPTY__', 'None', 'TOT', 0, ?, 0)
+            """,
+            (player_id, now),
+        )
+        conn.commit()
+        return
+
+    conn.execute("DELETE FROM player_career_official WHERE player_id = ?", (player_id,))
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO player_career_official VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        all_rows,
+    )
+    conn.commit()
+
+
+@app.get("/api/players/{id}/career-official")
+def get_player_career_official(id: int):
+    """
+    Complete official career, season by season (regular + playoffs), plus
+    career totals — from stats.nba.com, cached weekly. This covers a
+    player's WHOLE career, not just the seasons in our local archive.
+    """
+    conn = get_db_conn()
+    try:
+        try:
+            _ensure_career_official(conn, id)
+        except Exception as exc:
+            logger.warning(f"Career-official fetch failed for {id} (serving cache): {exc}")
+        rows = conn.execute(
+            """
+            SELECT * FROM player_career_official
+            WHERE player_id = ? AND season != '__EMPTY__'
+            ORDER BY season
+            """,
+            (id,),
+        ).fetchall()
+        seasons = [dict(r) for r in rows if not r["is_career_total"]]
+        totals = [dict(r) for r in rows if r["is_career_total"]]
+        return {
+            "player_id": id,
+            "seasons": seasons,
+            "career_totals": {t["season_type"]: t for t in totals},
+        }
+    except Exception as e:
+        logger.error(f"Error fetching official career for {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# --- Milestone watch: proximity to career milestones ---
+MILESTONE_STEPS = {"pts": 1000, "ast": 500, "reb": 500, "fg3m": 250, "stl": 250, "blk": 250}
+
+
+@app.get("/api/stats/milestones")
+def get_milestone_watch(limit: int = 25):
+    """
+    Active players approaching career milestones. Seeded from this season's
+    top scorers/assisters/rebounders (whose official careers get cached on
+    first call), then ranked by proximity to their next round number.
+    """
+    conn = get_db_conn()
+    try:
+        # Seed pool: top current-season producers across categories.
+        seed_rows = conn.execute(
+            """
+            SELECT DISTINCT t.player_id, p.full_name
+            FROM player_season_totals t
+            JOIN players p ON p.player_id = t.player_id
+            WHERE t.season = ? AND t.season_type = 'Regular Season' AND t.gp >= 30
+            ORDER BY t.pts DESC LIMIT 60
+            """,
+            (CURRENT_SEASON,),
+        ).fetchall()
+
+        watch = []
+        for pid, name in [(r[0], r[1]) for r in seed_rows]:
+            try:
+                _ensure_career_official(conn, pid)
+            except Exception:
+                continue
+            tot = conn.execute(
+                """
+                SELECT pts, ast, reb, fg3m, stl, blk FROM player_career_official
+                WHERE player_id = ? AND is_career_total = 1 AND season_type = 'Regular Season'
+                """,
+                (pid,),
+            ).fetchone()
+            if not tot:
+                continue
+            for stat, step in MILESTONE_STEPS.items():
+                val = tot[stat]
+                if val is None or val < step:
+                    continue
+                next_ms = ((val // step) + 1) * step
+                remaining = next_ms - val
+                # Only show genuinely close milestones (within 60% of a step)
+                if remaining <= step * 0.6:
+                    watch.append({
+                        "player_id": pid,
+                        "full_name": name,
+                        "stat": stat,
+                        "career_total": val,
+                        "next_milestone": next_ms,
+                        "remaining": remaining,
+                        "pct_there": round(100 * val / next_ms, 1),
+                    })
+
+        watch.sort(key=lambda w: w["remaining"] / MILESTONE_STEPS[w["stat"]])
+        return {"count": len(watch), "milestones": watch[:limit]}
+    except Exception as e:
+        logger.error(f"Error building milestone watch: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Game Finder: Stathead-style queries over the game-log archive ---
 @app.get("/api/finder/player-games")
 def finder_player_games(

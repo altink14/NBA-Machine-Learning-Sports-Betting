@@ -13,6 +13,10 @@ class SbrOddsProvider:
     def __init__(self, sportsbook="fanduel", sport="NBA"):
         self.sportsbook = sportsbook
         self.sport = sport
+        # The sport actually scraped. Starts as the requested sport and is
+        # updated by the fallback logic below (NBA -> WNBA in the offseason),
+        # so callers can label logs/snapshots with the truth.
+        self.resolved_sport = (sport or "").upper() or sport
         self.games = self._fetch_games_with_fallback()
 
     def _fetch_games_with_fallback(self):
@@ -40,6 +44,7 @@ class SbrOddsProvider:
                         for game in sb.games:
                             game['game_start_time_utc'] = game.get('datetime')
                             game['sport'] = 'NBA'
+                        self.resolved_sport = 'NBA'
                         return sb.games
                 except Exception as e:
                     logger.error(f"Failed to fetch NBA games for {check_date.strftime('%Y-%m-%d')} due to an error: {e}")
@@ -60,12 +65,24 @@ class SbrOddsProvider:
                     for game in sb.games:
                         game['game_start_time_utc'] = game.get('datetime')
                         game['sport'] = requested_sport
+                    self.resolved_sport = requested_sport
                     return sb.games
             except Exception as e:
                 logger.error(f"Failed to fetch {requested_sport} games for {check_date.strftime('%Y-%m-%d')} due to an error: {e}")
         
         logger.warning(f"No {requested_sport} games found within the next 7 days.")
         return []
+
+    def get_resolved_sport(self):
+        """
+        The sport whose games were actually fetched. Prefers the per-game 'sport'
+        key, falling back to the requested sport when nothing was resolved.
+        """
+        for game in (self.games or []):
+            game_sport = game.get('sport') if isinstance(game, dict) else None
+            if game_sport:
+                return game_sport
+        return self.resolved_sport or self.sport
 
     def get_odds(self):
         """

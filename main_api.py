@@ -3,19 +3,31 @@
 import glob
 import re
 import os
+import secrets
 from typing import List, Dict, Any, Optional, Tuple, Union
 import uvicorn
 import pandas as pd
 import numpy as np
 import xgboost as xgb
 import sqlite3
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# Rate limiting (slowapi). Declared in requirements.txt; if it is missing from a
+# local environment the API still boots, but unthrottled - and says so loudly.
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
+    from slowapi.util import get_remote_address
+    SLOWAPI_AVAILABLE = True
+except ImportError:
+    SLOWAPI_AVAILABLE = False
 
 # nba_api imports
 try:
@@ -91,15 +103,141 @@ def find_db_team_stats(team_name: str, season: str = CURRENT_SEASON):
         logger.warning(f"Error querying advanced team stats for {team_name}: {e}")
         return None
 
+# --- Security / networking configuration (env-driven) ---
+# CORS_ORIGINS: comma-separated list of allowed browser origins. Defaults to the
+# local Next.js dev server so a fresh checkout works with no configuration.
+DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
+    if origin.strip()
+] or [o.strip() for o in DEFAULT_CORS_ORIGINS.split(",")]
+
+# API_KEY: when unset, auth is disabled (local dev / current frontend keep working).
+# When set, only the PROTECTED paths below require the X-API-Key header.
+#
+# The model is an allowlist of PROTECTED paths, not an exempt-list, on purpose:
+# the reference stats site is fetched straight from the browser by client
+# components, so any key they could send would have to be a NEXT_PUBLIC_ var -
+# i.e. not a secret. Those endpoints are guarded by CORS + rate limiting.
+# The paths below are the expensive / non-public ones, and the frontend already
+# reaches them through server-side Next API routes that can hold a real secret.
+API_KEY = (os.environ.get("API_KEY") or "").strip()
+API_KEY_HEADER = "X-API-Key"
+PROTECTED_PATH_PREFIXES = (
+    "/predictions",           # live sbrscrape scraping + XGBoost inference
+    "/api/parlay/evaluate",   # parlay EV engine
+    "/api/line-movements",    # odds snapshot history
+)
+# Deliberately NOT protected: /api/prediction-log. It backs the public
+# /track-record grading ledger, is fetched straight from the browser, and is a
+# cheap DB read - public readability is the point of that page.
+# Never require a key here, whatever else is configured (uptime probes).
+ALWAYS_OPEN_PATHS = {"/", "/health"}
+
+
+def _is_protected_path(path: str) -> bool:
+    """True when `path` needs the API key. Exact match or a genuine sub-path."""
+    if path in ALWAYS_OPEN_PATHS:
+        return False
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in PROTECTED_PATH_PREFIXES
+    )
+
+# Rate limits (per client IP). Tunable without a code change / redeploy.
+# RATE_LIMIT_DEFAULT is slowapi's per-endpoint default; RATE_LIMIT_GLOBAL is the
+# overall per-IP ceiling that stops a crawler from fanning out across every route.
+RATE_LIMIT_DEFAULT = os.environ.get("RATE_LIMIT_DEFAULT", "").strip() or "60/minute"
+RATE_LIMIT_GLOBAL = os.environ.get("RATE_LIMIT_GLOBAL", "").strip() or "240/minute"
+RATE_LIMIT_EXPENSIVE = os.environ.get("RATE_LIMIT_EXPENSIVE", "").strip() or "10/minute"
+# RATE_LIMIT_UPSTREAM guards the handful of public routes that turn one inbound
+# request into one outbound stats.nba.com call. Abuse there gets THIS SERVER's IP
+# throttled or banned by nba.com, which breaks the site for everyone and is not
+# something a redeploy fixes. Keyless (they back the public reference site), but
+# throttled harder than an ordinary DB read.
+RATE_LIMIT_UPSTREAM = os.environ.get("RATE_LIMIT_UPSTREAM", "").strip() or "20/minute"
+
+
+def require_api_key(request: Request) -> None:
+    """Global dependency: enforce X-API-Key on protected paths when API_KEY is set."""
+    if not API_KEY:
+        return
+    # CORS preflight never carries custom headers - never block it.
+    if request.method == "OPTIONS":
+        return
+    path = request.url.path.rstrip("/") or "/"
+    if not _is_protected_path(path):
+        return
+    provided = request.headers.get(API_KEY_HEADER)
+    if not provided or not secrets.compare_digest(provided, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail=f"Missing or invalid {API_KEY_HEADER} header.",
+        )
+
+
+class _NoopLimiter:
+    """Stand-in used when slowapi is not installed; decorators become no-ops."""
+
+    def limit(self, *args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+    def exempt(self, func):
+        return func
+
+
+if SLOWAPI_AVAILABLE:
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=[RATE_LIMIT_DEFAULT],
+        application_limits=[RATE_LIMIT_GLOBAL],
+    )
+else:
+    limiter = _NoopLimiter()
+
 # FastAPI App Setup
-app = FastAPI(title="Betting Buddy API", version="1.1.1-stable-fixed")
+app = FastAPI(
+    title="Betting Buddy API",
+    version="1.1.1-stable-fixed",
+    dependencies=[Depends(require_api_key)],
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if SLOWAPI_AVAILABLE:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
+# Make misconfiguration obvious in deploy logs.
+logger.info(f"CORS allowed origins: {CORS_ORIGINS}")
+logger.info(
+    f"Key-protected paths ({len(PROTECTED_PATH_PREFIXES)}): {', '.join(PROTECTED_PATH_PREFIXES)} "
+    "- every other route is public by design (reference stats site)."
+)
+if API_KEY:
+    logger.info(f"API key auth ENABLED: the paths above require the {API_KEY_HEADER} header.")
+else:
+    logger.warning(
+        "API_KEY is not set - the protected paths listed above are OPEN to anyone who can "
+        f"reach this host. Set API_KEY in the environment to require the {API_KEY_HEADER} header."
+    )
+if SLOWAPI_AVAILABLE:
+    logger.info(
+        f"Rate limiting enabled (per IP): {RATE_LIMIT_DEFAULT} per endpoint, "
+        f"{RATE_LIMIT_GLOBAL} overall, {RATE_LIMIT_EXPENSIVE} on /predictions and /api/parlay/evaluate, "
+        f"{RATE_LIMIT_UPSTREAM} on the 5 routes that call stats.nba.com live; /health exempt"
+    )
+else:
+    logger.warning("slowapi is not installed - rate limiting is DISABLED. Run: pip install slowapi")
 
 # --- Odds snapshots (real line-movement tracking) ---
 ODDS_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data', 'OddsData.sqlite')
@@ -268,6 +406,44 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
     finally:
         conn.close()
 
+# --- Days-rest helpers -------------------------------------------------------
+# The schedule CSVs (Data/nba-*-UTC.csv) carry UTC timestamps, but an NBA "game date"
+# -- and therefore the days-rest convention the model was trained on -- is the US
+# Eastern calendar date. A 7:30pm ET tip-off is stamped 00:30 UTC the FOLLOWING day, so
+# comparing UTC timestamps against a naive local clock silently shifts games by a day.
+DEFAULT_DAYS_REST = 7          # used when a team has no earlier game on record
+MIN_DAYS_REST = 1
+MAX_DAYS_REST = 7
+
+try:
+    from zoneinfo import ZoneInfo
+    _NBA_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - no tz database on this platform
+    _NBA_TZ = None
+
+
+def to_nba_date(ts):
+    """UTC instant (datetime, pandas Timestamp, or ISO string) -> US Eastern calendar date.
+
+    Returns None if `ts` cannot be interpreted. Falls back to a fixed UTC-5 offset if no
+    timezone database is available; that is correct for the whole regular season and off
+    by at most one day for a handful of late-evening playoff tip-offs.
+    """
+    if ts is None:
+        return None
+    try:
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize('UTC')
+        if _NBA_TZ is not None:
+            return ts.tz_convert(_NBA_TZ).date()
+        return (ts.tz_convert('UTC').tz_localize(None) - timedelta(hours=5)).date()
+    except Exception:
+        return None
+
+
 # PredictionRunner Class
 class PredictionRunner:
     def __init__(self, sportsbook: str, kelly_criterion: bool, sport: str = 'NBA'):
@@ -279,6 +455,15 @@ class PredictionRunner:
         self.team_stats_df = self._load_team_stats()
         self.schedule_df = self._load_schedule()
         self.odds_provider = SbrOddsProvider(sportsbook=self.sportsbook, sport=self.sport)
+        # The provider falls back from NBA to WNBA out of season; record what it
+        # actually scraped so snapshots and the prediction log are labeled truthfully.
+        try:
+            self.resolved_sport = self.odds_provider.get_resolved_sport() or self.sport
+        except Exception as exc:
+            logger.warning(f"Could not resolve scraped sport, falling back to '{self.sport}': {exc}")
+            self.resolved_sport = self.sport
+        if self.resolved_sport != self.sport:
+            logger.info(f"Requested sport '{self.sport}' resolved to '{self.resolved_sport}' by the odds provider.")
         self.xgb_ml_model, self.xgb_uo_model = self._load_xgboost_models()
 
     def _load_team_stats(self):
@@ -307,10 +492,40 @@ class PredictionRunner:
             return None
         try:
             logger.info(f"Loading schedule from: {os.path.basename(schedule_files[0])}")
-            return pd.read_csv(schedule_files[0], parse_dates=['Date'], date_format='%d/%m/%Y %H:%M')
+            df = pd.read_csv(schedule_files[0], parse_dates=['Date'], date_format='%d/%m/%Y %H:%M')
+            # Precompute the US Eastern calendar date so days-rest can be worked out in
+            # whole days without depending on the server's clock or timezone.
+            df['GameDateET'] = df['Date'].map(to_nba_date)
+            return df
         except Exception as e:
             logger.error(f"Failed to load schedule file {schedule_files[0]}: {e}")
             return None
+
+    def _days_rest(self, team, game_date):
+        """Days of rest a team has going into a game on `game_date` (US Eastern date).
+
+        Matches the convention the model was trained on (src/Process-Data/Add_Days_Rest.py
+        and src/Process-Data/Get_Odds_Data.py): the whole-day difference between this
+        game's date and the team's most recent previous game date.
+
+        Only games on a STRICTLY EARLIER date are considered, so a game can never
+        contribute to its own rest figure no matter when this endpoint is called. The
+        previous implementation compared UTC timestamps against a naive local clock,
+        which made the answer depend on the server's timezone and the hour of the call.
+        """
+        if self.schedule_df is None or game_date is None:
+            return DEFAULT_DAYS_REST
+        if 'GameDateET' not in self.schedule_df.columns:
+            return DEFAULT_DAYS_REST
+        sched = self.schedule_df
+        played = sched.loc[
+            ((sched['Home Team'] == team) | (sched['Away Team'] == team))
+            & sched['GameDateET'].notna()
+            & (sched['GameDateET'] < game_date),
+            'GameDateET']
+        if played.empty:
+            return DEFAULT_DAYS_REST
+        return (game_date - max(played)).days
 
     def _load_xgboost_models(self):
         try:
@@ -329,7 +544,7 @@ class PredictionRunner:
         if not odds_data:
             return {"error": f"No odds data found from {self.sportsbook}.", "predictions": []}
         try:
-            snapshot_odds(odds_data, self.sportsbook, self.sport)
+            snapshot_odds(odds_data, self.sportsbook, getattr(self, 'resolved_sport', self.sport) or self.sport)
         except Exception as exc:
             logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
         games_list = create_todays_games_from_odds(odds_data)
@@ -476,8 +691,8 @@ class PredictionRunner:
     def _prepare_data_for_model(self, games, odds):
         game_data_list, home_odds_list, away_odds_list, uo_lines_list, game_start_times_list = [], [], [], [], []
         
-        # We need datetime today to calculate rest days
-        today = datetime.today()
+        # Fallback game date, used only when the odds feed carries no start time.
+        today_nba_date = to_nba_date(datetime.now(timezone.utc))
 
         for home_team, away_team in games:
             game_key = f"{home_team}:{away_team}"
@@ -501,25 +716,15 @@ class PredictionRunner:
             home_stats = home_stats_rows.iloc[0].copy()
             away_stats = away_stats_rows.iloc[0].copy()
 
-            # Calculate days rest
-            home_days_off = 7
-            away_days_off = 7
-            if self.schedule_df is not None:
-                home_games = self.schedule_df[(self.schedule_df['Home Team'] == home_team) | (self.schedule_df['Away Team'] == home_team)]
-                away_games = self.schedule_df[(self.schedule_df['Home Team'] == away_team) | (self.schedule_df['Away Team'] == away_team)]
-                previous_home_games = home_games.loc[self.schedule_df['Date'] <= today].sort_values('Date', ascending=False).head(1)['Date']
-                previous_away_games = away_games.loc[self.schedule_df['Date'] <= today].sort_values('Date', ascending=False).head(1)['Date']
-                
-                if len(previous_home_games) > 0:
-                    last_home_date = previous_home_games.iloc[0]
-                    home_days_off = (timedelta(days=1) + today - last_home_date).days
-                if len(previous_away_games) > 0:
-                    last_away_date = previous_away_games.iloc[0]
-                    away_days_off = (timedelta(days=1) + today - last_away_date).days
+            # Calculate days rest, anchored to the game's own US Eastern date rather than
+            # to the server's wall clock, so the result is identical whenever it is run.
+            game_date = to_nba_date(game_odds.get('game_start_time_utc')) or today_nba_date
+            home_days_off = self._days_rest(home_team, game_date)
+            away_days_off = self._days_rest(away_team, game_date)
 
             # Clip rest days to a reasonable range of 1-7 days to prevent model outlier issues
-            home_days_off = max(1, min(home_days_off, 7))
-            away_days_off = max(1, min(away_days_off, 7))
+            home_days_off = max(MIN_DAYS_REST, min(home_days_off, MAX_DAYS_REST))
+            away_days_off = max(MIN_DAYS_REST, min(away_days_off, MAX_DAYS_REST))
 
             # Concatenate home and away team statistics
             game_data = pd.concat([home_stats, away_stats.rename(index=lambda x: x + '.1')])
@@ -741,8 +946,9 @@ class PredictionRunner:
 def read_root():
     return { "message": "Welcome to the Betting Buddy API!", "status": "healthy" }
 
-# Health check endpoint for frontend monitoring
+# Health check endpoint for frontend monitoring (never rate limited - uptime probes)
 @app.get("/health")
+@limiter.exempt
 def health_check():
     return {
         "status": "healthy",
@@ -764,7 +970,8 @@ predictions_cache = {}
 
 # This is the predictions endpoint for http://localhost:8000/predictions
 @app.get("/predictions")
-def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool = True, sport: str = 'NBA'):
+@limiter.limit(RATE_LIMIT_EXPENSIVE)
+def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kelly_criterion: bool = True, sport: str = 'NBA'):
     cache_key = f"{sportsbook}_{kelly_criterion}_{sport}"
     now = datetime.now()
     
@@ -785,7 +992,9 @@ def get_predictions_endpoint(sportsbook: str = 'fanduel', kelly_criterion: bool 
         res = runner.run_predictions()
         predictions_cache[cache_key] = (res, now)
         try:
-            log_predictions(res, sportsbook, sport)
+            # Log the sport the odds provider actually resolved (the NBA->WNBA
+            # offseason fallback means it is not always the requested one).
+            log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
         except Exception as exc:
             logger.warning(f"Prediction logging failed (non-fatal): {exc}")
         return res
@@ -826,7 +1035,8 @@ def _model_prob_from_prediction(leg: ParlayLeg, prediction: Dict[str, Any]) -> O
     return None
 
 @app.post("/api/parlay/evaluate")
-def evaluate_parlay_endpoint(request: ParlayRequest):
+@limiter.limit(RATE_LIMIT_EXPENSIVE)
+def evaluate_parlay_endpoint(request: Request, payload: ParlayRequest):
     """
     Evaluate a parlay ticket: combined odds, model probability, EV, Kelly stake,
     and correlation warnings. Legs without an explicit model_prob are enriched
@@ -836,7 +1046,7 @@ def evaluate_parlay_endpoint(request: ParlayRequest):
     cached_predictions: List[Dict[str, Any]] = []
     now = datetime.now()
     for kelly_variant in (True, False):
-        entry = predictions_cache.get(f"{request.sportsbook}_{kelly_variant}_NBA")
+        entry = predictions_cache.get(f"{payload.sportsbook}_{kelly_variant}_NBA")
         if entry and now - entry[1] < timedelta(minutes=5):
             cached_predictions = entry[0].get("predictions", []) or []
             break
@@ -849,7 +1059,7 @@ def evaluate_parlay_endpoint(request: ParlayRequest):
         return None
 
     legs_payload = []
-    for leg in request.legs:
+    for leg in payload.legs:
         model_prob = leg.model_prob
         if model_prob is None:
             pred = find_prediction(leg)
@@ -1965,7 +2175,8 @@ TATUM_MOCK_SHOTS = [
 ]
 
 @app.get("/api/shot-chart")
-def get_shot_chart(game_date: str, home_team: str):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_shot_chart(request: Request, game_date: str, home_team: str):
     """
     Fetch shot chart details for a game, resolved via database and retrieved from NBA Stats API.
     """
@@ -2104,7 +2315,8 @@ def get_active_players():
 player_shot_chart_cache = {}
 
 @app.get("/api/player-shot-chart")
-def get_player_shot_chart(player_id: int, season: str = CURRENT_SEASON):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_player_shot_chart(request: Request, player_id: int, season: str = CURRENT_SEASON):
     cache_key = f"{player_id}_{season}"
     if cache_key in player_shot_chart_cache:
         logger.info(f"Returning cached player shot chart for key: {cache_key}")
@@ -2191,7 +2403,8 @@ def get_player_shot_chart(player_id: int, season: str = CURRENT_SEASON):
 player_stats_cache = {}
 
 @app.get("/api/player-stats")
-def get_player_stats(season: str = "2025-26", per_mode: str = "PerGame", measure_type: str = "Base"):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_player_stats(request: Request, season: str = "2025-26", per_mode: str = "PerGame", measure_type: str = "Base"):
     cache_key = f"{season}_{per_mode}_{measure_type}"
     now = datetime.now()
     
@@ -2474,7 +2687,8 @@ def search_players(q: str):
         conn.close()
 
 @app.get("/api/players/{id}")
-def get_player_by_id(id: int, season: str = CURRENT_SEASON):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
     """
     Fetch player biography, current season totals, and advanced statistics.
     """
@@ -3163,7 +3377,8 @@ def get_game_play_by_play(game_id: str):
         conn.close()
 
 @app.get("/api/games/{game_id}/shot-chart")
-def get_game_shot_chart(game_id: str):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_game_shot_chart(request: Request, game_id: str):
     """
     Fetch shot chart details for a game resolved directly via game_id.
     """

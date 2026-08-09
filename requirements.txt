@@ -4,6 +4,7 @@
 fastapi
 uvicorn[standard]
 python-dotenv
+slowapi
 
 # Data and ML libraries
 pandas

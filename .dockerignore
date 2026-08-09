@@ -1,12 +1,104 @@
+# ---------------------------------------------------------------------------
+# Docker build context excludes.
+#
+# The Dockerfile does `COPY . .`, so anything not listed here ships in the
+# image. Keep this file honest: only exclude things proven not to be loaded
+# at runtime by `main_api:app` (the container's entrypoint).
+# ---------------------------------------------------------------------------
+
+# --- Virtualenvs (two of them live in this repo) ---
 venv/
+nba_env/
+
+# --- VCS / build metadata ---
 .git/
+.gitignore
+.dockerignore
+
+# --- Databases and API cache (bootstrap_db.py downloads these at boot) ---
 Data/*.sqlite
 Data/*.sqlite-shm
 Data/*.sqlite-wal
 Data/nba_cache/
+
+# --- Secrets ---
+.env
+
+# --- Python bytecode / tooling artifacts ---
 __pycache__/
 *.pyc
-.env
-Flask/
+.pytest_cache/
+.coverage
+.mypy_cache/
+.idea/
+.claude/
+
+# --- Node / legacy Flask UI ---
 node_modules/
+Flask/
+
+# --- Logs ---
 daily_update.log
+*.log
+
+# ---------------------------------------------------------------------------
+# XGBoost models.
+#
+# LOAD-BEARING - these two MUST stay in the image. Both are referenced by
+# explicit, hardcoded relative paths (no globbing, no filename pattern
+# matching, no "pick the highest accuracy" logic anywhere in the codebase):
+#
+#   main_api.py:317-318         Models/XGBoost_Models/XGBoost_68.9%_ML-3.json
+#                               Models/XGBoost_Models/XGBoost_54.8%_UO-8.json
+#   src/Predict/XGBoost_Runner.py:15,17   (same two files)
+#
+# Every other .json under Models/ is a superseded training checkpoint written
+# by src/Train-Models/*.py and read by nothing that runs in the container.
+# Excluded by exact filename so a future model rename cannot silently drop the
+# wrong file.
+# ---------------------------------------------------------------------------
+
+# Superseded UO checkpoint in the live model dir (62 MB, replaced by UO-8).
+# See the "Changed from 53.7% to 54.8%" comment in XGBoost_Runner.py:17.
+Models/XGBoost_Models/XGBoost_53.7%_UO-9.json
+# Superseded ML checkpoint (replaced by ML-3). See XGBoost_Runner.py:15.
+Models/XGBoost_Models/XGBoost_68.7%_ML-4.json
+
+# Stale training checkpoints in Models/ root - no code path loads these.
+# (Models/XGBoost_ML.json is read only by simple_main.py, which is not an
+#  entrypoint; train_model.py writes it. Neither runs in the container.)
+Models/XGBoost_53.1%_UO-9.json
+Models/XGBoost_53.6%_UO-9.json
+Models/XGBoost_53.8%_UO-9.json
+Models/XGBoost_65.3%_ML-4.json
+Models/XGBoost_65.5%_ML-4.json
+Models/XGBoost_65.9%_ML-4.json
+Models/XGBoost_66.7%_ML-4.json
+Models/XGBoost_66.8%_ML-4.json
+Models/XGBoost_67.7%_ML-4.json
+Models/XGBoost_68.1%_ML-4.json
+Models/XGBoost_68.5%_ML-4.json
+Models/XGBoost_ML.json
+
+# NOTE: Models/NN_Models/ is deliberately NOT excluded. It is loaded by
+# src/Predict/NN_Runner.py and it is only ~5 MB - not worth the risk.
+
+# --- Raw dunk scrape dumps (~102 MB). No Python in this repo reads them; the
+#     /stats/dunk-scores page ships its own copy of the derived data at
+#     basic-saas-starter/src/app/(app)/stats/dunk-scores/dunk_scores_data.json ---
+all_real_dunks.json
+real_dunks_2425_reg.json
+dunk_data.json
+dunk_scores_data.json
+scrape_dunks_regex.py
+
+# --- Tests, notebooks, screenshots, scratch work: not imported by main_api ---
+Tests/
+Personal_Tests/
+scratch/
+Screenshots/
+ColabNotebook.ipynb
+notes.txt
+inspect_db.py
+inspect_model.py
+test_predictions.py

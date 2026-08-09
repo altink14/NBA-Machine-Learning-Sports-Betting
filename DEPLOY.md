@@ -70,9 +70,35 @@ generally cannot run on Railway. The working pipeline:
 
 ## Env inventory
 
-Backend: `CORS_ORIGINS`, `DB_SNAPSHOT_URL`, `ODDS_API_KEY?`, `DEFAULT_SPORTSBOOK?`
+The authoritative, annotated list now lives in `.env.example` in each repo —
+those are kept in sync with the code. Summary:
+
+Backend: `DB_SNAPSHOT_URL`, `CORS_ORIGINS`, `API_KEY?`, `RATE_LIMIT_DEFAULT?`,
+`RATE_LIMIT_GLOBAL?`, `RATE_LIMIT_EXPENSIVE?`, `RATE_LIMIT_UPSTREAM?`,
+`NBA_CACHE_DIR?`, `PORT` (set by the platform).
+`ODDS_API_KEY` and `DEFAULT_SPORTSBOOK` are listed in `render.yaml` but read by
+no Python in this repo — setting them does nothing today.
+
 Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `STRIPE_SECRET_KEY`,
 `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`,
 `NEXT_PUBLIC_STRIPE_PRICE_*` (4x), `NEXT_PUBLIC_NBA_API_URL`,
-`NEXT_PUBLIC_SITE_URL`
+`NEXT_PUBLIC_SITE_URL`, `NBA_API_KEY?`, `PREMIUM_BYPASS?` (local only).
+
+## Security notes — read before going live
+
+- **`CORS_ORIGINS` is not in `render.yaml` on purpose** (step 0.4). Until you set
+  it in the dashboard the backend falls back to `localhost:3000`, and the
+  deployed frontend's requests will be rejected by the browser. This is the
+  single easiest way to ship a broken production site.
+- **`API_KEY` protects an allowlist, not everything**: `/predictions`,
+  `/api/parlay/evaluate`, `/api/line-movements`. The public reference endpoints
+  are keyless by design — they're fetched directly from the browser. Set
+  `NBA_API_KEY` on Vercel to the same value; the frontend attaches the header
+  only from server-side route handlers.
+- **Rate limits need real client IPs.** The Dockerfile passes
+  `--forwarded-allow-ips="*"`; without it every request behind the platform
+  proxy looks like one IP and `RATE_LIMIT_GLOBAL` becomes one shared bucket for
+  all users. If you ever override the start command, keep that flag.
+- **Limits are in-process.** They reset on restart and are per-instance. Fine
+  for a single instance; needs Redis (`storage_uri`) if you scale out.

@@ -1,0 +1,1661 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-08-08T21:02:11+00:00",
+  "generated_by": "backtest_model.py",
+  "headline": {
+    "number_pct": 65.81,
+    "n_games": 2597,
+    "ci95_pct": [
+      63.96,
+      67.61
+    ],
+    "seasons": [
+      "2024-25",
+      "2025-26"
+    ],
+    "recommended_public_wording": "65.81% moneyline accuracy across 2,597 NBA games in the 2024-25 and 2025-26 seasons -- games played entirely after the model was trained. Picking the home team every time would have gone 55.1%.",
+    "required_footnote": "Measured on 2,597 games from 2024-25 and 2025-26, none of which were in the training data (training ends 2024-04-28). 95% confidence interval 63.96-67.61%. Accuracy is not profitability: no historical odds exist for these seasons, so no ROI has been measured. A simple 'pick the better record' rule scored 65.34% on the same games.",
+    "replaces_claim": "68.9% test accuracy on held-out games",
+    "why_the_old_claim_is_wrong": "The 68.9% figure is the best of 300 random train/test splits taken during training, not an out-of-sample result. The splits were random rather than chronological and the model saved was the single luckiest of the 300. The model scores only 68.16% on its own training rows, so 68.9% was never a stable estimate of anything. The phrase \"held-out games\" is also misleading: until this backtest, no games outside the training window had ever been scored.",
+    "do_not_say": [
+      "Do not quote 68.9% as held-out or out-of-sample accuracy.",
+      "Do not quote the confidence-floor numbers (e.g. \"79% on high-confidence picks\") without stating that they cover only a selected subset of games and that the threshold was chosen after seeing the data.",
+      "Do not imply profitability, ROI, or edge against the closing line. None of that has been measured for these seasons."
+    ]
+  },
+  "model": {
+    "file": "Models/XGBoost_Models/XGBoost_68.9%_ML-3.json",
+    "type": "XGBoost multi:softprob, 2 classes, 750 boosting rounds, max_depth 3, eta 0.01",
+    "n_features": 106,
+    "target": "home team wins",
+    "trained_by": "src/Train-Models/XGBoost_Model_ML.py",
+    "training_table": "Data/dataset.sqlite :: dataset_2012-24_new",
+    "training_rows": 15115,
+    "training_date_range": [
+      "2012-11-04",
+      "2024-04-28"
+    ],
+    "filename_accuracy_claim_68_9": "The 68.9% in the filename is the MAXIMUM test accuracy observed across 300 random 90/10 train_test_split runs; the model saved is the single best of those runs. Splits were random rather than chronological, so test rows sat between train rows in time. It is a selected maximum over noisy estimates, not an out-of-sample estimate, and it should not be quoted as held-out accuracy."
+  },
+  "evaluation": {
+    "seasons": [
+      "2024-25",
+      "2025-26"
+    ],
+    "why_held_out": "Neither season appears in dataset_2012-24_new, which ends 2024-04-28. No 2024-25 or 2025-26 game influenced training in any way.",
+    "n_games_scored": 2597,
+    "n_games_available": 2629,
+    "n_games_skipped": 32,
+    "skipped_reason": "season-opening games have no prior-game stats to build features from",
+    "games_by_season": {
+      "2024-25": 1298,
+      "2025-26": 1299
+    },
+    "games_by_season_type": {
+      "Regular Season": 2428,
+      "Playoffs": 169
+    },
+    "date_range": [
+      "2024-10-25",
+      "2026-06-13"
+    ]
+  },
+  "results": {
+    "overall": {
+      "n": 2597,
+      "model_correct": 1709,
+      "model_accuracy_pct": 65.81,
+      "model_accuracy_95ci": [
+        63.96,
+        67.61
+      ],
+      "home_wins": 1431,
+      "home_team_baseline_pct": 55.1,
+      "home_team_baseline_95ci": [
+        53.18,
+        57.01
+      ],
+      "edge_over_home_baseline_pp": 10.7,
+      "better_record_baseline_pct": 65.34,
+      "better_record_baseline_95ci": [
+        63.49,
+        67.15
+      ],
+      "edge_over_better_record_pp": 0.46,
+      "better_point_margin_baseline_pct": 65.58,
+      "edge_over_better_point_margin_pp": 0.23,
+      "mean_confidence_pct": 64.13,
+      "brier_score": 0.2142,
+      "log_loss": 0.6177
+    },
+    "by_season": {
+      "2024-25": {
+        "n": 1298,
+        "model_correct": 834,
+        "model_accuracy_pct": 64.25,
+        "model_accuracy_95ci": [
+          61.61,
+          66.81
+        ],
+        "home_wins": 712,
+        "home_team_baseline_pct": 54.85,
+        "home_team_baseline_95ci": [
+          52.14,
+          57.54
+        ],
+        "edge_over_home_baseline_pp": 9.4,
+        "better_record_baseline_pct": 64.02,
+        "better_record_baseline_95ci": [
+          61.37,
+          66.59
+        ],
+        "edge_over_better_record_pp": 0.23,
+        "better_point_margin_baseline_pct": 64.41,
+        "edge_over_better_point_margin_pp": -0.15,
+        "mean_confidence_pct": 64.47,
+        "brier_score": 0.2181,
+        "log_loss": 0.6258
+      },
+      "2025-26": {
+        "n": 1299,
+        "model_correct": 875,
+        "model_accuracy_pct": 67.36,
+        "model_accuracy_95ci": [
+          64.76,
+          69.86
+        ],
+        "home_wins": 719,
+        "home_team_baseline_pct": 55.35,
+        "home_team_baseline_95ci": [
+          52.63,
+          58.03
+        ],
+        "edge_over_home_baseline_pp": 12.01,
+        "better_record_baseline_pct": 66.67,
+        "better_record_baseline_95ci": [
+          64.06,
+          69.18
+        ],
+        "edge_over_better_record_pp": 0.69,
+        "better_point_margin_baseline_pct": 66.74,
+        "edge_over_better_point_margin_pp": 0.62,
+        "mean_confidence_pct": 63.78,
+        "brier_score": 0.2102,
+        "log_loss": 0.6096
+      }
+    },
+    "by_season_type": {
+      "Regular Season": {
+        "n": 2428,
+        "model_correct": 1603,
+        "model_accuracy_pct": 66.02,
+        "model_accuracy_95ci": [
+          64.11,
+          67.88
+        ],
+        "home_wins": 1336,
+        "home_team_baseline_pct": 55.02,
+        "home_team_baseline_95ci": [
+          53.04,
+          56.99
+        ],
+        "edge_over_home_baseline_pp": 11.0,
+        "better_record_baseline_pct": 65.69,
+        "better_record_baseline_95ci": [
+          63.78,
+          67.55
+        ],
+        "edge_over_better_record_pp": 0.33,
+        "better_point_margin_baseline_pct": 66.1,
+        "edge_over_better_point_margin_pp": -0.08,
+        "mean_confidence_pct": 64.31,
+        "brier_score": 0.2131,
+        "log_loss": 0.6153
+      },
+      "Playoffs": {
+        "n": 169,
+        "model_correct": 106,
+        "model_accuracy_pct": 62.72,
+        "model_accuracy_95ci": [
+          55.22,
+          69.65
+        ],
+        "home_wins": 95,
+        "home_team_baseline_pct": 56.21,
+        "home_team_baseline_95ci": [
+          48.68,
+          63.47
+        ],
+        "edge_over_home_baseline_pp": 6.51,
+        "better_record_baseline_pct": 60.36,
+        "better_record_baseline_95ci": [
+          52.83,
+          67.42
+        ],
+        "edge_over_better_record_pp": 2.37,
+        "better_point_margin_baseline_pct": 57.99,
+        "edge_over_better_point_margin_pp": 4.73,
+        "mean_confidence_pct": 61.51,
+        "brier_score": 0.2303,
+        "log_loss": 0.6524
+      }
+    },
+    "by_season_and_type": {
+      "2024-25 Regular Season": {
+        "n": 1214,
+        "model_correct": 784,
+        "model_accuracy_pct": 64.58,
+        "model_accuracy_95ci": [
+          61.85,
+          67.22
+        ],
+        "home_wins": 664,
+        "home_team_baseline_pct": 54.7,
+        "home_team_baseline_95ci": [
+          51.88,
+          57.48
+        ],
+        "edge_over_home_baseline_pp": 9.88,
+        "better_record_baseline_pct": 64.33,
+        "better_record_baseline_95ci": [
+          61.6,
+          66.98
+        ],
+        "edge_over_better_record_pp": 0.25,
+        "better_point_margin_baseline_pct": 64.91,
+        "edge_over_better_point_margin_pp": -0.33,
+        "mean_confidence_pct": 64.65,
+        "brier_score": 0.2171,
+        "log_loss": 0.6237
+      },
+      "2024-25 Playoffs": {
+        "n": 84,
+        "model_correct": 50,
+        "model_accuracy_pct": 59.52,
+        "model_accuracy_95ci": [
+          48.83,
+          69.38
+        ],
+        "home_wins": 48,
+        "home_team_baseline_pct": 57.14,
+        "home_team_baseline_95ci": [
+          46.48,
+          67.18
+        ],
+        "edge_over_home_baseline_pp": 2.38,
+        "better_record_baseline_pct": 59.52,
+        "better_record_baseline_95ci": [
+          48.83,
+          69.38
+        ],
+        "edge_over_better_record_pp": 0.0,
+        "better_point_margin_baseline_pct": 57.14,
+        "edge_over_better_point_margin_pp": 2.38,
+        "mean_confidence_pct": 61.94,
+        "brier_score": 0.2325,
+        "log_loss": 0.6565
+      },
+      "2025-26 Regular Season": {
+        "n": 1214,
+        "model_correct": 819,
+        "model_accuracy_pct": 67.46,
+        "model_accuracy_95ci": [
+          64.78,
+          70.04
+        ],
+        "home_wins": 672,
+        "home_team_baseline_pct": 55.35,
+        "home_team_baseline_95ci": [
+          52.55,
+          58.13
+        ],
+        "edge_over_home_baseline_pp": 12.11,
+        "better_record_baseline_pct": 67.05,
+        "better_record_baseline_95ci": [
+          64.36,
+          69.64
+        ],
+        "edge_over_better_record_pp": 0.41,
+        "better_point_margin_baseline_pct": 67.3,
+        "edge_over_better_point_margin_pp": 0.16,
+        "mean_confidence_pct": 63.97,
+        "brier_score": 0.209,
+        "log_loss": 0.6069
+      },
+      "2025-26 Playoffs": {
+        "n": 85,
+        "model_correct": 56,
+        "model_accuracy_pct": 65.88,
+        "model_accuracy_95ci": [
+          55.31,
+          75.08
+        ],
+        "home_wins": 47,
+        "home_team_baseline_pct": 55.29,
+        "home_team_baseline_95ci": [
+          44.72,
+          65.41
+        ],
+        "edge_over_home_baseline_pp": 10.59,
+        "better_record_baseline_pct": 61.18,
+        "better_record_baseline_95ci": [
+          50.55,
+          70.84
+        ],
+        "edge_over_better_record_pp": 4.71,
+        "better_point_margin_baseline_pct": 58.82,
+        "edge_over_better_point_margin_pp": 7.06,
+        "mean_confidence_pct": 61.09,
+        "brier_score": 0.2281,
+        "log_loss": 0.6483
+      }
+    },
+    "by_month": {
+      "2024-10": {
+        "n": 55,
+        "model_correct": 28,
+        "model_accuracy_pct": 50.91,
+        "model_accuracy_95ci": [
+          38.08,
+          63.62
+        ],
+        "home_wins": 30,
+        "home_team_baseline_pct": 54.55,
+        "home_team_baseline_95ci": [
+          41.52,
+          66.97
+        ],
+        "edge_over_home_baseline_pp": -3.64,
+        "better_record_baseline_pct": 49.09,
+        "better_record_baseline_95ci": [
+          36.38,
+          61.92
+        ],
+        "edge_over_better_record_pp": 1.82,
+        "better_point_margin_baseline_pct": 56.36,
+        "edge_over_better_point_margin_pp": -5.45,
+        "mean_confidence_pct": 62.63,
+        "brier_score": 0.2569,
+        "log_loss": 0.71
+      },
+      "2024-11": {
+        "n": 222,
+        "model_correct": 146,
+        "model_accuracy_pct": 65.77,
+        "model_accuracy_95ci": [
+          59.3,
+          71.69
+        ],
+        "home_wins": 133,
+        "home_team_baseline_pct": 59.91,
+        "home_team_baseline_95ci": [
+          53.35,
+          66.14
+        ],
+        "edge_over_home_baseline_pp": 5.86,
+        "better_record_baseline_pct": 60.81,
+        "better_record_baseline_95ci": [
+          54.26,
+          67.0
+        ],
+        "edge_over_better_record_pp": 4.95,
+        "better_point_margin_baseline_pct": 65.32,
+        "edge_over_better_point_margin_pp": 0.45,
+        "mean_confidence_pct": 64.58,
+        "brier_score": 0.2167,
+        "log_loss": 0.6246
+      },
+      "2024-12": {
+        "n": 191,
+        "model_correct": 126,
+        "model_accuracy_pct": 65.97,
+        "model_accuracy_95ci": [
+          58.99,
+          72.31
+        ],
+        "home_wins": 97,
+        "home_team_baseline_pct": 50.79,
+        "home_team_baseline_95ci": [
+          43.75,
+          57.79
+        ],
+        "edge_over_home_baseline_pp": 15.18,
+        "better_record_baseline_pct": 63.87,
+        "better_record_baseline_95ci": [
+          56.85,
+          70.35
+        ],
+        "edge_over_better_record_pp": 2.09,
+        "better_point_margin_baseline_pct": 64.92,
+        "edge_over_better_point_margin_pp": 1.05,
+        "mean_confidence_pct": 64.42,
+        "brier_score": 0.2096,
+        "log_loss": 0.6071
+      },
+      "2025-01": {
+        "n": 227,
+        "model_correct": 141,
+        "model_accuracy_pct": 62.11,
+        "model_accuracy_95ci": [
+          55.65,
+          68.17
+        ],
+        "home_wins": 122,
+        "home_team_baseline_pct": 53.74,
+        "home_team_baseline_95ci": [
+          47.25,
+          60.11
+        ],
+        "edge_over_home_baseline_pp": 8.37,
+        "better_record_baseline_pct": 63.0,
+        "better_record_baseline_95ci": [
+          56.55,
+          69.01
+        ],
+        "edge_over_better_record_pp": -0.88,
+        "better_point_margin_baseline_pct": 63.0,
+        "edge_over_better_point_margin_pp": -0.88,
+        "mean_confidence_pct": 64.19,
+        "brier_score": 0.2247,
+        "log_loss": 0.641
+      },
+      "2025-02": {
+        "n": 176,
+        "model_correct": 110,
+        "model_accuracy_pct": 62.5,
+        "model_accuracy_95ci": [
+          55.15,
+          69.31
+        ],
+        "home_wins": 98,
+        "home_team_baseline_pct": 55.68,
+        "home_team_baseline_95ci": [
+          48.3,
+          62.82
+        ],
+        "edge_over_home_baseline_pp": 6.82,
+        "better_record_baseline_pct": 65.34,
+        "better_record_baseline_95ci": [
+          58.05,
+          71.98
+        ],
+        "edge_over_better_record_pp": -2.84,
+        "better_point_margin_baseline_pct": 61.36,
+        "edge_over_better_point_margin_pp": 1.14,
+        "mean_confidence_pct": 64.81,
+        "brier_score": 0.2235,
+        "log_loss": 0.6357
+      },
+      "2025-03": {
+        "n": 238,
+        "model_correct": 160,
+        "model_accuracy_pct": 67.23,
+        "model_accuracy_95ci": [
+          61.03,
+          72.88
+        ],
+        "home_wins": 131,
+        "home_team_baseline_pct": 55.04,
+        "home_team_baseline_95ci": [
+          48.69,
+          61.23
+        ],
+        "edge_over_home_baseline_pp": 12.18,
+        "better_record_baseline_pct": 68.07,
+        "better_record_baseline_95ci": [
+          61.9,
+          73.66
+        ],
+        "edge_over_better_record_pp": -0.84,
+        "better_point_margin_baseline_pct": 68.07,
+        "edge_over_better_point_margin_pp": -0.84,
+        "mean_confidence_pct": 65.0,
+        "brier_score": 0.2092,
+        "log_loss": 0.6065
+      },
+      "2025-04": {
+        "n": 143,
+        "model_correct": 98,
+        "model_accuracy_pct": 68.53,
+        "model_accuracy_95ci": [
+          60.52,
+          75.57
+        ],
+        "home_wins": 76,
+        "home_team_baseline_pct": 53.15,
+        "home_team_baseline_95ci": [
+          44.99,
+          61.14
+        ],
+        "edge_over_home_baseline_pp": 15.38,
+        "better_record_baseline_pct": 71.33,
+        "better_record_baseline_95ci": [
+          63.43,
+          78.11
+        ],
+        "edge_over_better_record_pp": -2.8,
+        "better_point_margin_baseline_pct": 69.23,
+        "edge_over_better_point_margin_pp": -0.7,
+        "mean_confidence_pct": 65.47,
+        "brier_score": 0.2019,
+        "log_loss": 0.5894
+      },
+      "2025-05": {
+        "n": 39,
+        "model_correct": 20,
+        "model_accuracy_pct": 51.28,
+        "model_accuracy_95ci": [
+          36.2,
+          66.14
+        ],
+        "home_wins": 20,
+        "home_team_baseline_pct": 51.28,
+        "home_team_baseline_95ci": [
+          36.2,
+          66.14
+        ],
+        "edge_over_home_baseline_pp": 0.0,
+        "better_record_baseline_pct": 53.85,
+        "better_record_baseline_95ci": [
+          38.57,
+          68.43
+        ],
+        "edge_over_better_record_pp": -2.56,
+        "better_point_margin_baseline_pct": 51.28,
+        "edge_over_better_point_margin_pp": 0.0,
+        "mean_confidence_pct": 60.91,
+        "brier_score": 0.2636,
+        "log_loss": 0.724
+      },
+      "2025-06": {
+        "n": 7,
+        "model_correct": 5,
+        "model_accuracy_pct": 71.43,
+        "model_accuracy_95ci": [
+          35.89,
+          91.78
+        ],
+        "home_wins": 5,
+        "home_team_baseline_pct": 71.43,
+        "home_team_baseline_95ci": [
+          35.89,
+          91.78
+        ],
+        "edge_over_home_baseline_pp": 0.0,
+        "better_record_baseline_pct": 57.14,
+        "better_record_baseline_95ci": [
+          25.05,
+          84.18
+        ],
+        "edge_over_better_record_pp": 14.29,
+        "better_point_margin_baseline_pct": 57.14,
+        "edge_over_better_point_margin_pp": 14.29,
+        "mean_confidence_pct": 59.38,
+        "brier_score": 0.2183,
+        "log_loss": 0.628
+      },
+      "2025-10": {
+        "n": 64,
+        "model_correct": 37,
+        "model_accuracy_pct": 57.81,
+        "model_accuracy_95ci": [
+          45.61,
+          69.13
+        ],
+        "home_wins": 37,
+        "home_team_baseline_pct": 57.81,
+        "home_team_baseline_95ci": [
+          45.61,
+          69.13
+        ],
+        "edge_over_home_baseline_pp": 0.0,
+        "better_record_baseline_pct": 53.12,
+        "better_record_baseline_95ci": [
+          41.07,
+          64.82
+        ],
+        "edge_over_better_record_pp": 4.69,
+        "better_point_margin_baseline_pct": 60.94,
+        "edge_over_better_point_margin_pp": -3.12,
+        "mean_confidence_pct": 60.65,
+        "brier_score": 0.2285,
+        "log_loss": 0.6493
+      },
+      "2025-11": {
+        "n": 219,
+        "model_correct": 153,
+        "model_accuracy_pct": 69.86,
+        "model_accuracy_95ci": [
+          63.49,
+          75.55
+        ],
+        "home_wins": 121,
+        "home_team_baseline_pct": 55.25,
+        "home_team_baseline_95ci": [
+          48.63,
+          61.69
+        ],
+        "edge_over_home_baseline_pp": 14.61,
+        "better_record_baseline_pct": 68.95,
+        "better_record_baseline_95ci": [
+          62.54,
+          74.71
+        ],
+        "edge_over_better_record_pp": 0.91,
+        "better_point_margin_baseline_pct": 73.06,
+        "edge_over_better_point_margin_pp": -3.2,
+        "mean_confidence_pct": 63.85,
+        "brier_score": 0.2031,
+        "log_loss": 0.5942
+      },
+      "2025-12": {
+        "n": 197,
+        "model_correct": 112,
+        "model_accuracy_pct": 56.85,
+        "model_accuracy_95ci": [
+          49.87,
+          63.57
+        ],
+        "home_wins": 105,
+        "home_team_baseline_pct": 53.3,
+        "home_team_baseline_95ci": [
+          46.34,
+          60.14
+        ],
+        "edge_over_home_baseline_pp": 3.55,
+        "better_record_baseline_pct": 59.39,
+        "better_record_baseline_95ci": [
+          52.42,
+          66.01
+        ],
+        "edge_over_better_record_pp": -2.54,
+        "better_point_margin_baseline_pct": 57.36,
+        "edge_over_better_point_margin_pp": -0.51,
+        "mean_confidence_pct": 63.02,
+        "brier_score": 0.2376,
+        "log_loss": 0.6674
+      },
+      "2026-01": {
+        "n": 235,
+        "model_correct": 144,
+        "model_accuracy_pct": 61.28,
+        "model_accuracy_95ci": [
+          54.91,
+          67.28
+        ],
+        "home_wins": 132,
+        "home_team_baseline_pct": 56.17,
+        "home_team_baseline_95ci": [
+          49.78,
+          62.36
+        ],
+        "edge_over_home_baseline_pp": 5.11,
+        "better_record_baseline_pct": 61.28,
+        "better_record_baseline_95ci": [
+          54.91,
+          67.28
+        ],
+        "edge_over_better_record_pp": 0.0,
+        "better_point_margin_baseline_pct": 61.28,
+        "edge_over_better_point_margin_pp": 0.0,
+        "mean_confidence_pct": 63.96,
+        "brier_score": 0.2293,
+        "log_loss": 0.6502
+      },
+      "2026-02": {
+        "n": 166,
+        "model_correct": 112,
+        "model_accuracy_pct": 67.47,
+        "model_accuracy_95ci": [
+          60.02,
+          74.13
+        ],
+        "home_wins": 78,
+        "home_team_baseline_pct": 46.99,
+        "home_team_baseline_95ci": [
+          39.55,
+          54.56
+        ],
+        "edge_over_home_baseline_pp": 20.48,
+        "better_record_baseline_pct": 71.08,
+        "better_record_baseline_95ci": [
+          63.77,
+          77.44
+        ],
+        "edge_over_better_record_pp": -3.61,
+        "better_point_margin_baseline_pct": 70.48,
+        "edge_over_better_point_margin_pp": -3.01,
+        "mean_confidence_pct": 63.14,
+        "brier_score": 0.2124,
+        "log_loss": 0.6144
+      },
+      "2026-03": {
+        "n": 237,
+        "model_correct": 187,
+        "model_accuracy_pct": 78.9,
+        "model_accuracy_95ci": [
+          73.27,
+          83.62
+        ],
+        "home_wins": 142,
+        "home_team_baseline_pct": 59.92,
+        "home_team_baseline_95ci": [
+          53.57,
+          65.95
+        ],
+        "edge_over_home_baseline_pp": 18.99,
+        "better_record_baseline_pct": 75.53,
+        "better_record_baseline_95ci": [
+          69.68,
+          80.57
+        ],
+        "edge_over_better_record_pp": 3.38,
+        "better_point_margin_baseline_pct": 73.0,
+        "edge_over_better_point_margin_pp": 5.91,
+        "mean_confidence_pct": 66.05,
+        "brier_score": 0.1767,
+        "log_loss": 0.5387
+      },
+      "2026-04": {
+        "n": 138,
+        "model_correct": 104,
+        "model_accuracy_pct": 75.36,
+        "model_accuracy_95ci": [
+          67.55,
+          81.8
+        ],
+        "home_wins": 83,
+        "home_team_baseline_pct": 60.14,
+        "home_team_baseline_95ci": [
+          51.81,
+          67.93
+        ],
+        "edge_over_home_baseline_pp": 15.22,
+        "better_record_baseline_pct": 69.57,
+        "better_record_baseline_95ci": [
+          61.44,
+          76.63
+        ],
+        "edge_over_better_record_pp": 5.8,
+        "better_point_margin_baseline_pct": 68.84,
+        "edge_over_better_point_margin_pp": 6.52,
+        "mean_confidence_pct": 64.15,
+        "brier_score": 0.1889,
+        "log_loss": 0.5633
+      },
+      "2026-05": {
+        "n": 38,
+        "model_correct": 25,
+        "model_accuracy_pct": 65.79,
+        "model_accuracy_95ci": [
+          49.89,
+          78.79
+        ],
+        "home_wins": 20,
+        "home_team_baseline_pct": 52.63,
+        "home_team_baseline_95ci": [
+          37.26,
+          67.52
+        ],
+        "edge_over_home_baseline_pp": 13.16,
+        "better_record_baseline_pct": 68.42,
+        "better_record_baseline_95ci": [
+          52.54,
+          80.92
+        ],
+        "edge_over_better_record_pp": -2.63,
+        "better_point_margin_baseline_pct": 65.79,
+        "edge_over_better_point_margin_pp": 0.0,
+        "mean_confidence_pct": 59.47,
+        "brier_score": 0.2248,
+        "log_loss": 0.6414
+      },
+      "2026-06": {
+        "n": 5,
+        "model_correct": 1,
+        "model_accuracy_pct": 20.0,
+        "model_accuracy_95ci": [
+          3.62,
+          62.45
+        ],
+        "home_wins": 1,
+        "home_team_baseline_pct": 20.0,
+        "home_team_baseline_95ci": [
+          3.62,
+          62.45
+        ],
+        "edge_over_home_baseline_pp": 0.0,
+        "better_record_baseline_pct": 20.0,
+        "better_record_baseline_95ci": [
+          3.62,
+          62.45
+        ],
+        "edge_over_better_record_pp": 0.0,
+        "better_point_margin_baseline_pct": 20.0,
+        "edge_over_better_point_margin_pp": 0.0,
+        "mean_confidence_pct": 58.34,
+        "brier_score": 0.3139,
+        "log_loss": 0.8225
+      }
+    },
+    "calibration_by_confidence": [
+      {
+        "bucket": "50-55%",
+        "n": 513,
+        "mean_predicted_pct": 52.58,
+        "actual_win_pct": 49.12,
+        "actual_95ci": [
+          44.82,
+          53.44
+        ],
+        "calibration_error_pp": -3.46
+      },
+      {
+        "bucket": "55-60%",
+        "n": 453,
+        "mean_predicted_pct": 57.53,
+        "actual_win_pct": 60.49,
+        "actual_95ci": [
+          55.91,
+          64.88
+        ],
+        "calibration_error_pp": 2.96
+      },
+      {
+        "bucket": "60-65%",
+        "n": 495,
+        "mean_predicted_pct": 62.69,
+        "actual_win_pct": 65.66,
+        "actual_95ci": [
+          61.37,
+          69.7
+        ],
+        "calibration_error_pp": 2.97
+      },
+      {
+        "bucket": "65-70%",
+        "n": 461,
+        "mean_predicted_pct": 67.4,
+        "actual_win_pct": 70.07,
+        "actual_95ci": [
+          65.73,
+          74.07
+        ],
+        "calibration_error_pp": 2.67
+      },
+      {
+        "bucket": "70-75%",
+        "n": 312,
+        "mean_predicted_pct": 72.36,
+        "actual_win_pct": 76.6,
+        "actual_95ci": [
+          71.6,
+          80.96
+        ],
+        "calibration_error_pp": 4.24
+      },
+      {
+        "bucket": "75-80%",
+        "n": 230,
+        "mean_predicted_pct": 77.17,
+        "actual_win_pct": 80.0,
+        "actual_95ci": [
+          74.36,
+          84.66
+        ],
+        "calibration_error_pp": 2.83
+      },
+      {
+        "bucket": "80-85%",
+        "n": 100,
+        "mean_predicted_pct": 82.04,
+        "actual_win_pct": 81.0,
+        "actual_95ci": [
+          72.22,
+          87.49
+        ],
+        "calibration_error_pp": -1.04
+      },
+      {
+        "bucket": "85-90%",
+        "n": 28,
+        "mean_predicted_pct": 86.26,
+        "actual_win_pct": 92.86,
+        "actual_95ci": [
+          77.35,
+          98.02
+        ],
+        "calibration_error_pp": 6.59
+      },
+      {
+        "bucket": "90-100%",
+        "n": 5,
+        "mean_predicted_pct": 91.02,
+        "actual_win_pct": 100.0,
+        "actual_95ci": [
+          56.55,
+          100.0
+        ],
+        "calibration_error_pp": 8.98
+      }
+    ],
+    "calibration_by_confidence_regular_season": [
+      {
+        "bucket": "50-55%",
+        "n": 471,
+        "mean_predicted_pct": 52.55,
+        "actual_win_pct": 48.62,
+        "actual_95ci": [
+          44.14,
+          53.13
+        ],
+        "calibration_error_pp": -3.93
+      },
+      {
+        "bucket": "55-60%",
+        "n": 423,
+        "mean_predicted_pct": 57.49,
+        "actual_win_pct": 60.76,
+        "actual_95ci": [
+          56.03,
+          65.29
+        ],
+        "calibration_error_pp": 3.27
+      },
+      {
+        "bucket": "60-65%",
+        "n": 444,
+        "mean_predicted_pct": 62.72,
+        "actual_win_pct": 65.32,
+        "actual_95ci": [
+          60.77,
+          69.59
+        ],
+        "calibration_error_pp": 2.6
+      },
+      {
+        "bucket": "65-70%",
+        "n": 437,
+        "mean_predicted_pct": 67.43,
+        "actual_win_pct": 70.48,
+        "actual_95ci": [
+          66.04,
+          74.56
+        ],
+        "calibration_error_pp": 3.05
+      },
+      {
+        "bucket": "70-75%",
+        "n": 301,
+        "mean_predicted_pct": 72.38,
+        "actual_win_pct": 76.74,
+        "actual_95ci": [
+          71.65,
+          81.16
+        ],
+        "calibration_error_pp": 4.36
+      },
+      {
+        "bucket": "75-80%",
+        "n": 222,
+        "mean_predicted_pct": 77.22,
+        "actual_win_pct": 80.63,
+        "actual_95ci": [
+          74.93,
+          85.29
+        ],
+        "calibration_error_pp": 3.41
+      },
+      {
+        "bucket": "80-85%",
+        "n": 97,
+        "mean_predicted_pct": 82.03,
+        "actual_win_pct": 80.41,
+        "actual_95ci": [
+          71.42,
+          87.09
+        ],
+        "calibration_error_pp": -1.62
+      },
+      {
+        "bucket": "85-90%",
+        "n": 28,
+        "mean_predicted_pct": 86.26,
+        "actual_win_pct": 92.86,
+        "actual_95ci": [
+          77.35,
+          98.02
+        ],
+        "calibration_error_pp": 6.59
+      },
+      {
+        "bucket": "90-100%",
+        "n": 5,
+        "mean_predicted_pct": 91.02,
+        "actual_win_pct": 100.0,
+        "actual_95ci": [
+          56.55,
+          100.0
+        ],
+        "calibration_error_pp": 8.98
+      }
+    ],
+    "accuracy_at_confidence_threshold": [
+      {
+        "min_confidence_pct": 50.0,
+        "n": 2597,
+        "pct_of_all_games": 100.0,
+        "accuracy_pct": 65.81,
+        "accuracy_95ci": [
+          63.96,
+          67.61
+        ],
+        "home_baseline_pct": 55.1,
+        "better_record_baseline_pct": 65.34
+      },
+      {
+        "min_confidence_pct": 55.0,
+        "n": 2084,
+        "pct_of_all_games": 80.2,
+        "accuracy_pct": 69.91,
+        "accuracy_95ci": [
+          67.91,
+          71.84
+        ],
+        "home_baseline_pct": 56.48,
+        "better_record_baseline_pct": 68.43
+      },
+      {
+        "min_confidence_pct": 60.0,
+        "n": 1631,
+        "pct_of_all_games": 62.8,
+        "accuracy_pct": 72.53,
+        "accuracy_95ci": [
+          70.31,
+          74.64
+        ],
+        "home_baseline_pct": 58.98,
+        "better_record_baseline_pct": 71.18
+      },
+      {
+        "min_confidence_pct": 65.0,
+        "n": 1136,
+        "pct_of_all_games": 43.7,
+        "accuracy_pct": 75.53,
+        "accuracy_95ci": [
+          72.94,
+          77.94
+        ],
+        "home_baseline_pct": 62.85,
+        "better_record_baseline_pct": 74.82
+      },
+      {
+        "min_confidence_pct": 70.0,
+        "n": 675,
+        "pct_of_all_games": 26.0,
+        "accuracy_pct": 79.26,
+        "accuracy_95ci": [
+          76.04,
+          82.15
+        ],
+        "home_baseline_pct": 68.15,
+        "better_record_baseline_pct": 78.96
+      },
+      {
+        "min_confidence_pct": 75.0,
+        "n": 363,
+        "pct_of_all_games": 14.0,
+        "accuracy_pct": 81.54,
+        "accuracy_95ci": [
+          77.23,
+          85.2
+        ],
+        "home_baseline_pct": 75.76,
+        "better_record_baseline_pct": 81.27
+      },
+      {
+        "min_confidence_pct": 80.0,
+        "n": 133,
+        "pct_of_all_games": 5.1,
+        "accuracy_pct": 84.21,
+        "accuracy_95ci": [
+          77.07,
+          89.43
+        ],
+        "home_baseline_pct": 84.21,
+        "better_record_baseline_pct": 84.21
+      }
+    ],
+    "reliability_home_win_probability": [
+      {
+        "bucket": "0-10%",
+        "n": 0
+      },
+      {
+        "bucket": "10-20%",
+        "n": 0
+      },
+      {
+        "bucket": "20-30%",
+        "n": 109,
+        "mean_predicted_home_win_pct": 26.76,
+        "actual_home_win_pct": 15.6,
+        "actual_95ci": [
+          9.97,
+          23.56
+        ],
+        "calibration_error_pp": -11.17
+      },
+      {
+        "bucket": "30-40%",
+        "n": 336,
+        "mean_predicted_home_win_pct": 35.1,
+        "actual_home_win_pct": 28.27,
+        "actual_95ci": [
+          23.73,
+          33.31
+        ],
+        "calibration_error_pp": -6.82
+      },
+      {
+        "bucket": "40-50%",
+        "n": 405,
+        "mean_predicted_home_win_pct": 45.15,
+        "actual_home_win_pct": 42.96,
+        "actual_95ci": [
+          38.23,
+          47.83
+        ],
+        "calibration_error_pp": -2.19
+      },
+      {
+        "bucket": "50-60%",
+        "n": 561,
+        "mean_predicted_home_win_pct": 54.94,
+        "actual_home_win_pct": 52.58,
+        "actual_95ci": [
+          48.45,
+          56.69
+        ],
+        "calibration_error_pp": -2.35
+      },
+      {
+        "bucket": "60-70%",
+        "n": 620,
+        "mean_predicted_home_win_pct": 64.99,
+        "actual_home_win_pct": 65.65,
+        "actual_95ci": [
+          61.82,
+          69.28
+        ],
+        "calibration_error_pp": 0.65
+      },
+      {
+        "bucket": "70-80%",
+        "n": 433,
+        "mean_predicted_home_win_pct": 74.7,
+        "actual_home_win_pct": 76.44,
+        "actual_95ci": [
+          72.22,
+          80.2
+        ],
+        "calibration_error_pp": 1.75
+      },
+      {
+        "bucket": "80-90%",
+        "n": 128,
+        "mean_predicted_home_win_pct": 82.96,
+        "actual_home_win_pct": 83.59,
+        "actual_95ci": [
+          76.22,
+          89.01
+        ],
+        "calibration_error_pp": 0.63
+      },
+      {
+        "bucket": "90-100%",
+        "n": 5,
+        "mean_predicted_home_win_pct": 91.02,
+        "actual_home_win_pct": 100.0,
+        "actual_95ci": [
+          56.55,
+          100.0
+        ],
+        "calibration_error_pp": 8.98
+      }
+    ],
+    "pick_side_split": {
+      "picked_home": {
+        "n": 1747,
+        "model_correct": 1145,
+        "model_accuracy_pct": 65.54,
+        "model_accuracy_95ci": [
+          63.28,
+          67.73
+        ],
+        "home_wins": 1145,
+        "home_team_baseline_pct": 65.54,
+        "home_team_baseline_95ci": [
+          63.28,
+          67.73
+        ],
+        "edge_over_home_baseline_pp": 0.0,
+        "better_record_baseline_pct": 65.03,
+        "better_record_baseline_95ci": [
+          62.76,
+          67.23
+        ],
+        "edge_over_better_record_pp": 0.52,
+        "better_point_margin_baseline_pct": 64.8,
+        "edge_over_better_point_margin_pp": 0.74,
+        "mean_confidence_pct": 65.56,
+        "brier_score": 0.2135,
+        "log_loss": 0.6157
+      },
+      "picked_away": {
+        "n": 850,
+        "model_correct": 564,
+        "model_accuracy_pct": 66.35,
+        "model_accuracy_95ci": [
+          63.11,
+          69.45
+        ],
+        "home_wins": 286,
+        "home_team_baseline_pct": 33.65,
+        "home_team_baseline_95ci": [
+          30.55,
+          36.89
+        ],
+        "edge_over_home_baseline_pp": 32.71,
+        "better_record_baseline_pct": 66.0,
+        "better_record_baseline_95ci": [
+          62.75,
+          69.11
+        ],
+        "edge_over_better_record_pp": 0.35,
+        "better_point_margin_baseline_pct": 67.18,
+        "edge_over_better_point_margin_pp": -0.82,
+        "mean_confidence_pct": 61.18,
+        "brier_score": 0.2156,
+        "log_loss": 0.6218
+      }
+    }
+  },
+  "baseline": {
+    "description": "Rules a user could apply with no model at all, scored on exactly the same games from exactly the same pre-game snapshot. These are the numbers that make the model accuracy meaningful or not.",
+    "n": 2597,
+    "model_accuracy_pct": 65.81,
+    "always_pick_home": {
+      "accuracy_pct": 55.1,
+      "accuracy_95ci": [
+        53.18,
+        57.01
+      ],
+      "model_minus_baseline_pp": 10.7
+    },
+    "pick_better_win_pct": {
+      "description": "pick the team with the better season-to-date record; ties to home",
+      "accuracy_pct": 65.34,
+      "accuracy_95ci": [
+        63.49,
+        67.15
+      ],
+      "model_minus_baseline_pp": 0.46,
+      "model_agrees_with_baseline_pct": 81.67,
+      "mcnemar_vs_model": {
+        "model_only_correct": 244,
+        "baseline_only_correct": 232,
+        "n_discordant": 476,
+        "p_value": 0.6142
+      }
+    },
+    "pick_better_point_margin": {
+      "description": "pick the team with the better season-to-date point differential",
+      "accuracy_pct": 65.58,
+      "accuracy_95ci": [
+        63.73,
+        67.38
+      ],
+      "model_minus_baseline_pp": 0.23,
+      "model_agrees_with_baseline_pct": 81.9,
+      "mcnemar_vs_model": {
+        "model_only_correct": 238,
+        "baseline_only_correct": 232,
+        "n_discordant": 470,
+        "p_value": 0.8176
+      }
+    },
+    "interpretation": "The model beats \"always pick home\" by a wide, clearly significant margin. It does NOT meaningfully beat the two record-based heuristics: the differences are under half a percentage point and not statistically significant. The model's defensible added value over those heuristics is that it emits a calibrated probability rather than a bare pick -- see results.calibration_by_confidence."
+  },
+  "validation": {
+    "feature_order_check": "PASS -- the 106 columns and their order are exactly dataset_2012-24_new minus ['Score', 'Home-Team-Win', 'TEAM_NAME', 'Date', 'TEAM_NAME.1', 'Date.1', 'OU-Cover', 'OU'], asserted at runtime against the live table.",
+    "in_sample_sanity": {
+      "n": 15115,
+      "in_sample_accuracy_pct": 68.16,
+      "home_win_rate_in_training_pct": 57.47,
+      "control_accuracy_with_shifted_columns_pct": 58.19,
+      "note": "In-sample only -- the model was fit on these rows. Reported purely to prove the 106-feature vector is assembled in the order the booster expects. The control row shifts every column by one position; it collapses toward the base rate, which is what makes the check meaningful."
+    },
+    "snapshot_reconstruction": {
+      "seasons": [
+        "2022-23",
+        "2023-24"
+      ],
+      "n_snapshot_dates_compared": 373,
+      "n_cells_compared": 581880,
+      "exact_match_pct": 99.6671,
+      "per_column": {
+        "GP": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "W": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "L": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "W_PCT": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "MIN": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FGM": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FGA": {
+          "exact": 11071,
+          "n": 11190,
+          "pct": 98.9366
+        },
+        "FG_PCT": {
+          "exact": 11117,
+          "n": 11190,
+          "pct": 99.3476
+        },
+        "FG3M": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FG3A": {
+          "exact": 11115,
+          "n": 11190,
+          "pct": 99.3298
+        },
+        "FG3_PCT": {
+          "exact": 11168,
+          "n": 11190,
+          "pct": 99.8034
+        },
+        "FTM": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FTA": {
+          "exact": 11182,
+          "n": 11190,
+          "pct": 99.9285
+        },
+        "FT_PCT": {
+          "exact": 11168,
+          "n": 11190,
+          "pct": 99.8034
+        },
+        "OREB": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "DREB": {
+          "exact": 11105,
+          "n": 11190,
+          "pct": 99.2404
+        },
+        "REB": {
+          "exact": 11092,
+          "n": 11190,
+          "pct": 99.1242
+        },
+        "AST": {
+          "exact": 11114,
+          "n": 11190,
+          "pct": 99.3208
+        },
+        "TOV": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "STL": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "BLK": {
+          "exact": 11047,
+          "n": 11190,
+          "pct": 98.7221
+        },
+        "BLKA": {
+          "exact": 11078,
+          "n": 11190,
+          "pct": 98.9991
+        },
+        "PF": {
+          "exact": 11160,
+          "n": 11190,
+          "pct": 99.7319
+        },
+        "PFD": {
+          "exact": 11161,
+          "n": 11190,
+          "pct": 99.7408
+        },
+        "PTS": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "PLUS_MINUS": {
+          "exact": 11040,
+          "n": 11190,
+          "pct": 98.6595
+        },
+        "GP_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "W_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "L_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "W_PCT_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "MIN_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FGM_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FGA_RANK": {
+          "exact": 11100,
+          "n": 11190,
+          "pct": 99.1957
+        },
+        "FG_PCT_RANK": {
+          "exact": 11158,
+          "n": 11190,
+          "pct": 99.714
+        },
+        "FG3M_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FG3A_RANK": {
+          "exact": 11161,
+          "n": 11190,
+          "pct": 99.7408
+        },
+        "FG3_PCT_RANK": {
+          "exact": 11160,
+          "n": 11190,
+          "pct": 99.7319
+        },
+        "FTM_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "FTA_RANK": {
+          "exact": 11184,
+          "n": 11190,
+          "pct": 99.9464
+        },
+        "FT_PCT_RANK": {
+          "exact": 11178,
+          "n": 11190,
+          "pct": 99.8928
+        },
+        "OREB_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "DREB_RANK": {
+          "exact": 11066,
+          "n": 11190,
+          "pct": 98.8919
+        },
+        "REB_RANK": {
+          "exact": 11073,
+          "n": 11190,
+          "pct": 98.9544
+        },
+        "AST_RANK": {
+          "exact": 11145,
+          "n": 11190,
+          "pct": 99.5979
+        },
+        "TOV_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "STL_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "BLK_RANK": {
+          "exact": 11091,
+          "n": 11190,
+          "pct": 99.1153
+        },
+        "BLKA_RANK": {
+          "exact": 10976,
+          "n": 11190,
+          "pct": 98.0876
+        },
+        "PF_RANK": {
+          "exact": 11176,
+          "n": 11190,
+          "pct": 99.8749
+        },
+        "PFD_RANK": {
+          "exact": 11107,
+          "n": 11190,
+          "pct": 99.2583
+        },
+        "PTS_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        },
+        "PLUS_MINUS_RANK": {
+          "exact": 11190,
+          "n": 11190,
+          "pct": 100.0
+        }
+      }
+    },
+    "end_to_end_feature_rows": [
+      {
+        "season": "2022-23",
+        "n_training_rows_in_season": 1305,
+        "n_matched_to_box_scores": 1298,
+        "n_unmatched": 7,
+        "stat_features_exact_pct": 99.70664928292047,
+        "stat_features_within_0p1_pct": 99.85480621073842,
+        "stat_features_within_1_rank_pct": 99.99629607680454,
+        "rows_with_all_stat_features_exact_pct": 78.0431432973806,
+        "days_rest_exact_pct": 99.69183359013869,
+        "max_abs_stat_diff": 2.0,
+        "mean_abs_prob_diff": 1.34858955789241e-05,
+        "max_abs_prob_diff": 0.011148035526275635,
+        "same_pick_pct": 100.0
+      },
+      {
+        "season": "2023-24",
+        "n_training_rows_in_season": 1179,
+        "n_matched_to_box_scores": 1172,
+        "n_unmatched": 7,
+        "stat_features_exact_pct": 99.61111840378052,
+        "stat_features_within_0p1_pct": 99.79489367288002,
+        "stat_features_within_1_rank_pct": 99.98523234444735,
+        "rows_with_all_stat_features_exact_pct": 75.25597269624573,
+        "days_rest_exact_pct": 98.46416382252559,
+        "max_abs_stat_diff": 4.0,
+        "mean_abs_prob_diff": 0.00017845361435320228,
+        "max_abs_prob_diff": 0.043615520000457764,
+        "same_pick_pct": 99.9146757679181
+      }
+    ],
+    "leakage_positive_control": {
+      "purpose": "Positive control. Identical pipeline except the as-of cutoff is relaxed from \"strictly before the game date\" to \"including the game date\", so each game's own result leaks into its own features. The reported result is the strict one; this row exists to show the strict cutoff is actually binding and that the harness would surface leakage if it were present.",
+      "strict_accuracy_pct": 65.81,
+      "leaky_accuracy_pct": 69.77,
+      "n": 2597
+    }
+  },
+  "days_rest_sensitivity": {
+    "note": "Days rest is the only feature whose definition is ambiguous. The training data mixes two conventions and production uses a third. Headline numbers use the \"training\" convention (plain day difference, 7 for a first game), matching src/Process-Data/Get_Odds_Data.py which produced the most recent training season. All three are reported so the reader can see the number is not sensitive to the choice.",
+    "conventions": {
+      "training": "(game_date - previous_game_date).days; 7 on a first game; no clamp",
+      "legacy": "same but 10 on a first game and values outside (0,9) clamped to 9 (src/Process-Data/Add_Days_Rest.py, used for 2012-13..2022-23)",
+      "production": "training difference, then clipped to [1,7] -- what the corrected main_api.py live path produces. The clip is the only systematic difference from \"training\", and it costs nothing measurable."
+    },
+    "accuracy": {
+      "training": {
+        "n": 2597,
+        "accuracy_pct": 65.81
+      },
+      "legacy": {
+        "n": 2597,
+        "accuracy_pct": 65.81
+      },
+      "production": {
+        "n": 2597,
+        "accuracy_pct": 65.81
+      }
+    }
+  },
+  "over_under": {
+    "backtested": false,
+    "reason": "Not backtested. The over/under model takes the sportsbook total itself as its 107th input feature, and no historical total lines exist for 2024-25 or 2025-26 anywhere in this repo. Back-filling or estimating a line would make the result meaningless, so it was skipped rather than approximated.",
+    "latest_historical_odds_date": "2024-04-28",
+    "odds_snapshots_rows": 23,
+    "odds_snapshots_captured_range": [
+      "2026-07-07T04:21:39.139832",
+      "2026-07-10T00:11:39.723568"
+    ],
+    "predictions_log_rows": 0,
+    "model_file": "Models/XGBoost_Models/XGBoost_54.8%_UO-8.json",
+    "model_n_features": 107
+  },
+  "methodology_notes": [
+    "Features are as-of-date cumulative REGULAR SEASON team stats for both teams (26 counting/percentage stats + their 26 league rank columns, home block then away block) plus days rest for each team: 106 features, in exactly the order dataset_2012-24_new has after the training script drops ['Score','Home-Team-Win','TEAM_NAME','Date','TEAM_NAME.1','Date.1','OU-Cover','OU'].",
+    "No odds are used as model inputs. The model never sees a betting line.",
+    "NO LEAKAGE: features for a game on date D aggregate only games played strictly before D. This reproduces the original pipeline, where Get_Data.py stored the stats-through-D snapshot under the table name D+1 and Create_Games.py read the table named for the game's own date.",
+    "Playoff games use the frozen final regular-season stats, exactly as the original snapshots did (the source URL pins SeasonType=Regular+Season).",
+    "Reconstructed from Data/TeamData.sqlite box_scores; BLKA = opponent blocks, PFD = opponent personal fouls, and team turnovers are recovered from the advanced box score because the traditional team block omits non-player turnovers.",
+    "Rank columns are computed on unrounded values with ties taking the best rank; ranks are ascending (1 = lowest) for L, TOV, PF and BLKA and descending otherwise.",
+    "Deterministic: the model is only used for inference, nothing is retrained or resampled, and every database is opened read-only."
+  ],
+  "caveats": [
+    "THE BIGGEST ONE: the model does not beat a trivial heuristic. \"Pick the team with the better season-to-date record\" scores 65.34% and \"pick the better point differential\" scores 65.58% on exactly these games. The model is at 65.81%. A paired McNemar test puts p at 0.61 and 0.82 respectively -- the difference is noise. Beating the home-field baseline by 10.7 points is real; beating a fan with a standings page is not demonstrated. What the model does add over those rules is a calibrated probability rather than a bare pick.",
+    "The confidence-floor table is a post-hoc slice: the thresholds were chosen after seeing the data, and each row covers only a subset of games. Those numbers are diagnostics, not headline claims.",
+    "Historical closing odds in Data/OddsData.sqlite stop at 2024-04-28, so no ROI, expected value, Kelly or closing-line-value result can be computed for these seasons. Accuracy alone says nothing about profitability: a moneyline bettor needs to beat the price, not the coin flip.",
+    "The reconstruction is validated against the original snapshots on 2022-23 and 2023-24 only, because those are the seasons where both the box scores and the original date-keyed tables exist.",
+    "Roughly one game in 500 has a reconstructed per-game average that differs from the original by 0.1 due to half-up rounding at a boundary; the effect on model output is measured in the validation block and is negligible.",
+    "The live days-rest path in main_api.py was found to be clock-dependent: it compared UTC schedule timestamps against a naive local datetime, so the value it produced varied with the server timezone and the hour of the call (97.6% correct during the daytime window that the scheduled 9 AM job falls in, degrading to 41% agreement at midnight local). It was corrected to key off the game's own US Eastern date. The corrected path reproduces the training convention exactly, up to the existing [1,7] clip, and days_rest_sensitivity shows that clip costs nothing measurable. This does not affect any number in this artifact, which builds days rest from the schedule directly and never called the API path."
+  ]
+}

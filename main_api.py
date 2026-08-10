@@ -48,6 +48,9 @@ from src.Utils import nba_live
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
 from src.Utils.game_flow import build_game_flow
+from src.Utils import player_impact
+from src.Utils import availability as availability_adjust
+from src.Utils import espn_injuries
 
 
 
@@ -704,15 +707,17 @@ class PredictionRunner:
                     "kelly_criterion": {"home_team": kelly_home, "away_team": kelly_away},
                     "game_start_time_utc": game_start_time_str
                 })
-            return {"sportsbook": self.sportsbook, "predictions": predictions_list}
+            return self._attach_availability({"sportsbook": self.sportsbook, "predictions": predictions_list})
 
         data_for_model, todays_games_uo, frame_ml, home_team_odds, away_team_odds, game_start_times = self._prepare_data_for_model(games_list, odds_data)
-        
+
         if data_for_model.size == 0:
             return {"error": "Could not prepare valid data for the prediction model.", "predictions": []}
-        
+
         ml_predictions, ou_predictions = self._run_xgboost_models(data_for_model, frame_ml, todays_games_uo)
-        return self._format_predictions(games_list, ml_predictions, ou_predictions, home_team_odds, away_team_odds, todays_games_uo, game_start_times)
+        return self._attach_availability(
+            self._format_predictions(games_list, ml_predictions, ou_predictions, home_team_odds, away_team_odds, todays_games_uo, game_start_times)
+        )
 
     def _prepare_data_for_model(self, games, odds):
         game_data_list, home_odds_list, away_odds_list, uo_lines_list, game_start_times_list = [], [], [], [], []
@@ -810,6 +815,46 @@ class PredictionRunner:
         
         ou_predictions = self.xgb_uo_model.predict(xgb.DMatrix(frame_uo_clean.values.astype(float)))
         return ml_predictions, ou_predictions
+
+    def _attach_availability(self, result):
+        """Attach an informational "availability" field to each prediction.
+
+        ADDITIVE ONLY: model probabilities, EV, and Kelly numbers are never
+        altered (folding the delta into win probability would need backtest
+        validation first). Any failure - ESPN feed down, WNBA fallback,
+        unknown team names - leaves predictions exactly as they were.
+        """
+        try:
+            if (getattr(self, 'resolved_sport', None) or self.sport) != 'NBA':
+                return result
+            preds = result.get("predictions") if isinstance(result, dict) else None
+            if not preds:
+                return result
+            absences = espn_injuries.get_absences()
+            for pred in preds:
+                try:
+                    home_abbr = espn_injuries.resolve_team_abbr(pred.get("home_team") or "")
+                    away_abbr = espn_injuries.resolve_team_abbr(pred.get("away_team") or "")
+                    if not home_abbr or not away_abbr:
+                        continue
+                    info = availability_adjust.matchup_availability(
+                        home_abbr, away_abbr, CURRENT_SEASON, absences=absences
+                    )
+                    pred["availability"] = {
+                        "home_delta": info["home"]["delta_per_100"],
+                        "away_delta": info["away"]["delta_per_100"],
+                        "players_out": (
+                            [p["name"] for p in info["home"]["players_out"]]
+                            + [p["name"] for p in info["away"]["players_out"]]
+                        ),
+                        "note": "impact-adjusted",
+                    }
+                except Exception as ex:
+                    logger.warning(f"Availability attach skipped for one game (non-fatal): {ex}")
+                    continue
+        except Exception as exc:
+            logger.warning(f"Availability attach failed (non-fatal): {exc}")
+        return result
 
     def _format_predictions(self, games, ml_preds, ou_preds, home_odds, away_odds, uo_lines, game_start_times):
         predictions_list = []
@@ -2748,6 +2793,78 @@ def get_matchup_power_ratings(game_id: str):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+# --- Player impact & availability (Estimated impact, box-score based) ---
+# Honesty label: these are OUR box-score estimates (Neil Paine's Estimated
+# RAPTOR regression weights, MIT-licensed), NOT official RAPTOR or DARKO.
+# Full methodology + limitations: src/Utils/player_impact.py docstring.
+
+@app.get("/api/impact-ratings")
+def get_impact_ratings_endpoint(season: str = CURRENT_SEASON, min_gp: int = 20):
+    """Ranked player-impact ratings (points per 100 possessions above a
+    league-average player) for one season, best first."""
+    try:
+        players = player_impact.get_impact_ratings(season, min_gp=min_gp)
+    except Exception as e:
+        logger.error(f"Error computing impact ratings for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to compute impact ratings.")
+    if not players:
+        raise HTTPException(status_code=404, detail=f"No impact ratings available for season {season}.")
+    return {
+        "season": season,
+        "min_gp": min_gp,
+        "count": len(players),
+        "methodology": player_impact.METHODOLOGY_LABEL,
+        "players": players,
+    }
+
+
+@app.get("/api/players/{id}/impact")
+def get_player_impact_endpoint(id: int):
+    """One player's estimated impact by season (career series within our
+    data window). impact_rank is among gp>=20 qualifiers, or null."""
+    try:
+        seasons = player_impact.get_player_impact(id)
+    except Exception as e:
+        logger.error(f"Error computing impact series for player {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to compute player impact.")
+    name = seasons[0]["name"] if seasons else None
+    if name is None:
+        conn = get_db_conn()
+        if conn:
+            try:
+                row = conn.execute("SELECT full_name FROM players WHERE player_id = ?", (id,)).fetchone()
+                if row:
+                    name = row["full_name"]
+            finally:
+                conn.close()
+        if name is None:
+            raise HTTPException(status_code=404, detail=f"Player {id} not found.")
+    return {
+        "player_id": id,
+        "name": name,
+        "methodology": player_impact.METHODOLOGY_LABEL,
+        "seasons": seasons,
+    }
+
+
+@app.get("/api/matchups/availability")
+def get_matchup_availability_endpoint(home: str, away: str, season: str = CURRENT_SEASON):
+    """Current OUT/DOUBTFUL players (ESPN injury wire) for both teams with
+    estimated impact contributions and each side's net-rating delta per
+    100 possessions. Questionable/Day-To-Day are deliberately excluded
+    (game-time decisions). Empty lists are the correct offseason answer."""
+    home_abbr = espn_injuries.resolve_team_abbr(home)
+    away_abbr = espn_injuries.resolve_team_abbr(away)
+    if not home_abbr or not away_abbr:
+        unknown = home if not home_abbr else away
+        raise HTTPException(status_code=404, detail=f"Unknown team: {unknown}")
+    try:
+        return availability_adjust.matchup_availability(home_abbr, away_abbr, season)
+    except Exception as e:
+        logger.error(f"Error computing availability for {home_abbr} vs {away_abbr}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to compute matchup availability.")
+
 
 # NOTE: must be registered before /api/players/{id} or FastAPI matches
 # the literal path segment "search" as an id.

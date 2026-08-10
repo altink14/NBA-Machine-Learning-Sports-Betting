@@ -29,7 +29,8 @@ from nba_api.stats.endpoints import (
     leaguegamelog,
     boxscoresummaryv2,
     playercareerstats,
-    playergamelog
+    playergamelog,
+    shotchartdetail
 )
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,28 @@ class NBAStatsClient:
         }
         raw = self._fetch("playercareerstats", playercareerstats.PlayerCareerStats, params, ttl=_LIVE_TTL_SECONDS)
         return self._parse_all_result_sets(raw)
+
+    def league_shot_averages(
+        self, season: str, season_type: str = "Regular Season"
+    ) -> List[Dict]:
+        """
+        League-wide FG% by shot zone for a season (the "LeagueAverages" result
+        set of shotchartdetail). Fetched with player_id=0/team_id=0 so the
+        Shot_Chart_Detail set is empty and the payload stays tiny. One call
+        serves every player/game for the season; disk-cached in nba_cache.
+        """
+        params = {
+            "team_id": 0,
+            "player_id": 0,
+            "season_nullable": season,
+            "context_measure_simple": "FGA",
+            "season_type_all_star": season_type,
+        }
+        raw = self._fetch(
+            "shotchartleagueavg", shotchartdetail.ShotChartDetail, params,
+            ttl=_LIVE_TTL_SECONDS
+        )
+        return self._parse_result_set(raw, "LeagueAverages")
 
     def player_game_log(
         self,

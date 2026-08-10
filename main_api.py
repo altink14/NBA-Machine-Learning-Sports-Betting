@@ -47,6 +47,7 @@ from src.Utils import elo as elo_engine
 from src.Utils import nba_live
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
+from src.Utils.game_flow import build_game_flow
 
 
 
@@ -2171,6 +2172,48 @@ def get_historical_matchup(team1: str, team2: str, season: int):
 # Cache for shot charts
 shot_chart_cache = {}
 
+# League-wide FG% by shot zone, keyed by "{season}_{season_type}". League
+# averages are league-wide (not per player/game), so ONE upstream call per
+# season serves every shot-chart request; also disk-cached in Data/nba_cache.
+league_shot_averages_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+def _season_from_game_id(game_id: str) -> str:
+    """Derive the season string ("2024-25") from an NBA game id: digits 3-4
+    are the season start year modulo 100 (e.g. "0022400001" -> 2024-25)."""
+    yy = int(game_id[3:5])
+    start = 2000 + yy if yy < 90 else 1900 + yy
+    return f"{start}-{(start + 1) % 100:02d}"
+
+def _get_league_shot_averages(season: str, season_type: str = "Regular Season") -> List[Dict[str, Any]]:
+    """
+    Zone-level league-average shooting for a season, in response shape:
+    [{"zone_basic", "zone_area", "zone_range", "fga", "fgm", "fg_pct"}].
+    Returns [] on failure so the additive field never breaks an endpoint.
+    """
+    cache_key = f"{season}_{season_type}"
+    if cache_key in league_shot_averages_cache:
+        return league_shot_averages_cache[cache_key]
+    try:
+        from src.Utils.nba_stats_client import get_client
+        rows = get_client().league_shot_averages(season, season_type)
+        averages = [
+            {
+                "zone_basic": r.get("SHOT_ZONE_BASIC"),
+                "zone_area": r.get("SHOT_ZONE_AREA"),
+                "zone_range": r.get("SHOT_ZONE_RANGE"),
+                "fga": r.get("FGA"),
+                "fgm": r.get("FGM"),
+                "fg_pct": r.get("FG_PCT"),
+            }
+            for r in rows
+        ]
+        if averages:
+            league_shot_averages_cache[cache_key] = averages
+        return averages
+    except Exception as e:
+        logger.warning(f"League shot averages fetch failed for {season} ({season_type}): {e}")
+        return []
+
 TEAM_TO_BR_ABBR = {
     "atlanta hawks": "ATL", "boston celtics": "BOS", "brooklyn nets": "BRK", "charlotte hornets": "CHO", "chicago bulls": "CHI",
     "cleveland cavaliers": "CLE", "dallas mavericks": "DAL", "denver nuggets": "DEN", "detroit pistons": "DET", "golden state warriors": "GSW",
@@ -2354,6 +2397,17 @@ player_shot_chart_cache = {}
 @app.get("/api/player-shot-chart")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_player_shot_chart(request: Request, player_id: int, season: str = CURRENT_SEASON):
+    """
+    Per-shot chart data for a player-season, plus league-average FG% by zone.
+
+    Coordinate space (stats.nba.com shotchartdetail convention): shot x/y are
+    LOC_X / LOC_Y in tenths of feet with the basket at the origin -
+    x in [-250, 250] (negative = left of the basket from the shooter's view),
+    y in [-52, ~890] (increasing toward half court).
+
+    `league_averages` (additive field) carries the same rows as the legacy
+    `averages` field, matching the shared shot-chart response contract.
+    """
     cache_key = f"{player_id}_{season}"
     if cache_key in player_shot_chart_cache:
         logger.info(f"Returning cached player shot chart for key: {cache_key}")
@@ -2427,7 +2481,9 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
             "player_id": player_id,
             "season": season,
             "shots": shots,
-            "averages": averages
+            "averages": averages,
+            # Additive alias: same zone rows under the contract field name.
+            "league_averages": averages
         }
         
         player_shot_chart_cache[cache_key] = response_data
@@ -2960,7 +3016,7 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
         conn.close()
 
 @app.get("/api/players/by-slug/{slug}")
-def get_player_by_slug(slug: str, season: str = CURRENT_SEASON):
+def get_player_by_slug(request: Request, slug: str, season: str = CURRENT_SEASON):
     """
     Resolve a player slug of format 'first-last-id' to player_id,
     then return their biography, current season totals, and advanced stats.
@@ -2973,7 +3029,11 @@ def get_player_by_slug(slug: str, season: str = CURRENT_SEASON):
         raise HTTPException(status_code=400, detail=f"Invalid slug format: {slug}. Last part must be a numeric player ID.")
     player_id = int(player_id_str)
     
-    return get_player_by_id(player_id, season=season)
+    # get_player_by_id gained a leading `request` parameter when the upstream
+    # rate limiter was added; forwarding it here keeps the internal call valid
+    # (calling it positionally without request put player_id INTO request and
+    # 500'd every player page).
+    return get_player_by_id(request, player_id, season=season)
 
 @app.get("/api/players/{id}/game-log")
 def get_player_game_log(id: int, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
@@ -3413,17 +3473,151 @@ def get_game_play_by_play(game_id: str):
     finally:
         conn.close()
 
+# Transformed game-flow payloads, keyed by game_id. Finished games never
+# change, so entries are kept for the life of the process.
+game_flow_cache: Dict[str, Dict[str, Any]] = {}
+
+def _load_pbp_actions(game_id: str) -> List[Dict[str, Any]]:
+    """
+    Load playbyplayv3 actions for a game using the same fetch path as
+    /api/games/{game_id}/play-by-play: box_scores.pbp_json first, then the
+    nba_stats_client (which itself has a permanent Data/nba_cache disk cache
+    for completed games).
+    """
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT pbp_json FROM box_scores WHERE game_id = ?", (game_id,))
+        row = cursor.fetchone()
+        if row and row["pbp_json"]:
+            return json.loads(row["pbp_json"])
+    except Exception as e:
+        logger.warning(f"DB pbp_json lookup failed for game {game_id}: {e}")
+    finally:
+        conn.close()
+
+    from src.Utils.nba_stats_client import get_client
+    return get_client().play_by_play(game_id)
+
+def _resolve_game_teams(game_id: str, actions: List[Dict[str, Any]]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Resolve {"abbr", "name"} descriptors for the home and away teams.
+    Prefers box_scores + team_metadata; falls back to the pbp actions
+    themselves (location 'h'/'v' + teamTricode).
+    """
+    home_id = None
+    away_id = None
+    # Tricodes straight from the pbp stream as a fallback.
+    tricodes: Dict[str, Tuple[int, str]] = {}
+    for action in actions:
+        team_id = action.get("teamId")
+        tricode = action.get("teamTricode")
+        loc = action.get("location")
+        if team_id and tricode and loc in ("h", "v") and loc not in tricodes:
+            tricodes[loc] = (team_id, tricode)
+        if len(tricodes) == 2:
+            break
+
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT home_team_id, away_team_id FROM box_scores WHERE game_id = ?",
+            (game_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            home_id = row["home_team_id"]
+            away_id = row["away_team_id"]
+        if home_id is None and "h" in tricodes:
+            home_id = tricodes["h"][0]
+        if away_id is None and "v" in tricodes:
+            away_id = tricodes["v"][0]
+
+        def team_meta(team_id, fallback_abbr: str) -> Dict[str, str]:
+            if team_id:
+                cursor.execute(
+                    "SELECT abbreviation, full_name FROM team_metadata WHERE team_id = ?",
+                    (team_id,)
+                )
+                r = cursor.fetchone()
+                if r:
+                    return {"abbr": r["abbreviation"], "name": r["full_name"]}
+            return {"abbr": fallback_abbr, "name": fallback_abbr}
+
+        home = team_meta(home_id, tricodes.get("h", (0, ""))[1])
+        away = team_meta(away_id, tricodes.get("v", (0, ""))[1])
+        return home, away
+    finally:
+        conn.close()
+
+@app.get("/api/games/{game_id}/game-flow")
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_game_flow(request: Request, game_id: str):
+    """
+    Score-margin game flow derived server-side from playbyplayv3:
+    compact scoring series (one point per score change), scoring runs
+    (>=8-point bursts while the opponent scores <=2), lead changes and ties.
+
+    `t` on series/run points is seconds elapsed from game start
+    (regulation periods = 720 s, overtime periods = 300 s);
+    `margin` = home_score - away_score.
+    """
+    if game_id in game_flow_cache:
+        return game_flow_cache[game_id]
+
+    if not re.fullmatch(r"\d{10}", game_id):
+        raise HTTPException(status_code=404, detail=f"Invalid game_id: {game_id}")
+
+    try:
+        actions = _load_pbp_actions(game_id)
+    except Exception as e:
+        logger.error(f"Upstream play-by-play fetch failed for game {game_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream stats.nba.com play-by-play fetch failed for game {game_id}: {e}"
+        )
+
+    if not actions:
+        raise HTTPException(status_code=404, detail=f"No play-by-play data found for game {game_id}")
+
+    try:
+        home, away = _resolve_game_teams(game_id, actions)
+        flow = build_game_flow(game_id, actions, home, away)
+    except Exception as e:
+        logger.error(f"Error building game flow for game {game_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to build game flow: {e}")
+
+    game_flow_cache[game_id] = flow
+    return flow
+
 @app.get("/api/games/{game_id}/shot-chart")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_game_shot_chart(request: Request, game_id: str):
     """
     Fetch shot chart details for a game resolved directly via game_id.
+
+    Coordinate space (stats.nba.com shotchartdetail convention): shot x/y are
+    LOC_X / LOC_Y in tenths of feet with the basket at the origin -
+    x in [-250, 250] (negative = left of the basket from the shooter's view),
+    y in [-52, ~890] (increasing toward half court).
+
+    `league_averages` (additive field) is league-wide FG% by zone for the
+    game's season - one upstream call per season, cached.
     """
     # Check cache
     if game_id in shot_chart_cache:
         logger.info(f"Returning cached shot chart data for game: {game_id}")
-        return shot_chart_cache[game_id]
-        
+        cached = shot_chart_cache[game_id]
+        # Entries written by /api/shot-chart (shared cache) may predate the
+        # league_averages field - backfill it additively.
+        if "league_averages" not in cached:
+            try:
+                cached["league_averages"] = _get_league_shot_averages(_season_from_game_id(game_id))
+            except Exception:
+                cached["league_averages"] = []
+        return cached
+
     try:
         logger.info(f"Fetching shot chart detail from NBA Stats API for game: {game_id}")
         sc = shotchartdetail.ShotChartDetail(
@@ -3461,13 +3655,21 @@ def get_game_shot_chart(request: Request, game_id: str):
                 except Exception:
                     continue
                     
+        # Additive: league-wide FG% by zone for the game's season. Never let
+        # this break the shots payload.
+        try:
+            league_averages = _get_league_shot_averages(_season_from_game_id(game_id))
+        except Exception:
+            league_averages = []
+
         response_data = {
             "game_id": game_id,
-            "shots": shots
+            "shots": shots,
+            "league_averages": league_averages
         }
         shot_chart_cache[game_id] = response_data
         return response_data
-        
+
     except Exception as e:
         logger.error(f"Error fetching game shot chart: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

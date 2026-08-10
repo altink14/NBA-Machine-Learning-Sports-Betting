@@ -42,6 +42,9 @@ except ImportError:
 # Local Imports
 from src.DataProviders.SbrOddsProvider import SbrOddsProvider
 from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
+from src.Utils import devig
+from src.Utils import elo as elo_engine
+from src.Utils import nba_live
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
 
@@ -238,6 +241,15 @@ if SLOWAPI_AVAILABLE:
     )
 else:
     logger.warning("slowapi is not installed - rate limiting is DISABLED. Run: pip install slowapi")
+
+# De-vig method for turning bookmaker quotes into fair probabilities (Task: EV math).
+if devig.SHIN_AVAILABLE:
+    logger.info("De-vig method active: shin (insider-trading model) for market fair probabilities.")
+else:
+    logger.warning(
+        "De-vig method active: multiplicative FALLBACK - the 'shin' package is not installed. "
+        "Run: pip install shin"
+    )
 
 # --- Odds snapshots (real line-movement tracking) ---
 ODDS_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data', 'OddsData.sqlite')
@@ -593,11 +605,24 @@ class PredictionRunner:
                         
                 prob_home = ml_to_prob(home_odd)
                 prob_away = ml_to_prob(away_odd)
-                total_prob = prob_home + prob_away
-                if total_prob > 0:
-                    prob_home_norm = prob_home / total_prob
-                else:
-                    prob_home_norm = 0.5
+                # Market opinion = de-vigged fair probability of the moneyline
+                # pair (Shin when available), not raw implied normalisation -
+                # payouts below still use the quoted odds.
+                prob_home_norm = None
+                if home_odd is not None and away_odd is not None:
+                    try:
+                        prob_home_norm = devig.fair_probs([
+                            parlay.american_to_true_decimal(float(home_odd)),
+                            parlay.american_to_true_decimal(float(away_odd)),
+                        ])[0]
+                    except (ValueError, TypeError):
+                        prob_home_norm = None
+                if prob_home_norm is None:
+                    total_prob = prob_home + prob_away
+                    if total_prob > 0:
+                        prob_home_norm = prob_home / total_prob
+                    else:
+                        prob_home_norm = 0.5
                 
                 # Simulate a small model edge (e.g. adding 2% to favored team or a slight variation)
                 # to show a positive Expected Value and Kelly Criterion suggestion!
@@ -1061,10 +1086,21 @@ def evaluate_parlay_endpoint(request: Request, payload: ParlayRequest):
     legs_payload = []
     for leg in payload.legs:
         model_prob = leg.model_prob
+        opp_odds = None
         if model_prob is None:
             pred = find_prediction(leg)
             if pred:
                 model_prob = _model_prob_from_prediction(leg, pred)
+                if model_prob is None and leg.market.lower().replace("-", "_") == "moneyline":
+                    # The model could not price this leg, but the cached game
+                    # carries both moneylines - hand the opposite quote to
+                    # evaluate_parlay so its market fallback is the de-vigged
+                    # fair probability instead of raw implied (vig included).
+                    pick = leg.pick.strip().lower()
+                    if pick == leg.home_team.strip().lower():
+                        opp_odds = pred.get("away_odds")
+                    elif pick == leg.away_team.strip().lower():
+                        opp_odds = pred.get("home_odds")
         legs_payload.append({
             "home_team": leg.home_team,
             "away_team": leg.away_team,
@@ -1072,6 +1108,7 @@ def evaluate_parlay_endpoint(request: Request, payload: ParlayRequest):
             "pick": leg.pick,
             "odds": leg.odds,
             "model_prob": model_prob,
+            "opp_odds": opp_odds,
         })
 
     try:
@@ -3592,6 +3629,155 @@ def get_data_health():
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+# --- Elo power ratings (computed lazily from TeamData.sqlite, cached per process) ---
+_elo_history_cache: Dict[str, Any] = {}
+
+def _get_elo_history() -> Dict[str, Any]:
+    if "history" not in _elo_history_cache:
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data', 'TeamData.sqlite')
+        _elo_history_cache["history"] = elo_engine.compute_elo_history(db_path)
+    return _elo_history_cache["history"]
+
+@app.get("/api/power-ratings")
+def get_power_ratings(season: str = CURRENT_SEASON):
+    """
+    FiveThirtyEight-style Elo power ratings (see src/Utils/elo.py for the
+    methodology). Elo runs continuously from 2022-23 through today, with 25%
+    reversion toward 1505 between seasons; `season` selects which season's
+    final (or, mid-season, current) state to report.
+    """
+    try:
+        history = _get_elo_history()
+    except Exception as e:
+        logger.error(f"Error computing Elo history: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute Elo ratings.")
+
+    if season not in history["season_end_ratings"]:
+        available = ", ".join(history["seasons"])
+        raise HTTPException(status_code=404, detail=f"No Elo history for season '{season}'. Available: {available}.")
+
+    as_of = history["season_last_date"][season]
+    season_ratings = history["season_end_ratings"][season]
+    cutoff_7d = (datetime.strptime(as_of, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # Team names, regular-season records, and net rating for the season.
+    meta: Dict[int, Dict[str, Any]] = {}
+    conn = get_db_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT team_id, full_name, abbreviation FROM team_metadata")
+        for row in cursor.fetchall():
+            meta[row["team_id"]] = {"team": row["full_name"], "abbr": row["abbreviation"],
+                                    "wins": None, "losses": None, "net_rtg": None}
+        cursor.execute(
+            "SELECT team_id, wins, losses, net_rating FROM team_season_advanced "
+            "WHERE season = ? AND season_type = 'Regular Season'",
+            (season,),
+        )
+        for row in cursor.fetchall():
+            if row["team_id"] in meta:
+                meta[row["team_id"]]["wins"] = row["wins"]
+                meta[row["team_id"]]["losses"] = row["losses"]
+                meta[row["team_id"]]["net_rtg"] = round(row["net_rating"], 1) if row["net_rating"] is not None else None
+    finally:
+        conn.close()
+
+    ratings = []
+    for team_id, rating in sorted(season_ratings.items(), key=lambda kv: kv[1], reverse=True):
+        team_meta = meta.get(team_id, {})
+        elo_7d_ago = elo_engine.elo_as_of(history["timelines"].get(team_id, []), cutoff_7d)
+        ratings.append({
+            "team": team_meta.get("team"),
+            "abbr": team_meta.get("abbr"),
+            "elo": round(rating, 1),
+            "rank": len(ratings) + 1,
+            "change_7d": round(rating - elo_7d_ago, 1),
+            "wins": team_meta.get("wins"),
+            "losses": team_meta.get("losses"),
+            "net_rtg": team_meta.get("net_rtg"),
+        })
+
+    return {
+        "season": season,
+        "as_of": as_of,
+        "params": {
+            "k": int(elo_engine.K_FACTOR),
+            "home_adv": int(elo_engine.HOME_ADVANTAGE),
+            "mov": True,
+            "carryover": elo_engine.SEASON_CARRYOVER,
+            "history_start": elo_engine.HISTORY_START_SEASON,
+        },
+        "ratings": ratings,
+    }
+
+# --- Model backtest summary (served from the validated artifact at repo root) ---
+BACKTEST_RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest_results.json')
+_backtest_summary_cache: Dict[str, Any] = {}
+
+@app.get("/api/model/backtest")
+def get_model_backtest():
+    """
+    Curated summary of backtest_results.json (the held-out backtest artifact
+    produced by backtest_model.py). Read once, cached per process.
+    """
+    if "summary" in _backtest_summary_cache:
+        return _backtest_summary_cache["summary"]
+    if not os.path.exists(BACKTEST_RESULTS_PATH):
+        raise HTTPException(
+            status_code=503,
+            detail="Backtest artifact backtest_results.json is missing on this deployment; "
+                   "run backtest_model.py to regenerate it.",
+        )
+    try:
+        with open(BACKTEST_RESULTS_PATH, "r", encoding="utf-8") as f:
+            artifact = json.load(f)
+        headline = artifact["headline"]
+        baseline = artifact["baseline"]
+        calibration = [
+            {
+                "bucket": row["bucket"].rstrip("%"),
+                "n": row["n"],
+                "predicted_pct": row["mean_predicted_pct"],
+                "actual_pct": row["actual_win_pct"],
+            }
+            for row in artifact["results"]["calibration_by_confidence"]
+        ]
+        seasons = headline["seasons"]
+        training_cutoff = artifact["model"]["training_date_range"][1]
+        summary = {
+            "headline": {
+                "accuracy_pct": headline["number_pct"],
+                "n_games": headline["n_games"],
+                "ci95": headline["ci95_pct"],
+                "seasons": seasons,
+            },
+            "baselines": {
+                "home_team_pct": baseline["always_pick_home"]["accuracy_pct"],
+                "better_record_pct": baseline["pick_better_win_pct"]["accuracy_pct"],
+            },
+            "calibration": calibration,
+            "generated_at": artifact["generated_at_utc"],
+            "methodology_note": (
+                f"Measured on {headline['n_games']:,} games from the {' and '.join(seasons)} seasons, "
+                f"all played after the model's training cutoff ({training_cutoff}); no historical odds "
+                "exist for these seasons, so this measures accuracy only - no ROI has been measured."
+            ),
+        }
+    except Exception as e:
+        logger.error(f"Error reading backtest artifact: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Backtest artifact backtest_results.json could not be parsed.")
+    _backtest_summary_cache["summary"] = summary
+    return summary
+
+# --- Live scoreboard (official NBA live CDN; cheap, cached, keyless by design) ---
+@app.get("/api/live/scoreboard")
+def get_live_scoreboard():
+    """
+    Normalized live scoreboard from cdn.nba.com (30s in-memory cache). An
+    off-season day or an unreachable CDN both yield games: [] - never an error.
+    """
+    return nba_live.get_scoreboard()
 
 if __name__ == "__main__":
     uvicorn.run("main_api:app", host="0.0.0.0", port=8000, reload=True)

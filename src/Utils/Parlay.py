@@ -12,6 +12,8 @@ of silently multiplying.
 
 from typing import Any, Dict, List
 
+from src.Utils import devig
+
 
 def american_to_true_decimal(american_odds: float) -> float:
     """American odds -> true decimal odds (stake included, e.g. -110 -> 1.909)."""
@@ -92,9 +94,17 @@ def evaluate_parlay(legs: List[Dict[str, Any]], kelly_fraction_cap: float = 10.0
 
     Each leg dict:
       home_team, away_team, market ('moneyline' | 'over_under'), pick,
-      odds (American), model_prob (0-1, optional — falls back to the
-      bookmaker's implied probability, which makes that leg EV-neutral
-      minus vig and is flagged in prob_source).
+      odds (American), model_prob (0-1, optional), opp_odds (American odds of
+      the OTHER side of the same two-outcome market, optional).
+
+    When model_prob is omitted the leg falls back to the market's own opinion:
+    if opp_odds is supplied, the pair is de-vigged (Shin's method via
+    src/Utils/devig, multiplicative fallback) into a fair probability
+    (prob_source 'market_fair'); otherwise the raw bookmaker implied
+    probability is used (prob_source 'market_implied', which makes the leg
+    EV-negative by exactly the vig). Payouts, EV, and break-even math always
+    use the QUOTED odds — de-vigging only ever adjusts the probability
+    estimate.
 
     Returns combined odds/probability, EV per $100, Kelly stake, break-even
     probability, and correlation warnings.
@@ -122,8 +132,20 @@ def evaluate_parlay(legs: List[Dict[str, Any]], kelly_fraction_cap: float = 10.0
         model_prob = leg.get("model_prob")
         prob_source = "model"
         if model_prob is None:
-            model_prob = implied
-            prob_source = "market_implied"
+            opp_odds = leg.get("opp_odds")
+            fair = None
+            if opp_odds is not None:
+                try:
+                    opp_decimal = american_to_true_decimal(float(opp_odds))
+                    fair = devig.fair_probs([decimal, opp_decimal])[0]
+                except (ValueError, TypeError):
+                    fair = None
+            if fair is not None:
+                model_prob = fair
+                prob_source = "market_fair"
+            else:
+                model_prob = implied
+                prob_source = "market_implied"
         model_prob = float(model_prob)
         if not 0.0 < model_prob < 1.0:
             raise ValueError(f"Leg {i + 1}: model_prob must be strictly between 0 and 1.")

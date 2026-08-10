@@ -11,6 +11,7 @@ pandas
 numpy
 scikit-learn
 xgboost
+shin
 
 # External APIs and Services
 sbrscrape

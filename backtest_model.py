@@ -42,6 +42,8 @@ Deterministic: no randomness anywhere. Read-only on every database.
 from __future__ import annotations
 
 import argparse
+import bisect
+import importlib.util
 import json
 import os
 import sqlite3
@@ -250,6 +252,7 @@ def build_games(tg: pd.DataFrame, season: str, convention: str = 'training', lea
         meta.append(dict(game_id=r.game_id, game_date=r.game_date, season=season,
                          season_type=r.season_type,
                          home_team=home.team_name, away_team=away.team_name,
+                         home_id=int(home.team_id), away_id=int(away.team_id),
                          home_pts=int(home.PTS), away_pts=int(away.PTS),
                          home_win=int(home.PTS > away.PTS),
                          total_points=int(home.PTS) + int(away.PTS),
@@ -963,5 +966,889 @@ def print_report(a, df):
     print('\nDays-rest sensitivity:', a['days_rest_sensitivity']['accuracy'])
 
 
+# ===========================================================================
+# CANDIDATE MODEL -- STEP 3 of the pre-registered retrain protocol.
+#
+# Everything below is ADDITIVE. The production backtest above is unchanged
+# and backtest_results.json is never rewritten by the candidate path; the
+# candidate writes backtest_results_candidate.json only.
+#
+# The candidate (Models/candidate_2026-08) uses 207 features:
+#   base 106  -- identical to the production model's inputs, reconstructed
+#                here by exactly the same build_games() path,
+#   rolling 92 -- K in {10,20} per-side blocks. In training these came from
+#                snapshot DIFFS (step 1); the snapshots stop 2024-04-29, so
+#                for the eval seasons they are rebuilt from box_scores with
+#                the same strict game_date < d cutoff, and the two
+#                construction paths are cross-validated against each other
+#                on 2022-24 where both exist,
+#   elo 4      -- pre-game Elo. Training burned in over the odds archive
+#                (2007-08 .. 2024-04-28); the eval continues that replay
+#                over box_scores games AFTER the archive's last date with
+#                identical constants and (game_date, game_id) ordering,
+#   rest 5     -- b2b/3-in-4 flags + rest_diff, built by the step-1 builder
+#                itself (retrain_features.build_rest_features).
+# ===========================================================================
+CAND_DIR = os.path.join(ROOT, 'Models', 'candidate_2026-08')
+CAND_MODEL = os.path.join(CAND_DIR, 'model.json')
+CAND_OUT_JSON = os.path.join(ROOT, 'backtest_results_candidate.json')
+RETRAIN_FEATURES_PY = os.path.join(ROOT, 'src', 'Process-Data', 'retrain_features.py')
+FEATURE_CACHE_RO = ("file:" + os.path.join(ROOT, 'Data', 'retrain_features.sqlite')
+                    .replace("\\", "/") + "?mode=ro")
+TRAINING_RO = ("file:" + os.path.join(ROOT, 'Data', 'retrain_training.sqlite')
+               .replace("\\", "/") + "?mode=ro")
+ROLLING_KS = (10, 20)
+CROSSVAL_SEASONS = ["2022-23", "2023-24"]   # both snapshot-diff and box paths exist
+
+
+def load_rf():
+    """Import the step-1 feature builders from the hyphenated directory."""
+    spec = importlib.util.spec_from_file_location("retrain_features", RETRAIN_FEATURES_PY)
+    rf = importlib.util.module_from_spec(spec)
+    sys.modules["retrain_features"] = rf
+    spec.loader.exec_module(rf)
+    return rf
+
+
+def roll_stat_cols(rf):
+    return list(rf.COUNT_STATS) + list(rf.PCT_STATS) + ["WIN_PCT"]
+
+
+def candidate_column_order(rf):
+    rolling = []
+    for k in ROLLING_KS:
+        for side in ("HOME", "AWAY"):
+            rolling += [f"R{k}_{side}_{s}" for s in roll_stat_cols(rf)]
+    elo = ["ELO_HOME", "ELO_AWAY", "ELO_DIFF", "ELO_HOME_EXPECTED"]
+    rest = ["REST_HOME_B2B", "REST_AWAY_B2B", "REST_HOME_3IN4",
+            "REST_AWAY_3IN4", "REST_DIFF"]
+    return FEATURE_ORDER + rolling + elo + rest
+
+
+def load_candidate(rf):
+    """Booster + manifest + config, with hard column-order assertions."""
+    with open(os.path.join(CAND_DIR, 'feature_manifest.json'), encoding='utf-8') as f:
+        manifest = json.load(f)
+    with open(os.path.join(CAND_DIR, 'training_config.json'), encoding='utf-8') as f:
+        config = json.load(f)
+    booster = xgb.Booster()
+    booster.load_model(CAND_MODEL)
+    cols = candidate_column_order(rf)
+    assert manifest['n_features'] == 207 and len(cols) == 207
+    assert manifest['feature_columns'] == cols, \
+        'harness column order does not reproduce the manifest'
+    assert booster.num_features() == 207
+    assert booster.feature_names == cols, \
+        'booster feature names do not match the manifest'
+    assert config['calibrator']['chosen'] == 'isotonic'
+    return booster, manifest, config
+
+
+def apply_isotonic(p, iso_cfg):
+    """Apply the stored isotonic calibrator exactly as sklearn would:
+    linear interpolation between thresholds, clipped outside the range
+    (out_of_bounds='clip'). np.interp implements precisely that."""
+    x = np.asarray(iso_cfg['x_thresholds'], dtype=float)
+    y = np.asarray(iso_cfg['y_thresholds'], dtype=float)
+    return np.interp(np.asarray(p, dtype=float), x, y)
+
+
+def team_canonical_map(tg, rf):
+    """{team_id: canonical franchise name} from box_scores, verified 30 teams."""
+    pairs = tg[['team_id', 'team_name']].drop_duplicates()
+    canon = {int(r.team_id): rf.normalize_team(r.team_name) for r in pairs.itertuples()}
+    assert len(canon) == 30 and len(set(canon.values())) == 30
+    return canon
+
+
+# ---------------------------------------------------------------------------
+# Rolling-K from box_scores (eval-side construction of the step-1 feature)
+# ---------------------------------------------------------------------------
+def rolling_from_box(tg, rf, season, leak=False):
+    """{(team_id, game_date): {k: (stats_vector, window, gp)}} for every
+    (team, date) the team plays on in `season`, built from that season's
+    REGULAR-SEASON games with game_date strictly before the game date
+    (snapshots freeze during the playoffs, so playoff games use the last K
+    regular-season games -- same as the training-side snapshot diffs).
+
+    Stats vector order = COUNT_STATS + FG_PCT/FG3_PCT/FT_PCT + WIN_PCT,
+    matching retrain_features. TOV in `tg` is already the recovered TOTAL
+    team turnovers (advanced-box method), matching the snapshots' TOV.
+
+    `leak=True` relaxes the cutoff to game_date <= d (a game's own stats
+    enter its own rolling window). Positive control only.
+    """
+    stat_names = list(rf.COUNT_STATS)
+    reg = tg[(tg.season == season) & (tg.season_type == 'Regular Season')] \
+        .sort_values(['game_date', 'game_id'])
+    per_team = {}
+    for tid, grp in reg.groupby('team_id'):
+        dates = grp.game_date.tolist()
+        cols = []
+        for s in stat_names:
+            v = grp[s].values.astype(float)
+            if s == 'MIN':
+                v = v / 5.0          # snapshot MIN is team minutes / 5 per game
+            cols.append(v)
+        cols.append(grp.W.values.astype(float))
+        arr = np.column_stack(cols)
+        cums = np.vstack([np.zeros(arr.shape[1]), np.cumsum(arr, axis=0)])
+        per_team[int(tid)] = (dates, cums)
+
+    i_fgm, i_fga = stat_names.index('FGM'), stat_names.index('FGA')
+    i_f3m, i_f3a = stat_names.index('FG3M'), stat_names.index('FG3A')
+    i_ftm, i_fta = stat_names.index('FTM'), stat_names.index('FTA')
+    i_w = len(stat_names)
+
+    out = {}
+    for r in tg[tg.season == season].itertuples():
+        key = (int(r.team_id), r.game_date)
+        if key in out:
+            continue
+        dates, cums = per_team.get(int(r.team_id), ([], None))
+        idx = (bisect.bisect_right(dates, r.game_date) if leak
+               else bisect.bisect_left(dates, r.game_date))
+        if idx == 0:
+            out[key] = None            # season opener: no rolling block (NaN)
+            continue
+        blocks = {}
+        for k in ROLLING_KS:
+            w = min(k, idx)
+            tot = cums[idx] - cums[idx - w]
+            means = tot[:len(stat_names)] / w
+            def _pct(n, d):
+                return (tot[n] / tot[d]) if tot[d] else np.nan
+            vec = np.concatenate([
+                means,
+                [_pct(i_fgm, i_fga), _pct(i_f3m, i_f3a), _pct(i_ftm, i_fta),
+                 tot[i_w] / w]])
+            blocks[k] = (vec, w, idx)
+        out[key] = blocks
+    return out
+
+
+def crossval_rolling(tg, rf, seasons=CROSSVAL_SEASONS):
+    """Cross-validate the box-score rolling construction against the step-1
+    snapshot-diff cache on seasons where BOTH exist. Pre-registered bound
+    (from step 1): >=99% of counting-stat cells within 0.05*(GP+GP')/K.
+
+    Tolerances by family:
+      counting stats : 0.05*(GP+GP')/window  (snapshot avgs are rounded 0.1)
+      WIN_PCT        : 1e-6 (both paths are exact integer wins / window)
+      shooting PCTs  : 0.1*(GP+GP')/max(denominator totals, 1)  (propagated)
+    """
+    canon = team_canonical_map(tg, rf)
+    inv = {v: k for k, v in canon.items()}
+    stat_cols = roll_stat_cols(rf)
+    count_set = set(rf.COUNT_STATS)
+    pct_den = {'FG_PCT': 'FGA', 'FG3_PCT': 'FG3A', 'FT_PCT': 'FTA'}
+    box = {s: rolling_from_box(tg, rf, s) for s in seasons}
+
+    con = sqlite3.connect(FEATURE_CACHE_RO, uri=True)
+    q = ("SELECT season, date, team, k, window, is_partial, exact_window, gp, "
+         + ", ".join(f'"{c}"' for c in stat_cols)
+         + f" FROM rolling_features WHERE season IN ({','.join('?' * len(seasons))})"
+         f" AND k IN ({','.join('?' * len(ROLLING_KS))})")
+    rows = con.execute(q, list(seasons) + list(ROLLING_KS)).fetchall()
+    con.close()
+
+    fam = {f: [0, 0, 0.0] for f in ('counting', 'win_pct', 'pct')}  # ok, n, worst ratio
+    n_rows = n_missing = n_window_mismatch = n_gp_mismatch = n_inexact = 0
+    for (season, date, team, k, window, is_partial, exact_window, gp, *vals) in rows:
+        n_rows += 1
+        if not exact_window:
+            n_inexact += 1
+            continue
+        tid = inv[team]
+        mine = box[season].get((tid, date))
+        if mine is None:
+            n_missing += 1
+            continue
+        vec, w, idx = mine[k]
+        if idx != gp:
+            n_gp_mismatch += 1
+            continue
+        if w != window:
+            n_window_mismatch += 1
+            continue
+        gp_prev = gp - window
+        base_tol = 0.05 * (gp + gp_prev)
+        for j, sname in enumerate(stat_cols):
+            cache_v, my_v = vals[j], vec[j]
+            if cache_v is None or (isinstance(my_v, float) and np.isnan(my_v)):
+                continue
+            d = abs(float(cache_v) - float(my_v))
+            if sname in count_set:
+                tol, f = base_tol / window, 'counting'
+            elif sname == 'WIN_PCT':
+                tol, f = 1e-6, 'win_pct'
+            else:
+                den_idx = stat_cols.index(pct_den[sname])
+                den_tot = vec[den_idx] * window
+                tol, f = 2.0 * base_tol / max(den_tot, 1.0), 'pct'
+            fam[f][1] += 1
+            if d <= tol + 1e-12:
+                fam[f][0] += 1
+            fam[f][2] = max(fam[f][2], d / tol if tol > 0 else d)
+    result = dict(
+        seasons=seasons,
+        n_cache_rows=n_rows,
+        n_inexact_window_rows_excluded=n_inexact,
+        n_missing_in_box_path=n_missing,
+        n_gp_mismatch=n_gp_mismatch,
+        n_window_mismatch=n_window_mismatch,
+        families={f: dict(within_tolerance=v[0], n=v[1],
+                          pct=round(v[0] / v[1] * 100, 4) if v[1] else None,
+                          worst_diff_over_tolerance=round(v[2], 3))
+                  for f, v in fam.items()},
+        preregistered_bound='>=99% of counting-stat cells within 0.05*(GP+GP\')/K',
+    )
+    result['bound_pass'] = bool(
+        fam['counting'][1] > 0
+        and fam['counting'][0] / fam['counting'][1] >= 0.99
+        and fam['win_pct'][0] == fam['win_pct'][1]
+        and (fam['pct'][1] == 0 or fam['pct'][0] / fam['pct'][1] >= 0.99))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Elo continuation over box_scores (2024-04-29 onward)
+# ---------------------------------------------------------------------------
+def box_game_frame(tg):
+    """One row per game with home/away ids, names, points."""
+    h = tg[tg.is_home][['game_id', 'game_date', 'season', 'season_type',
+                        'team_id', 'team_name', 'PTS']].rename(
+        columns={'team_id': 'home_id', 'team_name': 'home_name', 'PTS': 'home_pts'})
+    a = tg[~tg.is_home][['game_id', 'team_id', 'team_name', 'PTS']].rename(
+        columns={'team_id': 'away_id', 'team_name': 'away_name', 'PTS': 'away_pts'})
+    g = h.merge(a, on='game_id')
+    return g.sort_values(['game_date', 'game_id']).reset_index(drop=True)
+
+
+def continue_elo(rf, tg, base_elo=None, flip_gid=None):
+    """Continue the step-1 odds-table Elo replay over box_scores games played
+    AFTER the odds archive's last date (2024-04-28): the remainder of the
+    2023-24 playoffs, then (after the standard 25%-to-1505 between-season
+    reversion) 2024-25 and 2025-26, ordered by (game_date, game_id) with the
+    identical constants. A team plays at most once per date, so within-date
+    order cannot change any rating.
+
+    The feature is the PRE-GAME rating: recorded before the game's own
+    update is applied. `flip_gid` negates one game's margin -- used by the
+    off-by-one probe to show a game's own outcome cannot reach its own
+    pre-game feature.
+
+    Returns dict with pre / post ({game_id: {...}}), continuation game list,
+    and bookkeeping.
+    """
+    if base_elo is None:
+        base_elo = rf.build_elo_odds()
+    last_odds_date = max(k[0] for k in base_elo['pre_game'])
+    canon = team_canonical_map(tg, rf)
+    games = box_game_frame(tg)
+    games = games[games.game_date > last_odds_date]
+    seasons_seq = games.season.tolist()
+    assert seasons_seq == sorted(seasons_seq), 'continuation seasons out of order'
+
+    ratings = dict(base_elo['final_ratings'])
+    current_season = '2023-24'
+    pre, post = {}, {}
+    for g in games.itertuples():
+        if g.season != current_season:
+            for t in ratings:
+                ratings[t] = (rf.ELO_SEASON_CARRYOVER * ratings[t]
+                              + (1.0 - rf.ELO_SEASON_CARRYOVER)
+                              * rf.ELO_MEAN_REVERT_TARGET)
+            current_season = g.season
+        home, away = canon[int(g.home_id)], canon[int(g.away_id)]
+        home_elo = ratings.get(home, rf.ELO_BASE)
+        away_elo = ratings.get(away, rf.ELO_BASE)
+        expected_home = rf._elo_expected_home(home_elo, away_elo)
+        pre[g.game_id] = dict(home_elo=home_elo, away_elo=away_elo,
+                              home_expected=expected_home)
+        margin = float(g.home_pts - g.away_pts)
+        if flip_gid is not None and g.game_id == flip_gid:
+            margin = -margin
+        home_won = margin > 0
+        if home_won:
+            diff_winner = (home_elo + rf.ELO_HOME_ADVANTAGE) - away_elo
+        else:
+            diff_winner = away_elo - (home_elo + rf.ELO_HOME_ADVANTAGE)
+        shift = (rf.ELO_K * rf._elo_mov_multiplier(margin, diff_winner)
+                 * ((1.0 if home_won else 0.0) - expected_home))
+        ratings[home] = home_elo + shift
+        ratings[away] = away_elo - shift
+        post[g.game_id] = dict(
+            home_elo=ratings[home], away_elo=ratings[away],
+            home_expected=rf._elo_expected_home(ratings[home], ratings[away]))
+    return dict(pre=pre, post=post, games=games, last_odds_date=last_odds_date,
+                n_continuation_games=len(games))
+
+
+def elo_offbyone_probe(rf, tg, base_elo, elo_cont, n_samples=5):
+    """Explicit off-by-one test on the highest-risk code path: flip one
+    game's outcome and assert (a) that game's own PRE-GAME feature is
+    bit-identical, (b) its post-game rating changes, (c) the home team's
+    next game's pre-game rating changes. Run on games spread across the
+    continuation, restricted to the eval seasons."""
+    games = elo_cont['games']
+    ev = games[games.season.isin(HELD_OUT_SEASONS)].reset_index(drop=True)
+    picks = sorted({0, len(ev) // 4, len(ev) // 2, 3 * len(ev) // 4, len(ev) - 1})[:n_samples]
+    checks = []
+    for i in picks:
+        g = ev.iloc[i]
+        flipped = continue_elo(rf, tg, base_elo=base_elo, flip_gid=g.game_id)
+        same_pre = (flipped['pre'][g.game_id] == elo_cont['pre'][g.game_id])
+        post_changed = (flipped['post'][g.game_id]['home_elo']
+                        != elo_cont['post'][g.game_id]['home_elo'])
+        canon = team_canonical_map(tg, rf)
+        home_c = canon[int(g.home_id)]
+        later = games[games.game_date > g.game_date]
+        nxt = None
+        for r in later.itertuples():
+            if canon[int(r.home_id)] == home_c or canon[int(r.away_id)] == home_c:
+                nxt = r
+                break
+        next_changed = None
+        if nxt is not None:
+            side = 'home_elo' if canon[int(nxt.home_id)] == home_c else 'away_elo'
+            next_changed = (flipped['pre'][nxt.game_id][side]
+                            != elo_cont['pre'][nxt.game_id][side])
+        ok = bool(same_pre and post_changed and (next_changed is not False))
+        checks.append(dict(game_id=str(g.game_id), game_date=g.game_date,
+                           season=g.season, own_pre_unchanged=bool(same_pre),
+                           own_post_changed=bool(post_changed),
+                           next_game_pre_changed=next_changed, ok=ok))
+    return dict(n_probed=len(checks), all_ok=all(c['ok'] for c in checks),
+                probes=checks)
+
+
+def elo_replay_consistency(rf, base_elo):
+    """The step-1 cache's elo_pre table must be reproduced exactly by a fresh
+    replay (proves the replay this eval continues from is the same one the
+    training features came from)."""
+    con = sqlite3.connect(FEATURE_CACHE_RO, uri=True)
+    rows = con.execute('SELECT date, home, away, home_elo, away_elo FROM elo_pre').fetchall()
+    con.close()
+    worst = 0.0
+    n_missing = 0
+    for d, h, a, he, ae in rows:
+        v = base_elo['pre_game'].get((d, h, a))
+        if v is None:
+            n_missing += 1
+            continue
+        worst = max(worst, abs(v['home_elo'] - he), abs(v['away_elo'] - ae))
+    return dict(n_cache_rows=len(rows), n_missing=n_missing,
+                max_abs_diff=worst, ok=bool(n_missing == 0 and worst < 1e-9))
+
+
+# ---------------------------------------------------------------------------
+# Rest features (built by the step-1 builder itself)
+# ---------------------------------------------------------------------------
+def rest_from_box(rf, tg, seasons, leak=False):
+    """{game_id: (b2b_h, b2b_a, 3in4_h, 3in4_a, rest_diff)} via
+    retrain_features.build_rest_features on box_scores game dates.
+
+    `leak=True` is the positive control: rest measured INCLUDING the game's
+    own date (previous game := the game itself), i.e. rest=0 both sides, so
+    b2b flags collapse to False and rest_diff to 0. Rest is built from the
+    schedule and cannot leak outcomes; the control demonstrates the columns
+    are live inputs (predictions must move when they are perturbed)."""
+    canon = team_canonical_map(tg, rf)
+    games = box_game_frame(tg)
+    games = games[games.season.isin(seasons)]
+    out = {}
+    if leak:
+        rest34 = rest_from_box(rf, tg, seasons, leak=False)
+        for g in games.itertuples():
+            _, _, h3, a3, _ = rest34[g.game_id]
+            out[g.game_id] = (0.0, 0.0, h3, a3, 0.0)
+        return out
+    glist = [dict(date=g.game_date, home=canon[int(g.home_id)],
+                  away=canon[int(g.away_id)], season=g.season)
+             for g in games.itertuples()]
+    rest = rf.build_rest_features(glist)
+    for g in games.itertuples():
+        v = rest[(g.game_date, canon[int(g.home_id)], canon[int(g.away_id)])]
+        out[g.game_id] = (float(v['home_b2b']), float(v['away_b2b']),
+                          float(v['home_3in4']), float(v['away_3in4']),
+                          float(v['rest_diff']))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 207-column assembly
+# ---------------------------------------------------------------------------
+def build_candidate_matrix(tg, rf, elo_pre, rest_map, leak_rolling=False,
+                           elo_source=None):
+    """Assemble the 207-column matrix for the held-out seasons on EXACTLY
+    the game list build_games() produces (same skip rule as the production
+    backtest: season-opening games with no prior-game snapshot are skipped).
+    Returns (X207, meta_df, skipped)."""
+    stat_n = len(roll_stat_cols(rf))
+    nan_block = np.full(stat_n, np.nan)
+    X_parts, metas, skipped_all = [], [], []
+    for season in HELD_OUT_SEASONS:
+        Xb, meta, skipped = build_games(tg, season, convention='training')
+        skipped_all += skipped
+        roll = rolling_from_box(tg, rf, season, leak=leak_rolling)
+        rows = []
+        for i, m in enumerate(meta.itertuples()):
+            vec = [Xb[i]]
+            for k in ROLLING_KS:
+                for tid in (m.home_id, m.away_id):
+                    blocks = roll.get((tid, m.game_date))
+                    vec.append(nan_block if blocks is None else blocks[k][0])
+            e = (elo_source or elo_pre)[m.game_id]
+            vec.append(np.array([e['home_elo'], e['away_elo'],
+                                 e['home_elo'] - e['away_elo'],
+                                 e['home_expected']]))
+            vec.append(np.array(rest_map[m.game_id], dtype=float))
+            row = np.concatenate(vec)
+            assert row.shape[0] == 207
+            rows.append(row)
+        X_parts.append(np.vstack(rows))
+        metas.append(meta)
+    X = np.vstack(X_parts)
+    meta = pd.concat(metas, ignore_index=True)
+    assert X.shape == (len(meta), 207)
+    return X, meta, skipped_all
+
+
+def predict_candidate(booster, X, cols):
+    d = xgb.DMatrix(X, feature_names=cols)
+    return booster.predict(d)[:, 1]
+
+
+# ---------------------------------------------------------------------------
+# Task-A checks that do not touch sealed outcomes
+# ---------------------------------------------------------------------------
+def calibrator_replication_check(config):
+    """Applying the stored isotonic to the stored validation predictions must
+    reproduce the step-2 validation Brier (0.2167397466181913). Proves the
+    calibrator is being applied exactly as training_config specifies, using
+    only non-sealed (2022-24 validation) data."""
+    preds = np.load(os.path.join(CAND_DIR, 'work', 'valpreds_full_depth3_eta0.05.npy'))
+    con = sqlite3.connect(TRAINING_RO, uri=True)
+    yv = pd.read_sql_query(
+        "select \"Home-Team-Win\" y from training where season in ('2022-23','2023-24') "
+        "order by Date, home, away", con)['y'].values.astype(float)
+    con.close()
+    assert len(preds) == len(yv), 'validation prediction/label length mismatch'
+    p_cal = apply_isotonic(preds, config['calibrator']['isotonic'])
+    brier = float(np.mean((p_cal - yv) ** 2))
+    expected = 0.2167397466181913
+    return dict(n=int(len(yv)), brier_reproduced=brier, brier_expected=expected,
+                abs_diff=abs(brier - expected), ok=bool(abs(brier - expected) < 5e-7))
+
+
+def candidate_in_sample_sanity(booster, rf):
+    """Score the candidate on its own training table (2012-24). In-sample
+    only -- proves the 207-vector layout is what the booster expects, with
+    the shifted-column control collapsing toward the base rate."""
+    cols = candidate_column_order(rf)
+    con = sqlite3.connect(TRAINING_RO, uri=True)
+    df = pd.read_sql_query('select * from training order by Date, home, away', con)
+    con.close()
+    X = df[cols].astype(float).values
+    y = df['Home-Team-Win'].astype(int).values
+    p = predict_candidate(booster, X, cols)
+    acc = float(np.mean((p > 0.5).astype(int) == y))
+    shuf = np.concatenate([X[:, 1:], X[:, :1]], axis=1)
+    ps = predict_candidate(booster, shuf, cols)
+    return dict(
+        n=int(len(y)),
+        in_sample_accuracy_pct=round(acc * 100, 2),
+        home_win_rate_pct=round(float(np.mean(y)) * 100, 2),
+        control_accuracy_with_shifted_columns_pct=round(
+            float(np.mean((ps > 0.5).astype(int) == y)) * 100, 2),
+        step2_validation_accuracy_pct=64.44,
+        note=('In-sample on the candidate\'s own 15,110 training rows; not an accuracy '
+              'claim. Expect it modestly above the 64.44% step-2 validation accuracy; '
+              'the shifted-column control must collapse toward the base rate.'),
+    )
+
+
+def run_candidate_checks(tg, rf, booster, config):
+    """All Task-A gates. Returns (checks_dict, all_pass)."""
+    print('\n=============== CANDIDATE TASK-A CHECKS ===============')
+    print('Column order / booster feature-name assertions ... OK (asserted at load)')
+
+    cal = calibrator_replication_check(config)
+    print(f"Calibrator replication: Brier {cal['brier_reproduced']:.10f} vs "
+          f"expected {cal['brier_expected']:.10f} -> {'OK' if cal['ok'] else 'FAIL'}")
+
+    sanity = candidate_in_sample_sanity(booster, rf)
+    print(f"In-sample sanity: {sanity['in_sample_accuracy_pct']}% on n={sanity['n']} "
+          f"training rows; shifted-column control "
+          f"{sanity['control_accuracy_with_shifted_columns_pct']}%")
+    sanity_ok = (sanity['in_sample_accuracy_pct'] >= sanity['step2_validation_accuracy_pct']
+                 and sanity['control_accuracy_with_shifted_columns_pct']
+                 < sanity['in_sample_accuracy_pct'] - 5)
+
+    print('Cross-validating box-score rolling vs step-1 snapshot-diff rolling '
+          f'on {CROSSVAL_SEASONS} ...')
+    cv = crossval_rolling(tg, rf)
+    for f, v in cv['families'].items():
+        print(f"  {f:9s}: {v['within_tolerance']}/{v['n']} within tolerance "
+              f"({v['pct']}%), worst diff/tol {v['worst_diff_over_tolerance']}")
+    print(f"  rows: {cv['n_cache_rows']} cache rows, {cv['n_missing_in_box_path']} missing, "
+          f"{cv['n_gp_mismatch']} gp-mismatch, {cv['n_window_mismatch']} window-mismatch, "
+          f"{cv['n_inexact_window_rows_excluded']} inexact-window excluded "
+          f"-> bound {'PASS' if cv['bound_pass'] else 'FAIL'}")
+
+    print('Replaying step-1 odds Elo and checking it reproduces the cache ...')
+    base_elo = rf.build_elo_odds()
+    elo_ok = elo_replay_consistency(rf, base_elo)
+    print(f"  {elo_ok['n_cache_rows']} cache rows, max |diff| {elo_ok['max_abs_diff']:.2e} "
+          f"-> {'OK' if elo_ok['ok'] else 'FAIL'}")
+
+    print('Continuing Elo over box_scores and running the off-by-one probe ...')
+    elo_cont = continue_elo(rf, tg, base_elo=base_elo)
+    print(f"  continuation: {elo_cont['n_continuation_games']} games after "
+          f"{elo_cont['last_odds_date']}")
+    probe = elo_offbyone_probe(rf, tg, base_elo, elo_cont)
+    print(f"  off-by-one probe on {probe['n_probed']} games: "
+          f"{'ALL OK' if probe['all_ok'] else 'FAIL'}")
+
+    checks = dict(
+        column_order_assertions='PASS (hard asserts at model load)',
+        calibrator_replication=cal,
+        in_sample_sanity=sanity,
+        rolling_crossval=cv,
+        elo_replay_consistency=elo_ok,
+        elo_continuation=dict(last_odds_date=elo_cont['last_odds_date'],
+                              n_continuation_games=elo_cont['n_continuation_games'],
+                              note=('Continuation includes the 2023-24 playoff games after '
+                                    '2024-04-28 (better burn-in, strictly pre-eval); the 72 '
+                                    'regular-season games missing from the odds archive '
+                                    'remain missing, exactly as in the training-side replay.')),
+        elo_offbyone_probe=probe,
+    )
+    all_pass = bool(cal['ok'] and sanity_ok and cv['bound_pass']
+                    and elo_ok['ok'] and probe['all_ok'])
+    print(f"TASK-A GATES: {'ALL PASS' if all_pass else 'FAILED -- sealed eval must not run'}")
+    return checks, all_pass, base_elo, elo_cont
+
+
+# ---------------------------------------------------------------------------
+# Paired McNemar (generic) and calibration threshold helpers
+# ---------------------------------------------------------------------------
+def paired_mcnemar(ok_a, ok_b):
+    """Exact two-sided binomial McNemar on the discordant pairs.
+    ok_a / ok_b are boolean arrays: 'pick was correct' for each side."""
+    from math import comb
+    ok_a = np.asarray(ok_a, dtype=bool)
+    ok_b = np.asarray(ok_b, dtype=bool)
+    b = int(np.sum(ok_a & ~ok_b))
+    c = int(np.sum(~ok_a & ok_b))
+    n = b + c
+    if n == 0:
+        return dict(a_only_correct=b, b_only_correct=c, n_discordant=0, p_value=1.0)
+    k = min(b, c)
+    tail = sum(comb(n, i) for i in range(0, k + 1)) / (2.0 ** n)
+    return dict(a_only_correct=b, b_only_correct=c, n_discordant=n,
+                p_value=round(min(1.0, 2 * tail), 6))
+
+
+def calibration_thresholds(df, prob_edges, brier_max=0.2142, logloss_max=0.6177):
+    """Threshold 3: reliability of calibrated P(home win), n>=100 buckets."""
+    rel = reliability_home(df, prob_edges)
+    big = [b for b in rel if b['n'] >= 100]
+    errs = [abs(b['calibration_error_pp']) for b in big]
+    brier = float(np.mean((df.p_home - df.home_win) ** 2))
+    logloss = float(-np.mean(
+        df.home_win * np.log(np.clip(df.p_home, 1e-9, 1)) +
+        (1 - df.home_win) * np.log(np.clip(1 - df.p_home, 1e-9, 1))))
+    return dict(
+        reliability=rel,
+        n_buckets_ge_100=len(big),
+        all_ge100_buckets_within_5pp=bool(all(e <= 5.0 for e in errs)),
+        max_abs_bucket_error_pp=round(max(errs), 2) if errs else None,
+        mean_abs_bucket_error_pp=round(float(np.mean(errs)), 2) if errs else None,
+        mean_within_3pp=bool(errs and float(np.mean(errs)) <= 3.0),
+        brier=round(brier, 4), brier_max=brier_max, brier_ok=bool(brier <= brier_max),
+        log_loss=round(logloss, 4), logloss_max=logloss_max,
+        logloss_ok=bool(logloss <= logloss_max),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The sealed one-shot evaluation
+# ---------------------------------------------------------------------------
+def candidate_main(args):
+    con_team = sqlite3.connect(TEAMDATA, uri=True)
+    con_ds = sqlite3.connect(DATASET, uri=True)
+    print('Checking production feature order against the training table ...')
+    assert_feature_order(con_ds)
+
+    rf = load_rf()
+    booster_c, manifest, config = load_candidate(rf)
+    cols = candidate_column_order(rf)
+
+    print('Loading box scores ...')
+    tg = load_team_games(con_team)
+    print(f'  {len(tg)} team-game rows, {tg.game_id.nunique()} games')
+
+    checks, all_pass, base_elo, elo_cont = run_candidate_checks(tg, rf, booster_c, config)
+    if args.candidate_checks:
+        con_team.close(); con_ds.close()
+        return
+    if not all_pass:
+        print('\nABORT: Task-A gates failed; the sealed evaluation was NOT run.')
+        con_team.close(); con_ds.close()
+        sys.exit(1)
+
+    # ---- sealed evaluation (one shot) -------------------------------------
+    print('\n=============== SEALED ONE-SHOT EVALUATION ===============')
+    rest_map = rest_from_box(rf, tg, HELD_OUT_SEASONS)
+    X, meta, skipped = build_candidate_matrix(tg, rf, elo_cont['pre'], rest_map)
+
+    # candidate: raw -> stored isotonic -> pick
+    p_raw = predict_candidate(booster_c, X, cols)
+    p_cal = apply_isotonic(p_raw, config['calibrator']['isotonic'])
+    n_cal_ties = int(np.sum(p_cal == 0.5))
+    pred_c = np.where(p_cal == 0.5, (p_raw > 0.5), (p_cal > 0.5)).astype(int)
+
+    # production model on the IDENTICAL games via the existing harness path
+    booster_old = load_model()
+    frames_old = []
+    for s in HELD_OUT_SEASONS:
+        Xo, mo, _ = build_games(tg, s, convention='training')
+        po = booster_old.predict(xgb.DMatrix(Xo))
+        mo = mo.copy()
+        mo['p_home'] = po[:, 1]
+        mo['pred'] = (po[:, 1] > po[:, 0]).astype(int)
+        frames_old.append(mo)
+    old = pd.concat(frames_old, ignore_index=True)
+    assert list(old.game_id) == list(meta.game_id), \
+        'old/candidate game lists diverged -- reconciliation failed'
+
+    df = add_baselines(meta.copy())
+    df['p_raw'] = p_raw
+    df['p_home'] = p_cal                    # calibrated prob is the reported prob
+    df['pred'] = pred_c
+    df['conf'] = np.maximum(p_cal, 1 - p_cal)
+    df['old_pred'] = old['pred'].values
+    df['old_p_home'] = old['p_home'].values
+
+    y = df.home_win.values
+    ok_c = (df.pred.values == y)
+    ok_old = (df.old_pred.values == y)
+    ok_rec = (df.pick_better_record.values == y)
+    month = df.game_date.str.slice(5, 7).astype(int)
+    octdec = month.isin([10, 11, 12]).values
+
+    print(f'games evaluated: {len(df)} (skipped {len(skipped)} openers), '
+          f'candidate {ok_c.mean()*100:.2f}% vs old {ok_old.mean()*100:.2f}%')
+
+    # ---- leakage positive controls on the new families ---------------------
+    print('Running leakage positive controls ...')
+    controls = {}
+    variants = dict(
+        rolling_leq_cutoff=dict(leak_rolling=True),
+        elo_post_game=dict(elo_source=elo_cont['post']),
+    )
+    for name, kw in variants.items():
+        Xv, mv, _ = build_candidate_matrix(tg, rf, elo_cont['pre'], rest_map, **kw)
+        assert list(mv.game_id) == list(meta.game_id)
+        pv = apply_isotonic(predict_candidate(booster_c, Xv, cols),
+                            config['calibrator']['isotonic'])
+        predv = np.where(pv == 0.5, (predict_candidate(booster_c, Xv, cols) > 0.5),
+                         (pv > 0.5)).astype(int)
+        controls[name] = dict(
+            accuracy_pct=round(float((predv == y).mean()) * 100, 2),
+            picks_changed=int(np.sum(predv != df.pred.values)),
+            delta_vs_strict_pp=round(float((predv == y).mean() - ok_c.mean()) * 100, 2))
+    rest_leak = rest_from_box(rf, tg, HELD_OUT_SEASONS, leak=True)
+    Xr, mr, _ = build_candidate_matrix(tg, rf, elo_cont['pre'], rest_leak)
+    pr = apply_isotonic(predict_candidate(booster_c, Xr, cols),
+                        config['calibrator']['isotonic'])
+    predr = (pr > 0.5).astype(int)
+    controls['rest_including_same_day'] = dict(
+        accuracy_pct=round(float((predr == y).mean()) * 100, 2),
+        picks_changed=int(np.sum(predr != df.pred.values)),
+        delta_vs_strict_pp=round(float((predr == y).mean() - ok_c.mean()) * 100, 2),
+        note=('Rest is schedule-derived and cannot leak outcomes; this control shows '
+              'the rest columns are live inputs (picks move when perturbed).'))
+    shuf = np.concatenate([X[:, 1:], X[:, :1]], axis=1)
+    psh = apply_isotonic(predict_candidate(booster_c, shuf, cols),
+                         config['calibrator']['isotonic'])
+    controls['column_shift'] = dict(
+        accuracy_pct=round(float(((psh > 0.5).astype(int) == y).mean()) * 100, 2),
+        note='every column shifted one position; must collapse toward the base rate')
+    controls['strict_accuracy_pct'] = round(float(ok_c.mean()) * 100, 2)
+    for k, v in controls.items():
+        if isinstance(v, dict):
+            print(f"  {k}: {v['accuracy_pct']}%"
+                  + (f" ({v.get('picks_changed')} picks changed)" if 'picks_changed' in v else ''))
+
+    # ---- results tables -----------------------------------------------------
+    conf_edges = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.0]
+    prob_edges = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0001]
+
+    old_df = df.copy()
+    old_df['pred'] = df.old_pred
+    old_df['p_home'] = df.old_p_home
+    old_df['conf'] = np.maximum(old_df.p_home, 1 - old_df.p_home)
+
+    def _slices(frame):
+        return dict(
+            overall=acc_block(frame),
+            by_season={s: acc_block(frame[frame.season == s]) for s in HELD_OUT_SEASONS},
+            by_season_type={t: acc_block(frame[frame.season_type == t])
+                            for t in ['Regular Season', 'Playoffs']},
+            oct_dec=acc_block(frame[octdec]),
+        )
+
+    results_c = _slices(df)
+    results_old = _slices(old_df)
+    results_c['calibration_by_confidence'] = calibration(df, conf_edges)
+    cal3 = calibration_thresholds(df, prob_edges)
+
+    m_old = paired_mcnemar(ok_c, ok_old)
+    m_rec = paired_mcnemar(ok_c, ok_rec)
+    m_old_octdec = paired_mcnemar(ok_c[octdec], ok_old[octdec])
+
+    acc_c = float(ok_c.mean()) * 100
+    acc_old = float(ok_old.mean()) * 100
+    acc_rec = float(ok_rec.mean()) * 100
+    acc_c_od = float(ok_c[octdec].mean()) * 100
+    acc_old_od = float(ok_old[octdec].mean()) * 100
+
+    verdicts = dict(
+        t1_beats_old_model=dict(
+            requirement='paired McNemar vs production model p<0.05 AND candidate better',
+            candidate_pct=round(acc_c, 2), old_model_pct=round(acc_old, 2),
+            mcnemar=m_old,
+            PASS=bool(acc_c > acc_old and m_old['p_value'] < 0.05)),
+        t2_beats_better_record=dict(
+            requirement='paired McNemar vs better-record baseline p<0.05 AND candidate better',
+            candidate_pct=round(acc_c, 2), better_record_pct=round(acc_rec, 2),
+            mcnemar=m_rec,
+            PASS=bool(acc_c > acc_rec and m_rec['p_value'] < 0.05)),
+        t3_calibration=dict(
+            requirement=('every n>=100 bucket within +/-5pp, mean |bucket error| <=3pp, '
+                         'Brier <= 0.2142, log-loss <= 0.6177 (stored isotonic applied)'),
+            detail={k: v for k, v in cal3.items() if k != 'reliability'},
+            PASS=bool(cal3['all_ge100_buckets_within_5pp'] and cal3['mean_within_3pp']
+                      and cal3['brier_ok'] and cal3['logloss_ok'])),
+        t4_oct_dec=dict(
+            requirement='Oct-Dec improvement >= +2.5pp over the old model (paired slice)',
+            candidate_oct_dec_pct=round(acc_c_od, 2),
+            old_model_oct_dec_pct=round(acc_old_od, 2),
+            n_oct_dec=int(octdec.sum()),
+            improvement_pp=round(acc_c_od - acc_old_od, 2),
+            mcnemar=m_old_octdec,
+            PASS=bool(acc_c_od - acc_old_od >= 2.5)),
+    )
+
+    artifact = dict(
+        schema_version=1,
+        generated_at_utc=datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        generated_by='backtest_model.py --candidate (protocol step 3, sealed one-shot)',
+        rerun_reason=None,
+        model=dict(
+            file='Models/candidate_2026-08/model.json',
+            n_features=207,
+            architecture=('XGBoost multi:softprob 2-class, max_depth 3, eta 0.05, 67 rounds '
+                          '(frozen from chronological validation early stopping), trained on '
+                          '2012-24, stored isotonic calibrator applied to P(home win)'),
+            manifest='Models/candidate_2026-08/feature_manifest.json',
+            training_config='Models/candidate_2026-08/training_config.json'),
+        evaluation=dict(
+            seasons=HELD_OUT_SEASONS,
+            n_games_scored=int(len(df)),
+            n_games_available=int(tg[tg.season.isin(HELD_OUT_SEASONS)].game_id.nunique()),
+            n_games_skipped=len(skipped),
+            skipped_reason='season-opening games (no prior-game snapshot); identical rule for both models',
+            game_list_reconciliation=('IDENTICAL: both models evaluated on exactly the same '
+                                      f'{len(df)} games, asserted by game_id at runtime'),
+            games_by_season={s: int((df.season == s).sum()) for s in HELD_OUT_SEASONS},
+            games_by_season_type=df.season_type.value_counts().to_dict(),
+            date_range=[df.game_date.min(), df.game_date.max()],
+            calibrated_prob_exact_ties_at_0p5=n_cal_ties,
+            tie_rule='calibrated 0.5 exactly -> fall back to raw-probability argmax'),
+        task_a_checks=checks,
+        leakage_positive_controls=controls,
+        results_candidate=results_c,
+        results_old_model_same_games=results_old,
+        paired_tests=dict(
+            candidate_vs_old_model=m_old,
+            candidate_vs_better_record_baseline=m_rec,
+            candidate_vs_old_model_oct_dec=m_old_octdec),
+        calibration_reliability_home_prob=cal3['reliability'],
+        preregistered_thresholds=verdicts,
+        methodology_notes=[
+            'Base 106 features reconstructed by the identical build_games() path the '
+            'production backtest uses (validated 99.667% cell-exact elsewhere in this file).',
+            'Rolling K10/K20 rebuilt from box_scores with strict game_date < d cutoffs; '
+            'total team turnovers recovered from the advanced box score; playoff games use '
+            'the frozen last-K regular-season games, matching the training-side snapshots.',
+            'Elo continued from the step-1 odds-archive replay (verified to reproduce the '
+            'training cache exactly) over box_scores games after 2024-04-28, same constants, '
+            '(game_date, game_id) order, 25% between-season reversion; features are strictly '
+            'pre-game ratings (off-by-one probe in task_a_checks).',
+            'Rest features built by retrain_features.build_rest_features itself.',
+            'Stored isotonic calibrator applied exactly as training_config specifies; picks '
+            'are argmax of the calibrated probability.',
+            'No odds are model inputs. Accuracy is not profitability; no ROI is measured.',
+            'The sealed set was spent by this run. Thresholds were pre-registered before '
+            'any sealed number was seen.',
+        ],
+    )
+    with open(args.out_candidate, 'w', encoding='utf-8') as f:
+        json.dump(artifact, f, indent=2)
+    print(f'\nWrote {args.out_candidate}')
+
+    # ---- console report ----------------------------------------------------
+    print('\n================ SEALED RESULTS (CANDIDATE) ================')
+    o = results_c['overall']
+    print(f"Candidate overall: {o['model_accuracy_pct']}% (n={o['n']}, "
+          f"95% CI {o['model_accuracy_95ci'][0]}-{o['model_accuracy_95ci'][1]})")
+    print(f"Old model  overall: {results_old['overall']['model_accuracy_pct']}%")
+    print(f"Better-record baseline: {round(acc_rec, 2)}%")
+    for s in HELD_OUT_SEASONS:
+        print(f"  {s}: candidate {results_c['by_season'][s]['model_accuracy_pct']}% "
+              f"vs old {results_old['by_season'][s]['model_accuracy_pct']}% "
+              f"(n={results_c['by_season'][s]['n']})")
+    for t in ('Regular Season', 'Playoffs'):
+        print(f"  {t}: candidate {results_c['by_season_type'][t]['model_accuracy_pct']}% "
+              f"vs old {results_old['by_season_type'][t]['model_accuracy_pct']}% "
+              f"(n={results_c['by_season_type'][t]['n']})")
+    print(f"  Oct-Dec: candidate {round(acc_c_od, 2)}% vs old {round(acc_old_od, 2)}% "
+          f"(n={int(octdec.sum())})")
+    print(f"Candidate Brier {cal3['brier']}  log-loss {cal3['log_loss']}")
+    print('\nReliability of calibrated P(home win):')
+    for b in cal3['reliability']:
+        if b['n'] == 0:
+            continue
+        print(f"  {b['bucket']:>10} n={b['n']:>5} pred {b['mean_predicted_home_win_pct']:>6.2f}% "
+              f"actual {b['actual_home_win_pct']:>6.2f}%  err {b['calibration_error_pp']:>6.2f}pp")
+    print('\nPre-registered threshold verdicts:')
+    for k, v in verdicts.items():
+        print(f"  {k}: {'PASS' if v['PASS'] else 'FAIL'}")
+    con_team.close()
+    con_ds.close()
+
+
+def _dispatch():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--validate', action='store_true', help='run reconstruction validation only')
+    ap.add_argument('--out', default=OUT_JSON)
+    ap.add_argument('--candidate-checks', action='store_true',
+                    help='candidate Task-A checks only (no sealed outcomes revealed)')
+    ap.add_argument('--candidate', action='store_true',
+                    help='ONE-SHOT sealed evaluation of Models/candidate_2026-08')
+    ap.add_argument('--out-candidate', default=CAND_OUT_JSON)
+    args = ap.parse_args()
+    if args.candidate or args.candidate_checks:
+        candidate_main(args)
+    else:
+        sys.argv = [sys.argv[0]] + (['--validate'] if args.validate else []) \
+            + ['--out', args.out]
+        main()
+
+
 if __name__ == '__main__':
-    main()
+    _dispatch()

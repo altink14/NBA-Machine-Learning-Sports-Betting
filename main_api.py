@@ -48,6 +48,7 @@ from src.Utils import nba_live
 from src.Utils.tools import create_todays_games_from_odds
 from src.Utils.Dictionaries import team_index_current
 from src.Utils.game_flow import build_game_flow
+from src.Predict import candidate_live
 from src.Utils import player_impact
 from src.Utils import availability as availability_adjust
 from src.Utils import espn_injuries
@@ -709,19 +710,39 @@ class PredictionRunner:
                 })
             return self._attach_availability({"sportsbook": self.sportsbook, "predictions": predictions_list})
 
-        data_for_model, todays_games_uo, frame_ml, home_team_odds, away_team_odds, game_start_times = self._prepare_data_for_model(games_list, odds_data)
+        (data_for_model, todays_games_uo, frame_ml, home_team_odds, away_team_odds,
+         game_start_times, processed_games, game_dates) = self._prepare_data_for_model(games_list, odds_data)
 
         if data_for_model.size == 0:
             return {"error": "Could not prepare valid data for the prediction model.", "predictions": []}
 
         ml_predictions, ou_predictions = self._run_xgboost_models(data_for_model, frame_ml, todays_games_uo)
+
+        # Serve the sealed 2026-08 candidate for the moneyline when its feature
+        # pipeline is healthy; its calibrated probabilities are used AS-IS (the
+        # power-rating blend below is skipped — serving must match what the
+        # sealed evaluation measured). Any failure falls back to the old model.
+        calibrated_ml = False
+        cand = candidate_live.get_candidate()
+        if cand is not None:
+            try:
+                p_home = cand.predict(frame_ml, processed_games, game_dates)
+                ml_predictions = np.column_stack([1.0 - p_home, p_home])
+                self.model_name = candidate_live.MODEL_TAG
+                calibrated_ml = True
+            except Exception as exc:
+                logger.error(f"Candidate model path failed; serving old model: {exc}", exc_info=True)
+
         return self._attach_availability(
-            self._format_predictions(games_list, ml_predictions, ou_predictions, home_team_odds, away_team_odds, todays_games_uo, game_start_times)
+            self._format_predictions(processed_games, ml_predictions, ou_predictions, home_team_odds,
+                                     away_team_odds, todays_games_uo, game_start_times,
+                                     calibrated_ml=calibrated_ml)
         )
 
     def _prepare_data_for_model(self, games, odds):
         game_data_list, home_odds_list, away_odds_list, uo_lines_list, game_start_times_list = [], [], [], [], []
-        
+        processed_games, game_dates_list = [], []
+
         # Fallback game date, used only when the odds feed carries no start time.
         today_nba_date = to_nba_date(datetime.now(timezone.utc))
 
@@ -763,14 +784,16 @@ class PredictionRunner:
             game_data['Days-Rest-Away'] = float(away_days_off)
             
             game_data_list.append(game_data)
-            
+            processed_games.append((home_team, away_team))
+            game_dates_list.append(game_date.isoformat())
+
             home_odds_list.append(game_odds.get(home_team, {}).get('money_line_odds'))
             away_odds_list.append(game_odds.get(away_team, {}).get('money_line_odds'))
             uo_lines_list.append(game_odds.get('under_over_odds'))
             game_start_times_list.append(game_odds.get('game_start_time_utc'))
 
         if not game_data_list:
-            return np.array([]), [], pd.DataFrame(), [], [], []
+            return np.array([]), [], pd.DataFrame(), [], [], [], [], []
             
         frame_ml = pd.DataFrame(game_data_list)
         
@@ -788,7 +811,8 @@ class PredictionRunner:
             frame_for_model.drop(columns=non_numeric, inplace=True)
             
         logger.info(f"Prepared model input with shape: {frame_for_model.shape}")
-        return frame_for_model.values.astype(float), uo_lines_list, frame_ml, home_odds_list, away_odds_list, game_start_times_list
+        return (frame_for_model.values.astype(float), uo_lines_list, frame_ml, home_odds_list,
+                away_odds_list, game_start_times_list, processed_games, game_dates_list)
 
     def _run_xgboost_models(self, data_ml, frame_ml, todays_games_uo):
         ml_predictions = self.xgb_ml_model.predict(xgb.DMatrix(data_ml))
@@ -856,7 +880,7 @@ class PredictionRunner:
             logger.warning(f"Availability attach failed (non-fatal): {exc}")
         return result
 
-    def _format_predictions(self, games, ml_preds, ou_preds, home_odds, away_odds, uo_lines, game_start_times):
+    def _format_predictions(self, games, ml_preds, ou_preds, home_odds, away_odds, uo_lines, game_start_times, calibrated_ml=False):
         predictions_list = []
         for i, (home_team, away_team) in enumerate(games):
             home_odd, away_odd = home_odds[i], away_odds[i]
@@ -877,28 +901,33 @@ class PredictionRunner:
             blended_over_prob = xgb_over_prob
             blended_under_prob = xgb_under_prob
             
-            # Apply Bayesian/Weighted Blending if advanced stats are found
+            # Apply Bayesian/Weighted Blending if advanced stats are found.
+            # When the calibrated candidate is serving the moneyline, its
+            # probabilities are used untouched: the sealed evaluation measured
+            # the calibrated model alone, so blending would publish numbers
+            # nobody validated. The UO model is unchanged and keeps its blend.
             uo_line = uo_lines[i] if uo_lines[i] is not None else 220.0
             if home_power and away_power:
                 try:
                     expected_poss = (home_power["pace"] + away_power["pace"]) / 2.0
                     expected_home_pts = (home_power["offRating"] + away_power["defRating"]) / 2.0 / 100.0 * expected_poss
                     expected_away_pts = (away_power["offRating"] + home_power["defRating"]) / 2.0 / 100.0 * expected_poss
-                    
+
                     expected_margin = expected_home_pts - expected_away_pts
                     expected_total = expected_home_pts + expected_away_pts
-                    
-                    # Sigmoid for win probability (k = 0.14 matches standard margin-to-win distribution)
-                    power_home_prob = 1.0 / (1.0 + math.exp(-0.14 * expected_margin))
-                    
-                    # 70/30 weight blend for moneyline
-                    blended_home_prob = 0.7 * xgb_home_prob + 0.3 * power_home_prob
-                    blended_away_prob = 0.7 * xgb_away_prob + 0.3 * (1.0 - power_home_prob)
-                    sum_ml = blended_home_prob + blended_away_prob
-                    if sum_ml > 0:
-                        blended_home_prob /= sum_ml
-                        blended_away_prob /= sum_ml
-                        
+
+                    if not calibrated_ml:
+                        # Sigmoid for win probability (k = 0.14 matches standard margin-to-win distribution)
+                        power_home_prob = 1.0 / (1.0 + math.exp(-0.14 * expected_margin))
+
+                        # 70/30 weight blend for moneyline
+                        blended_home_prob = 0.7 * xgb_home_prob + 0.3 * power_home_prob
+                        blended_away_prob = 0.7 * xgb_away_prob + 0.3 * (1.0 - power_home_prob)
+                        sum_ml = blended_home_prob + blended_away_prob
+                        if sum_ml > 0:
+                            blended_home_prob /= sum_ml
+                            blended_away_prob /= sum_ml
+
                     # 70/30 weight blend for under/over
                     power_over_prob = max(0.35, min(0.5 + (expected_total - uo_line) * 0.02, 0.65))
                     blended_over_prob = 0.7 * xgb_over_prob + 0.3 * power_over_prob
@@ -4032,60 +4061,117 @@ def get_power_ratings(season: str = CURRENT_SEASON):
 
 # --- Model backtest summary (served from the validated artifact at repo root) ---
 BACKTEST_RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest_results.json')
+CANDIDATE_RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backtest_results_candidate.json')
 _backtest_summary_cache: Dict[str, Any] = {}
+
+def _summary_from_candidate_artifact() -> Dict[str, Any]:
+    """Summary of backtest_results_candidate.json — the sealed one-shot
+    evaluation of the model now serving predictions (candidate_2026-08)."""
+    with open(CANDIDATE_RESULTS_PATH, "r", encoding="utf-8") as f:
+        artifact = json.load(f)
+    overall = artifact["results_candidate"]["overall"]
+    old_overall = artifact["results_old_model_same_games"]["overall"]
+    seasons = artifact["evaluation"]["seasons"]
+    calibration = [
+        {
+            "bucket": row["bucket"].rstrip("%"),
+            "n": row["n"],
+            "predicted_pct": row["mean_predicted_pct"],
+            "actual_pct": row["actual_win_pct"],
+        }
+        for row in artifact["results_candidate"]["calibration_by_confidence"]
+    ]
+    return {
+        "headline": {
+            "accuracy_pct": overall["model_accuracy_pct"],
+            "n_games": overall["n"],
+            "ci95": overall["model_accuracy_95ci"],
+            "seasons": seasons,
+        },
+        "baselines": {
+            "home_team_pct": overall["home_team_baseline_pct"],
+            "better_record_pct": overall["better_record_baseline_pct"],
+        },
+        "previous_model": {
+            "accuracy_pct": old_overall["model_accuracy_pct"],
+            "mcnemar_p_vs_current": artifact["paired_tests"]["candidate_vs_old_model"]["p_value"],
+        },
+        "calibration": calibration,
+        "generated_at": artifact["generated_at_utc"],
+        "methodology_note": (
+            f"Sealed, pre-registered, one-shot evaluation on {overall['n']:,} games from the "
+            f"{' and '.join(seasons)} seasons, all outside the model's 2012-24 training window. "
+            f"Statistically ahead of both the previous model ({old_overall['model_accuracy_pct']}%) "
+            "and the better-record baseline. Accuracy only - no ROI has been measured."
+        ),
+    }
+
+
+def _summary_from_legacy_artifact() -> Dict[str, Any]:
+    """Summary of backtest_results.json (the previous production model)."""
+    with open(BACKTEST_RESULTS_PATH, "r", encoding="utf-8") as f:
+        artifact = json.load(f)
+    headline = artifact["headline"]
+    baseline = artifact["baseline"]
+    calibration = [
+        {
+            "bucket": row["bucket"].rstrip("%"),
+            "n": row["n"],
+            "predicted_pct": row["mean_predicted_pct"],
+            "actual_pct": row["actual_win_pct"],
+        }
+        for row in artifact["results"]["calibration_by_confidence"]
+    ]
+    seasons = headline["seasons"]
+    training_cutoff = artifact["model"]["training_date_range"][1]
+    return {
+        "headline": {
+            "accuracy_pct": headline["number_pct"],
+            "n_games": headline["n_games"],
+            "ci95": headline["ci95_pct"],
+            "seasons": seasons,
+        },
+        "baselines": {
+            "home_team_pct": baseline["always_pick_home"]["accuracy_pct"],
+            "better_record_pct": baseline["pick_better_win_pct"]["accuracy_pct"],
+        },
+        "calibration": calibration,
+        "generated_at": artifact["generated_at_utc"],
+        "methodology_note": (
+            f"Measured on {headline['n_games']:,} games from the {' and '.join(seasons)} seasons, "
+            f"all played after the model's training cutoff ({training_cutoff}); no historical odds "
+            "exist for these seasons, so this measures accuracy only - no ROI has been measured."
+        ),
+    }
+
 
 @app.get("/api/model/backtest")
 def get_model_backtest():
     """
-    Curated summary of backtest_results.json (the held-out backtest artifact
-    produced by backtest_model.py). Read once, cached per process.
+    Curated summary of the serving model's held-out evaluation. Prefers the
+    sealed candidate artifact (the model serving since 2026-08-11); falls back
+    to the previous model's backtest_results.json. Read once, cached per process.
     """
     if "summary" in _backtest_summary_cache:
         return _backtest_summary_cache["summary"]
-    if not os.path.exists(BACKTEST_RESULTS_PATH):
+    summary = None
+    if os.path.exists(CANDIDATE_RESULTS_PATH):
+        try:
+            summary = _summary_from_candidate_artifact()
+        except Exception as e:
+            logger.error(f"Error reading candidate backtest artifact: {e}", exc_info=True)
+    if summary is None and os.path.exists(BACKTEST_RESULTS_PATH):
+        try:
+            summary = _summary_from_legacy_artifact()
+        except Exception as e:
+            logger.error(f"Error reading backtest artifact: {e}", exc_info=True)
+            raise HTTPException(status_code=503, detail="Backtest artifact could not be parsed.")
+    if summary is None:
         raise HTTPException(
             status_code=503,
-            detail="Backtest artifact backtest_results.json is missing on this deployment; "
-                   "run backtest_model.py to regenerate it.",
+            detail="No backtest artifact is present on this deployment; "
+                   "run backtest_model.py to regenerate one.",
         )
-    try:
-        with open(BACKTEST_RESULTS_PATH, "r", encoding="utf-8") as f:
-            artifact = json.load(f)
-        headline = artifact["headline"]
-        baseline = artifact["baseline"]
-        calibration = [
-            {
-                "bucket": row["bucket"].rstrip("%"),
-                "n": row["n"],
-                "predicted_pct": row["mean_predicted_pct"],
-                "actual_pct": row["actual_win_pct"],
-            }
-            for row in artifact["results"]["calibration_by_confidence"]
-        ]
-        seasons = headline["seasons"]
-        training_cutoff = artifact["model"]["training_date_range"][1]
-        summary = {
-            "headline": {
-                "accuracy_pct": headline["number_pct"],
-                "n_games": headline["n_games"],
-                "ci95": headline["ci95_pct"],
-                "seasons": seasons,
-            },
-            "baselines": {
-                "home_team_pct": baseline["always_pick_home"]["accuracy_pct"],
-                "better_record_pct": baseline["pick_better_win_pct"]["accuracy_pct"],
-            },
-            "calibration": calibration,
-            "generated_at": artifact["generated_at_utc"],
-            "methodology_note": (
-                f"Measured on {headline['n_games']:,} games from the {' and '.join(seasons)} seasons, "
-                f"all played after the model's training cutoff ({training_cutoff}); no historical odds "
-                "exist for these seasons, so this measures accuracy only - no ROI has been measured."
-            ),
-        }
-    except Exception as e:
-        logger.error(f"Error reading backtest artifact: {e}", exc_info=True)
-        raise HTTPException(status_code=503, detail="Backtest artifact backtest_results.json could not be parsed.")
     _backtest_summary_cache["summary"] = summary
     return summary
 

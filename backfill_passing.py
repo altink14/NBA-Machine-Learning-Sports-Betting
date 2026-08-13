@@ -163,7 +163,15 @@ def main() -> int:
             ).fetchone()
             n = edges["edges_stored"] if edges else 0
             if n == 0:
-                logger.warning("    no tracking data (expected for pre-2013-14 seasons)")
+                # Two causes, and reporting the wrong one is worse than saying
+                # nothing: a season before tracking began, or a team that simply
+                # did not play in this season type (16 of 30 miss the playoffs).
+                reason = (
+                    "season predates tracking"
+                    if int(season[:4]) < 2013
+                    else "team did not play this season type"
+                )
+                logger.warning("    no data (%s)", reason)
             else:
                 logger.info("    %d edges", n)
         except KeyboardInterrupt:

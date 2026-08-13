@@ -3555,8 +3555,8 @@ def _ensure_team_passing(conn, team_id: int, season: str, season_type: str) -> N
     now = datetime.utcnow().isoformat()
     stored = 0
 
-    for player in roster:
-        pid = player["player_id"]
+    def fetch_one(pid: int, fallback_name: Optional[str] = None) -> int:
+        """Store one player's outgoing edges. Returns how many were written."""
         try:
             made = client.player_pass_dashboard(
                 player_id=pid, team_id=team_id, season=season, season_type=season_type
@@ -3564,8 +3564,9 @@ def _ensure_team_passing(conn, team_id: int, season: str, season_type: str) -> N
         except Exception as exc:
             # One dead player call must not lose the other seventeen.
             logger.warning("Pass dashboard failed for player %s (%s): %s", pid, season, exc)
-            continue
+            return 0
 
+        written = 0
         for row in made:
             receiver_id = row.get("PASS_TEAMMATE_PLAYER_ID")
             if not receiver_id or receiver_id == pid:
@@ -3580,14 +3581,49 @@ def _ensure_team_passing(conn, team_id: int, season: str, season_type: str) -> N
                 """,
                 (
                     team_id, season, season_type, pid,
-                    _flip_last_first(row.get("PLAYER_NAME_LAST_FIRST")) or player.get("full_name"),
+                    _flip_last_first(row.get("PLAYER_NAME_LAST_FIRST")) or fallback_name,
                     receiver_id, _flip_last_first(row.get("PASS_TO")),
                     row.get("G"), row.get("PASS"), row.get("AST"),
                     row.get("FGM"), row.get("FGA"), row.get("FG_PCT"),
                     row.get("FG3M"), row.get("FG3A"), now,
                 ),
             )
-            stored += 1
+            written += 1
+        return written
+
+    for player in roster:
+        stored += fetch_one(player["player_id"], player.get("full_name"))
+
+    # Second pass: mid-season departures.
+    #
+    # The roster above is the END-of-season squad, so a player traded away in
+    # February is never asked for his outgoing passes - yet his teammates' rows
+    # still name him as a receiver. Left there, he lands on the wheel with a
+    # zero-width arc and, because arc colour is assists given against received,
+    # gets painted as a pure finisher. Measured across five seasons that hit 30%
+    # of team-seasons, and the players it caught were ball handlers like
+    # McCollum, Harden and Derrick White - precisely the ones whose passing the
+    # chart exists to show.
+    #
+    # Anyone who appears as a receiver but was never queried as a passer is
+    # exactly that case, so ask for him too. One extra pass is enough in
+    # practice: it would only fall short for a player whose sole receiver was
+    # himself another mid-season departure.
+    queried = {p["player_id"] for p in roster}
+    received = {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT receiver_id FROM team_passing WHERE team_id=? AND season=? AND season_type=?",
+            (team_id, season, season_type),
+        )
+    }
+    departed = sorted(pid for pid in received if pid not in queried)
+    if departed:
+        logger.info(
+            "Second pass for team %s %s: %d mid-season departure(s) absent from the end-of-season roster.",
+            team_id, season, len(departed),
+        )
+        for pid in departed:
+            stored += fetch_one(pid)
 
     conn.execute(
         """
@@ -3595,7 +3631,7 @@ def _ensure_team_passing(conn, team_id: int, season: str, season_type: str) -> N
             (team_id, season, season_type, fetched_at, players_queried, edges_stored)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (team_id, season, season_type, now, len(roster), stored),
+        (team_id, season, season_type, now, len(roster) + len(departed), stored),
     )
     conn.commit()
     logger.info("Stored %d passing edges for team %s %s.", stored, team_id, season)

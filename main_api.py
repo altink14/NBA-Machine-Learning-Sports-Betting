@@ -2702,6 +2702,11 @@ def get_db_conn():
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data', 'TeamData.sqlite')
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # Wait for a writer instead of failing instantly with "database is locked".
+    # The lazy caches (passing, draft, awards, coaches) write from request
+    # handlers, so a backfill script running alongside the API is a normal
+    # situation rather than an exceptional one.
+    conn.execute("PRAGMA busy_timeout = 15000")
     return conn
 
 @app.get("/api/matchups/{game_id}/power-ratings")
@@ -3443,6 +3448,277 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+# --- Team passing wheel (player->player pass tracking, 2013-14 onward) ---
+#
+# One PlayerDashPtPass call per rostered player yields that player's outgoing
+# edges; the roster's worth of calls is the complete directed passer->receiver
+# matrix for a team-season. That is ~18 outbound requests, so the result is
+# persisted in `team_passing` and only ever fetched once per team-season.
+#
+# `team_passing_fetch_log` records the attempt itself. Without it, a season with
+# no tracking data (anything before 2013-14) would re-run the whole roster on
+# every single page view and never store a thing.
+
+def _flip_last_first(name: Optional[str]) -> str:
+    """'Tatum, Jayson' -> 'Jayson Tatum'. Leaves already-normal names alone."""
+    if not name:
+        return ""
+    if "," not in name:
+        return name.strip()
+    last, _, first = name.partition(",")
+    return f"{first.strip()} {last.strip()}".strip()
+
+
+def _passing_roster(conn, team_id: int, season: str, season_type: str) -> List[Dict]:
+    """
+    Who to ask for pass data. Prefers the local season totals (no HTTP), and
+    falls back to the official roster endpoint for seasons the archive does not
+    cover — that fallback is what makes pre-2022 team-seasons work at all.
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT t.player_id, p.full_name
+        FROM player_season_totals t
+        JOIN players p ON p.player_id = t.player_id
+        WHERE t.team_id = ? AND t.season = ? AND t.season_type = ?
+        """,
+        (team_id, season, season_type),
+    ).fetchall()
+    if rows:
+        return [{"player_id": r["player_id"], "full_name": r["full_name"]} for r in rows]
+
+    from src.Utils.nba_stats_client import get_client
+    client = get_client()
+    roster = client.common_team_roster(team_id=team_id, season=season)
+    return [
+        {"player_id": r.get("PLAYER_ID"), "full_name": r.get("PLAYER")}
+        for r in roster
+        if r.get("PLAYER_ID")
+    ]
+
+
+def _ensure_team_passing(conn, team_id: int, season: str, season_type: str) -> None:
+    """Populate `team_passing` for one team-season, once."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_passing (
+            team_id INTEGER,
+            season TEXT,
+            season_type TEXT,
+            passer_id INTEGER,
+            passer_name TEXT,
+            receiver_id INTEGER,
+            receiver_name TEXT,
+            games INTEGER,
+            passes INTEGER,
+            assists INTEGER,
+            fgm INTEGER,
+            fga INTEGER,
+            fg_pct REAL,
+            fg3m INTEGER,
+            fg3a INTEGER,
+            fetched_at TEXT,
+            PRIMARY KEY (team_id, season, season_type, passer_id, receiver_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_passing_fetch_log (
+            team_id INTEGER,
+            season TEXT,
+            season_type TEXT,
+            fetched_at TEXT,
+            players_queried INTEGER,
+            edges_stored INTEGER,
+            PRIMARY KEY (team_id, season, season_type)
+        )
+        """
+    )
+
+    already = conn.execute(
+        "SELECT edges_stored FROM team_passing_fetch_log WHERE team_id=? AND season=? AND season_type=?",
+        (team_id, season, season_type),
+    ).fetchone()
+    if already is not None:
+        return
+
+    roster = _passing_roster(conn, team_id, season, season_type)
+    logger.info(
+        "Fetching pass tracking for team %s %s %s (%d players)...",
+        team_id, season, season_type, len(roster)
+    )
+
+    from src.Utils.nba_stats_client import get_client
+    client = get_client()
+    now = datetime.utcnow().isoformat()
+    stored = 0
+
+    for player in roster:
+        pid = player["player_id"]
+        try:
+            made = client.player_pass_dashboard(
+                player_id=pid, team_id=team_id, season=season, season_type=season_type
+            )
+        except Exception as exc:
+            # One dead player call must not lose the other seventeen.
+            logger.warning("Pass dashboard failed for player %s (%s): %s", pid, season, exc)
+            continue
+
+        for row in made:
+            receiver_id = row.get("PASS_TEAMMATE_PLAYER_ID")
+            if not receiver_id or receiver_id == pid:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO team_passing (
+                    team_id, season, season_type, passer_id, passer_name,
+                    receiver_id, receiver_name, games, passes, assists,
+                    fgm, fga, fg_pct, fg3m, fg3a, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    team_id, season, season_type, pid,
+                    _flip_last_first(row.get("PLAYER_NAME_LAST_FIRST")) or player.get("full_name"),
+                    receiver_id, _flip_last_first(row.get("PASS_TO")),
+                    row.get("G"), row.get("PASS"), row.get("AST"),
+                    row.get("FGM"), row.get("FGA"), row.get("FG_PCT"),
+                    row.get("FG3M"), row.get("FG3A"), now,
+                ),
+            )
+            stored += 1
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO team_passing_fetch_log
+            (team_id, season, season_type, fetched_at, players_queried, edges_stored)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (team_id, season, season_type, now, len(roster), stored),
+    )
+    conn.commit()
+    logger.info("Stored %d passing edges for team %s %s.", stored, team_id, season)
+
+
+@app.get("/api/teams/{abbr}/passing")
+def get_team_passing(
+    abbr: str,
+    season: str = CURRENT_SEASON,
+    season_type: str = "Regular Season",
+):
+    """
+    The passer->receiver matrix for one team-season, for the passing wheel.
+
+    Returns every edge with at least one pass. `players` carries per-player
+    totals in both directions so the chord layout can size arcs by assists
+    given without a second pass over the edge list.
+
+    An empty `connections` array with `tracked: false` means the season predates
+    SecondSpectrum tracking (2013-14) — the caller must say so rather than
+    render an empty wheel.
+    """
+    conn = get_db_conn()
+    try:
+        t_row = conn.execute(
+            "SELECT team_id, full_name, nickname FROM team_metadata WHERE abbreviation = ?",
+            (abbr.upper(),),
+        ).fetchone()
+        if not t_row:
+            raise HTTPException(status_code=404, detail=f"Team abbreviation {abbr} not found.")
+        team_id = t_row["team_id"]
+
+        _ensure_team_passing(conn, team_id, season, season_type)
+
+        rows = conn.execute(
+            """
+            SELECT passer_id, passer_name, receiver_id, receiver_name,
+                   games, passes, assists, fgm, fga, fg_pct, fg3m, fg3a
+            FROM team_passing
+            WHERE team_id = ? AND season = ? AND season_type = ?
+              AND passes > 0
+            ORDER BY assists DESC, passes DESC
+            """,
+            (team_id, season, season_type),
+        ).fetchall()
+
+        connections = []
+        players: Dict[int, Dict[str, Any]] = {}
+        total_assists = 0
+        total_passes = 0
+
+        def slot(pid: int, name: str) -> Dict[str, Any]:
+            if pid not in players:
+                players[pid] = {
+                    "id": pid, "name": name,
+                    "assists_given": 0, "assists_received": 0,
+                    "passes_made": 0, "passes_received": 0,
+                }
+            elif name and not players[pid]["name"]:
+                players[pid]["name"] = name
+            return players[pid]
+
+        for r in rows:
+            d = dict(r)
+            connections.append({
+                "from": d["passer_id"], "from_name": d["passer_name"],
+                "to": d["receiver_id"], "to_name": d["receiver_name"],
+                "passes": d["passes"] or 0, "assists": d["assists"] or 0,
+                "fgm": d["fgm"] or 0, "fga": d["fga"] or 0, "fg_pct": d["fg_pct"],
+                "fg3m": d["fg3m"] or 0, "fg3a": d["fg3a"] or 0,
+            })
+            giver = slot(d["passer_id"], d["passer_name"])
+            taker = slot(d["receiver_id"], d["receiver_name"])
+            giver["assists_given"] += d["assists"] or 0
+            giver["passes_made"] += d["passes"] or 0
+            taker["assists_received"] += d["assists"] or 0
+            taker["passes_received"] += d["passes"] or 0
+            total_assists += d["assists"] or 0
+            total_passes += d["passes"] or 0
+
+        # Team games, for the passes-per-game line. The archive is authoritative
+        # where it reaches; for seasons it does not cover, fall back to the
+        # largest per-player G, since a healthy starter's appearances are a close
+        # proxy for the team's schedule.
+        games_row = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM team_game_advanced
+            WHERE team_id = ? AND season = ? AND season_type = ?
+            """,
+            (team_id, season, season_type),
+        ).fetchone()
+        games = (games_row["n"] if games_row else 0) or 0
+        games_exact = games > 0
+        if not games_exact:
+            games = max((dict(r)["games"] or 0 for r in rows), default=0)
+        top = connections[0] if connections else None
+
+        return {
+            "team": abbr.upper(),
+            "team_name": t_row["full_name"],
+            "team_nickname": t_row["nickname"],
+            "season": season,
+            "season_type": season_type,
+            "tracked": len(connections) > 0,
+            "games": games,
+            "games_exact": games_exact,
+            "totals": {"assists": total_assists, "passes": total_passes},
+            "top_duo": top,
+            "players": sorted(
+                players.values(),
+                key=lambda p: p["assists_given"] + p["assists_received"],
+                reverse=True,
+            ),
+            "connections": connections,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching team passing for {abbr}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 
 @app.get("/api/games/{game_id}/advanced-box")
 def get_game_advanced_box(game_id: str):

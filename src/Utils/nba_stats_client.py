@@ -30,6 +30,7 @@ from nba_api.stats.endpoints import (
     boxscoresummaryv2,
     playercareerstats,
     playergamelog,
+    playerdashptpass,
     shotchartdetail
 )
 
@@ -214,7 +215,9 @@ class NBAStatsClient:
         return self._parse_result_set(raw, "CommonAllPlayers")
 
     def common_team_roster(self, team_id: int, season: str = "2024-25") -> List[Dict]:
-        params = {"team_id": team_id, "season": season, "league_id": "00"}
+        # CommonTeamRoster takes `league_id_nullable`, not `league_id` — passing
+        # the latter raises TypeError on every attempt.
+        params = {"team_id": team_id, "season": season, "league_id_nullable": "00"}
         raw = self._fetch("commonteamroster", commonteamroster.CommonTeamRoster, params, ttl=_LIVE_TTL_SECONDS)
         return self._parse_result_set(raw, "CommonTeamRoster")
 
@@ -272,6 +275,41 @@ class NBAStatsClient:
             ttl=_LIVE_TTL_SECONDS
         )
         return self._parse_result_set(raw, "LeagueAverages")
+
+    def player_pass_dashboard(
+        self,
+        player_id: int,
+        team_id: int,
+        season: str = "2024-25",
+        season_type: str = "Regular Season",
+    ) -> List[Dict]:
+        """
+        One player's outgoing passes for a season: a row per teammate with
+        PASS (passes thrown), AST (assists off them), and the receiver's
+        FGM/FGA/FG_PCT on those passes. The `PassesMade` set alone is the full
+        directed passer->receiver matrix once you call it for every player on
+        the roster; `PassesReceived` is the same edges seen from the other end,
+        so we deliberately ignore it.
+
+        SecondSpectrum tracking data. An empty set has two distinct causes —
+        a season before tracking began in 2013-14, or a player who did not
+        appear in that season type at all (a team that missed the playoffs) —
+        and callers must not report one as the other. Empty never means "this
+        team did not pass".
+        """
+        params = {
+            "player_id": player_id,
+            "team_id": team_id,
+            "season": season,
+            "season_type_all_star": season_type,
+            "per_mode_simple": "Totals",
+            "league_id": "00",
+        }
+        raw = self._fetch(
+            "playerdashptpass", playerdashptpass.PlayerDashPtPass, params,
+            ttl=_LIVE_TTL_SECONDS
+        )
+        return self._parse_result_set(raw, "PassesMade")
 
     def player_game_log(
         self,

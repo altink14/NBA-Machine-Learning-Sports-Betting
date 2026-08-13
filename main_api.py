@@ -3449,6 +3449,177 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
     finally:
         conn.close()
 
+# --- Schedule spots: rest, back-to-backs, and what they actually cost ---
+#
+# There is a `rest_features` table in retrain_features.sqlite, but it stops at
+# 2024-04-28 and carries no result, so it cannot answer the only question worth
+# asking - whether tired teams actually lose. Deriving rest from
+# team_game_advanced instead gives current seasons AND the outcome attached.
+#
+# Rest is counted in days between a team's own consecutive games, never across
+# a season boundary or between season types: a team's first playoff game is not
+# "120 days rested" in any useful sense.
+
+REST_BUCKETS = [
+    (0, 0, "Back-to-back"),
+    (1, 1, "1 day off"),
+    (2, 2, "2 days off"),
+    (3, 99, "3+ days off"),
+]
+
+
+def _rest_bucket(days: Optional[int]) -> Optional[str]:
+    if days is None:
+        return None
+    for lo, hi, label in REST_BUCKETS:
+        if lo <= days <= hi:
+            return label
+    return None
+
+
+def _load_rest_rows(conn, season: str, season_type: str) -> List[Dict[str, Any]]:
+    """One row per team-game with days of rest, the opponent's rest, and the result."""
+    rows = conn.execute(
+        """
+        SELECT tga.team_id, tga.opp_team_id, tga.game_id, tga.game_date,
+               tga.pts, tga.opp_pts,
+               m.abbreviation AS team, m.full_name AS team_name,
+               (CASE WHEN bs.home_team_id = tga.team_id THEN 1 ELSE 0 END) AS is_home
+        FROM team_game_advanced tga
+        JOIN team_metadata m ON m.team_id = tga.team_id
+        JOIN box_scores bs ON bs.game_id = tga.game_id
+        WHERE tga.season = ? AND tga.season_type = ?
+        ORDER BY tga.team_id, tga.game_date
+        """,
+        (season, season_type),
+    ).fetchall()
+
+    # Days of rest, per team, in date order.
+    prev_date: Dict[int, Any] = {}
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        gd = datetime.strptime(d["game_date"][:10], "%Y-%m-%d").date()
+        last = prev_date.get(d["team_id"])
+        # Days OFF, so consecutive calendar days is 0 - a back-to-back.
+        d["rest_days"] = (gd - last).days - 1 if last else None
+        prev_date[d["team_id"]] = gd
+        out.append(d)
+
+    # Attach each opponent's rest for the same game.
+    by_game: Dict[str, List[Dict[str, Any]]] = {}
+    for d in out:
+        by_game.setdefault(d["game_id"], []).append(d)
+    for pair in by_game.values():
+        if len(pair) == 2:
+            pair[0]["opp_rest"] = pair[1]["rest_days"]
+            pair[1]["opp_rest"] = pair[0]["rest_days"]
+        else:
+            for d in pair:
+                d["opp_rest"] = None
+    return out
+
+
+@app.get("/api/stats/rest")
+def get_rest_splits(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    How teams perform by how rested they are, and by how rested they are
+    relative to the opponent.
+
+    Every bucket carries its own sample size; small ones are meaningless and the
+    caller must show n alongside any rate.
+    """
+    conn = get_db_conn()
+    try:
+        rows = _load_rest_rows(conn, season, season_type)
+        if not rows:
+            return {
+                "season": season, "season_type": season_type, "games": 0,
+                "by_rest": [], "by_advantage": [], "by_team": [],
+            }
+
+        def blank() -> Dict[str, Any]:
+            return {"games": 0, "wins": 0, "margin": 0}
+
+        def record(acc: Dict[str, Any], d: Dict[str, Any]) -> None:
+            acc["games"] += 1
+            acc["wins"] += 1 if d["pts"] > d["opp_pts"] else 0
+            acc["margin"] += d["pts"] - d["opp_pts"]
+
+        def finish(acc: Dict[str, Any], **extra) -> Dict[str, Any]:
+            g = acc["games"]
+            return {
+                **extra,
+                "games": g,
+                "wins": acc["wins"],
+                "losses": g - acc["wins"],
+                "win_pct": round(acc["wins"] / g, 4) if g else None,
+                "avg_margin": round(acc["margin"] / g, 2) if g else None,
+            }
+
+        by_rest: Dict[str, Dict[str, Any]] = {}
+        by_adv: Dict[str, Dict[str, Any]] = {}
+        by_team: Dict[int, Dict[str, Any]] = {}
+
+        for d in rows:
+            bucket = _rest_bucket(d["rest_days"])
+            if bucket:
+                by_rest.setdefault(bucket, blank())
+                record(by_rest[bucket], d)
+
+            # Rest advantage against the opponent, which is what a line reacts to.
+            if d["rest_days"] is not None and d.get("opp_rest") is not None:
+                diff = d["rest_days"] - d["opp_rest"]
+                label = "Even rest" if diff == 0 else (
+                    f"+{diff} day{'s' if diff > 1 else ''} rested" if diff > 0
+                    else f"{diff} day{'s' if diff < -1 else ''} rested"
+                )
+                by_adv.setdefault(label, blank())
+                by_adv[label]["diff"] = diff
+                record(by_adv[label], d)
+
+            t = by_team.setdefault(d["team_id"], {
+                "team": d["team"], "team_name": d["team_name"],
+                "b2b": blank(), "rested": blank(),
+            })
+            if d["rest_days"] == 0:
+                record(t["b2b"], d)
+            elif d["rest_days"] is not None and d["rest_days"] >= 2:
+                record(t["rested"], d)
+
+        order = [lbl for _, _, lbl in REST_BUCKETS]
+        return {
+            "season": season,
+            "season_type": season_type,
+            "games": len({d["game_id"] for d in rows}),
+            "by_rest": [finish(by_rest[k], label=k) for k in order if k in by_rest],
+            "by_advantage": sorted(
+                [finish(v, label=k, diff=v.get("diff", 0)) for k, v in by_adv.items()],
+                key=lambda x: x["diff"],
+            ),
+            "by_team": sorted(
+                [
+                    {
+                        "team": t["team"], "team_name": t["team_name"],
+                        "b2b": finish(t["b2b"]), "rested": finish(t["rested"]),
+                        "drop": (
+                            round((t["b2b"]["wins"] / t["b2b"]["games"]
+                                   - t["rested"]["wins"] / t["rested"]["games"]) * 100, 1)
+                            if t["b2b"]["games"] and t["rested"]["games"] else None
+                        ),
+                    }
+                    for t in by_team.values()
+                ],
+                key=lambda x: (x["drop"] is None, x["drop"]),
+            ),
+        }
+    except Exception as e:
+        logger.error(f"Error computing rest splits: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Team passing wheel (player->player pass tracking, 2013-14 onward) ---
 #
 # One PlayerDashPtPass call per rostered player yields that player's outgoing

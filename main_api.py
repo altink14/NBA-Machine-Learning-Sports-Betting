@@ -3449,6 +3449,149 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
     finally:
         conn.close()
 
+# --- Comeback probabilities from play-by-play ---
+#
+# "Down 15 entering the fourth, teams win 7.7% of the time (n=479)." Every cell
+# is a frequency with its sample count, never a model output.
+#
+# Built by walking pbp_events once, carrying the last known score forward
+# (only scoring plays carry one) and sampling the margin at each minute mark.
+# The whole archive computes in about two seconds, so it is done lazily and
+# held for the life of the process rather than precomputed into a table.
+
+_COMEBACK_CACHE: Optional[Dict[str, Any]] = None
+
+# Minutes remaining in regulation. The labelled ones are the moments people
+# actually ask about.
+COMEBACK_MARKS = [
+    (36, "End of Q1"),
+    (24, "Halftime"),
+    (18, "Mid Q3"),
+    (12, "Start of Q4"),
+    (9, "9 min left"),
+    (6, "6 min left"),
+    (3, "3 min left"),
+    (1, "1 min left"),
+]
+
+COMEBACK_BUCKETS = [
+    (1, 3, "1-3"), (4, 6, "4-6"), (7, 9, "7-9"), (10, 12, "10-12"),
+    (13, 15, "13-15"), (16, 20, "16-20"), (21, 99, "21+"),
+]
+
+
+def _deficit_bucket(d: int) -> Optional[str]:
+    for lo, hi, label in COMEBACK_BUCKETS:
+        if lo <= d <= hi:
+            return label
+    return None
+
+
+def _build_comeback_grid(conn) -> Dict[str, Any]:
+    finals: Dict[str, tuple] = {}
+    for gid, sh, sa in conn.execute(
+        "SELECT game_id, score_home, score_away FROM pbp_events "
+        "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
+    ):
+        finals[gid] = (sh, sa)
+
+    marks = [m for m, _ in COMEBACK_MARKS]
+    # (minutes_left, bucket) -> [situations, comebacks]
+    agg: Dict[tuple, List[int]] = {}
+
+    cur = None
+    last = (0, 0)
+    idx = 0
+    minute_marks = list(range(0, 48))
+
+    for gid, es, sh, sa in conn.execute(
+        "SELECT game_id, elapsed_seconds, score_home, score_away FROM pbp_events "
+        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_number"
+    ):
+        if gid != cur:
+            cur, last, idx = gid, (0, 0), 0
+        if sh is not None and sa is not None:
+            last = (sh, sa)
+        final = finals.get(gid)
+        if not final:
+            continue
+        mins = es / 60.0
+        while idx < len(minute_marks) and mins >= minute_marks[idx]:
+            elapsed_min = minute_marks[idx]
+            idx += 1
+            mins_left = 48 - elapsed_min
+            if mins_left not in marks:
+                continue
+            margin = last[0] - last[1]
+            home_won = final[0] > final[1]
+            # Both perspectives: the trailing team is what we are counting, and
+            # recording each game from both sides keeps the table symmetric and
+            # doubles the sample.
+            for deficit, won in ((-margin, home_won), (margin, not home_won)):
+                if deficit <= 0:
+                    continue
+                b = _deficit_bucket(deficit)
+                if not b:
+                    continue
+                cell = agg.setdefault((mins_left, b), [0, 0])
+                cell[0] += 1
+                cell[1] += 1 if won else 0
+
+    rows = []
+    for _, _, b in COMEBACK_BUCKETS:
+        cells = []
+        for m, label in COMEBACK_MARKS:
+            n, w = agg.get((m, b), [0, 0])
+            cells.append({
+                "mins_left": m, "label": label, "games": n, "comebacks": w,
+                "win_pct": round(w / n, 4) if n else None,
+            })
+        rows.append({"deficit": b, "cells": cells})
+
+    seasons = [r[0] for r in conn.execute(
+        "SELECT DISTINCT b.season FROM pbp_events p JOIN box_scores b ON b.game_id = p.game_id "
+        "ORDER BY b.season"
+    )]
+
+    return {
+        "games": len(finals),
+        "seasons": seasons,
+        "marks": [{"mins_left": m, "label": lbl} for m, lbl in COMEBACK_MARKS],
+        "deficits": [b for _, _, b in COMEBACK_BUCKETS],
+        "grid": rows,
+    }
+
+
+@app.get("/api/stats/comebacks")
+def get_comeback_grid():
+    """
+    How often a trailing team came back, by deficit and time remaining.
+
+    Pure frequencies over every archived game. A cell with a small `games`
+    count means exactly that and callers must show it.
+    """
+    global _COMEBACK_CACHE
+    if _COMEBACK_CACHE is not None:
+        return _COMEBACK_CACHE
+    conn = get_db_conn()
+    try:
+        has_pbp = conn.execute("SELECT COUNT(*) FROM pbp_events").fetchone()[0]
+        if not has_pbp:
+            raise HTTPException(
+                status_code=503,
+                detail="Play-by-play has not been backfilled yet. Run backfill_pbp.py.",
+            )
+        _COMEBACK_CACHE = _build_comeback_grid(conn)
+        return _COMEBACK_CACHE
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building comeback grid: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Schedule spots: rest, back-to-backs, and what they actually cost ---
 #
 # There is a `rest_features` table in retrain_features.sqlite, but it stops at

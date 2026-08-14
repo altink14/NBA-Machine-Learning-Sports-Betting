@@ -3459,7 +3459,12 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
 # The whole archive computes in about two seconds, so it is done lazily and
 # held for the life of the process rather than precomputed into a table.
 
+# Keyed on how many games are in pbp_events, so the grid rebuilds when the
+# archive grows. A plain "compute once per process" cache would keep serving a
+# stale grid after every nightly backfill until someone restarted the API -
+# silently, since a slightly-wrong percentage looks exactly like a right one.
 _COMEBACK_CACHE: Optional[Dict[str, Any]] = None
+_COMEBACK_CACHE_GAMES: int = -1
 
 # Minutes remaining in regulation. The labelled ones are the moments people
 # actually ask about.
@@ -3570,18 +3575,19 @@ def get_comeback_grid():
     Pure frequencies over every archived game. A cell with a small `games`
     count means exactly that and callers must show it.
     """
-    global _COMEBACK_CACHE
-    if _COMEBACK_CACHE is not None:
-        return _COMEBACK_CACHE
+    global _COMEBACK_CACHE, _COMEBACK_CACHE_GAMES
     conn = get_db_conn()
     try:
-        has_pbp = conn.execute("SELECT COUNT(*) FROM pbp_events").fetchone()[0]
-        if not has_pbp:
+        games = conn.execute("SELECT COUNT(DISTINCT game_id) FROM pbp_events").fetchone()[0]
+        if not games:
             raise HTTPException(
                 status_code=503,
                 detail="Play-by-play has not been backfilled yet. Run backfill_pbp.py.",
             )
+        if _COMEBACK_CACHE is not None and _COMEBACK_CACHE_GAMES == games:
+            return _COMEBACK_CACHE
         _COMEBACK_CACHE = _build_comeback_grid(conn)
+        _COMEBACK_CACHE_GAMES = games
         return _COMEBACK_CACHE
     except HTTPException:
         raise

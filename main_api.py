@@ -5486,6 +5486,194 @@ def get_key_numbers(season_from: Optional[str] = None, season_to: Optional[str] 
         conn.close()
 
 
+# --- League schedule ---------------------------------------------------------
+# nba.com/schedule is one page driven by query params, not seven pages: its
+# "Preseason Schedule", "Regular Season Schedule", "NBA Cup Schedule" and
+# "National TV Games" menu items are all filter states of the same feed. This
+# endpoint mirrors that - one route, the same filters.
+#
+# Season type comes from the game id prefix, which is the league's own encoding:
+# 001 preseason, 002 regular season, 003 all-star, 004 playoffs, 005 play-in,
+# 006 special events. gameLabel/gameSubtype carry the NBA Cup and global-game
+# markers on top of it.
+SEASON_TYPE_BY_PREFIX = {
+    "001": "Preseason",
+    "002": "Regular Season",
+    "003": "All-Star",
+    "004": "Playoffs",
+    "005": "Play-In",
+    "006": "Special Event",
+}
+
+
+def _broadcaster_names(game: Dict[str, Any], scope: str, media: str) -> List[str]:
+    """Display names for one scope ('national'/'home'/'away') and medium."""
+    out = []
+    for key, entries in (game.get("broadcasters") or {}).items():
+        if not key.startswith(scope):
+            continue
+        for b in entries or []:
+            if media and b.get("broadcasterMedia") != media:
+                continue
+            name = b.get("broadcasterDisplay") or b.get("broadcasterAbbreviation")
+            # "TBD" is a real value in the feed for games whose window is sold
+            # but unassigned. It is not a broadcaster, so it is not offered as a
+            # filter option, but it is passed through so the row can show it.
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+@app.get("/api/schedule")
+def get_league_schedule(
+    season: str = "2026-27",
+    season_type: Optional[str] = None,
+    month: Optional[int] = None,
+    team: Optional[str] = None,
+    broadcaster: Optional[str] = None,
+    national_tv_only: bool = False,
+    hide_previous: bool = False,
+    cup_only: bool = False,
+):
+    """
+    The published league schedule, filtered the way nba.com/schedule filters it.
+
+    `team` is a tricode (BOS). `broadcaster` matches a national TV display name
+    (ESPN, ABC, NBC, Peacock, Prime Video). `hide_previous` drops dates before
+    today. Every filter is optional and they compose.
+    """
+    try:
+        from src.Utils.nba_stats_client import get_client
+
+        league = get_client().schedule_league_v2(season=season)
+    except Exception as e:
+        logger.error(f"Error fetching league schedule: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Could not reach the NBA schedule feed.")
+
+    today = datetime.now(timezone.utc).date()
+    dates_out = []
+    teams_seen: Dict[str, str] = {}
+    broadcasters_seen: Dict[str, int] = {}
+    season_types_seen: Dict[str, int] = {}
+    total = 0
+
+    for gd in league.get("gameDates") or []:
+        games = []
+        for g in gd.get("games") or []:
+            gid = str(g.get("gameId") or "")
+            stype = SEASON_TYPE_BY_PREFIX.get(gid[:3], "Other")
+            season_types_seen[stype] = season_types_seen.get(stype, 0) + 1
+
+            home = g.get("homeTeam") or {}
+            away = g.get("awayTeam") or {}
+            for t in (home, away):
+                if t.get("teamTricode"):
+                    teams_seen[t["teamTricode"]] = f"{t.get('teamCity', '')} {t.get('teamName', '')}".strip()
+
+            natl_tv = _broadcaster_names(g, "national", "tv")
+            for name in natl_tv:
+                if name != "TBD":
+                    broadcasters_seen[name] = broadcasters_seen.get(name, 0) + 1
+
+            label = g.get("gameLabel") or ""
+            subtype = g.get("gameSubtype") or ""
+            is_cup = "cup" in label.lower() or subtype.startswith("in-season")
+
+            if season_type and stype != season_type:
+                continue
+            if cup_only and not is_cup:
+                continue
+            if team and team.upper() not in {home.get("teamTricode"), away.get("teamTricode")}:
+                continue
+            if broadcaster and broadcaster not in natl_tv:
+                continue
+            if national_tv_only and not [n for n in natl_tv if n != "TBD"]:
+                continue
+
+            est = g.get("gameDateTimeEst") or ""
+            if month and est[5:7].isdigit() and int(est[5:7]) != month:
+                continue
+            if hide_previous and est[:10]:
+                try:
+                    if datetime.strptime(est[:10], "%Y-%m-%d").date() < today:
+                        continue
+                except ValueError:
+                    pass
+
+            total += 1
+            games.append({
+                "game_id": gid,
+                "season_type": stype,
+                "date_est": est,
+                "time_est": g.get("gameTimeEst"),
+                "date_utc": g.get("gameDateTimeUTC"),
+                "status": g.get("gameStatusText"),
+                "week": g.get("weekNumber"),
+                "week_name": g.get("weekName"),
+                "label": label or None,
+                "sub_label": g.get("gameSubLabel") or None,
+                "is_cup": is_cup,
+                "is_neutral": bool(g.get("isNeutral")),
+                "arena": g.get("arenaName"),
+                "arena_city": g.get("arenaCity"),
+                "arena_state": g.get("arenaState"),
+                "home": {
+                    "tricode": home.get("teamTricode"),
+                    "name": f"{home.get('teamCity', '')} {home.get('teamName', '')}".strip(),
+                    "team_id": home.get("teamId"),
+                },
+                "away": {
+                    "tricode": away.get("teamTricode"),
+                    "name": f"{away.get('teamCity', '')} {away.get('teamName', '')}".strip(),
+                    "team_id": away.get("teamId"),
+                },
+                "national_tv": natl_tv,
+                "national_radio": _broadcaster_names(g, "national", "radio"),
+                "home_tv": _broadcaster_names(g, "home", "tv"),
+                "away_tv": _broadcaster_names(g, "away", "tv"),
+            })
+
+        if games:
+            # The feed lists a night's games in its own sequence, which is not
+            # tip-off order. A schedule that reads 7:30, 8:00, 7:00 down the page
+            # is unreadable, so sort by start time.
+            games.sort(key=lambda g: g["date_est"] or "")
+            dates_out.append({
+                "date": (games[0]["date_est"] or "")[:10],
+                "label": gd.get("gameDate"),
+                "games": games,
+            })
+
+    return {
+        "season": season,
+        "games": total,
+        "dates": dates_out,
+        "weeks": league.get("weeks") or [],
+        "filters": {
+            "season_type": season_type,
+            "month": month,
+            "team": team,
+            "broadcaster": broadcaster,
+            "national_tv_only": national_tv_only,
+            "hide_previous": hide_previous,
+            "cup_only": cup_only,
+        },
+        "options": {
+            # Built from the whole feed, before filtering, so the dropdowns do
+            # not shrink as the user narrows the view.
+            "season_types": [
+                {"value": k, "games": v}
+                for k, v in sorted(season_types_seen.items(), key=lambda x: -x[1])
+            ],
+            "teams": [{"tricode": k, "name": v} for k, v in sorted(teams_seen.items())],
+            "broadcasters": [
+                {"name": k, "games": v}
+                for k, v in sorted(broadcasters_seen.items(), key=lambda x: -x[1])
+            ],
+        },
+    }
+
+
 @app.get("/api/health/validation")
 def get_validation_health():
     """

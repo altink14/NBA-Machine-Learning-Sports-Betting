@@ -31,7 +31,8 @@ from nba_api.stats.endpoints import (
     playercareerstats,
     playergamelog,
     playerdashptpass,
-    shotchartdetail
+    shotchartdetail,
+    scheduleleaguev2
 )
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,26 @@ class NBAStatsClient:
             params["date_to_nullable"] = date_to
         raw = self._fetch("leaguedashteamstats", leaguedashteamstats.LeagueDashTeamStats, params, ttl=_LIVE_TTL_SECONDS)
         return self._parse_result_set(raw, "LeagueDashTeamStats")
+
+    def schedule_league_v2(self, season: str = "2026-27") -> Dict:
+        """The full league schedule for a season: every game, with broadcasters.
+
+        This is the feed nba.com/schedule itself runs on - arenas, week numbers,
+        national/local TV and radio, and the labels that mark NBA Cup and global
+        games. Returned raw (the whole `leagueSchedule` object) because the
+        caller needs the `weeks` array as well as the games.
+
+        Cached for an hour: a published schedule moves rarely, and when it does
+        (a postponement) it is not something to hammer the endpoint over.
+        """
+        params = {
+            "season": season,
+            "league_id": "00",
+        }
+        raw = self._fetch(
+            "scheduleleaguev2", scheduleleaguev2.ScheduleLeagueV2, params, ttl=3600
+        )
+        return raw.get("leagueSchedule", {})
 
     def common_all_players(
         self, season: str = "2024-25", is_only_current_season: int = 1

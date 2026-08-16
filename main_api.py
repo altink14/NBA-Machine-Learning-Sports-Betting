@@ -5486,6 +5486,153 @@ def get_key_numbers(season_from: Optional[str] = None, season_to: Optional[str] 
         conn.close()
 
 
+@app.get("/api/health/validation")
+def get_validation_health():
+    """
+    Every place our derived numbers disagree with NBA.com, and by how much.
+
+    The pipeline recomputes pace, offensive rating and defensive rating from raw
+    box scores and compares each against the official figure, writing the result
+    to raw_scrape_log. This publishes that audit trail rather than summarising it
+    charitably: the distribution of disagreements, the direction of the bias, and
+    the log's own limitations.
+
+    Three things the caller must surface, or the numbers mislead:
+      - `ok` and `warning` rows were written under DIFFERENT tolerances. The
+        validator's default is 1.0 now; the 'ok' rows predate that and say 3.0.
+        Counting one against the other measures a threshold change, not quality.
+      - Ratings are double-counted by construction. Our offensive rating for one
+        team is our defensive rating for the other, so a single disagreement in a
+        game appears as two rows with identical numbers.
+      - The log covers the days the archive was built, not every day since. It is
+        a record of how the archive was validated, not a live heartbeat.
+    """
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT logged_at, game_id, team_id, endpoint, status, metric, "
+            "our_value, official_value, diff FROM raw_scrape_log"
+        ).fetchall()
+        if not rows:
+            raise HTTPException(status_code=503, detail="Validation log is empty.")
+
+        statuses: Dict[str, int] = {}
+        days: Dict[str, int] = {}
+        by_metric: Dict[str, List[Dict[str, float]]] = {}
+        all_games = set()
+        warned_games = set()
+        error_games = set()
+        error_rows = 0
+
+        for r in rows:
+            statuses[r["status"]] = statuses.get(r["status"], 0) + 1
+            if r["logged_at"]:
+                day = r["logged_at"][:10]
+                days[day] = days.get(day, 0) + 1
+            if r["game_id"]:
+                all_games.add(r["game_id"])
+                if r["status"] == "warning":
+                    warned_games.add(r["game_id"])
+                elif r["status"] == "error":
+                    error_games.add(r["game_id"])
+            if r["status"] == "error":
+                error_rows += 1
+            if r["metric"] and r["diff"] is not None:
+                by_metric.setdefault(r["metric"], []).append({
+                    "diff": abs(float(r["diff"])),
+                    "signed": float(r["our_value"]) - float(r["official_value"])
+                    if r["our_value"] is not None and r["official_value"] is not None else 0.0,
+                })
+
+        def pct(values: List[float], q: float) -> float:
+            s = sorted(values)
+            if not s:
+                return 0.0
+            return round(s[min(len(s) - 1, int(q * len(s)))], 2)
+
+        # Buckets chosen around the tolerance, so a reader can see how much of the
+        # disagreement is the documented 1-3 point band and how much is the tail.
+        edges = [(0, 1), (1, 2), (2, 3), (3, 5), (5, 8), (8, None)]
+        metrics = []
+        for name, vals in sorted(by_metric.items()):
+            diffs = [v["diff"] for v in vals]
+            signed = [v["signed"] for v in vals]
+            n = len(diffs)
+            buckets = []
+            for lo, hi in edges:
+                c = sum(1 for d in diffs if d >= lo and (hi is None or d < hi))
+                buckets.append({
+                    "from": lo, "to": hi, "games": c,
+                    "pct": round(c / n * 100, 2) if n else 0.0,
+                })
+            metrics.append({
+                "metric": name,
+                "n": n,
+                "mean_abs_diff": round(sum(diffs) / n, 2) if n else None,
+                "median_abs_diff": pct(diffs, 0.5),
+                "p95_abs_diff": pct(diffs, 0.95),
+                "max_abs_diff": round(max(diffs), 2) if diffs else None,
+                "bias": round(sum(signed) / n, 2) if n else None,
+                "within_1": round(sum(1 for d in diffs if d <= 1) / n * 100, 2) if n else None,
+                "within_3": round(sum(1 for d in diffs if d <= 3) / n * 100, 2) if n else None,
+                "over_5": round(sum(1 for d in diffs if d > 5) / n * 100, 2) if n else None,
+                "buckets": buckets,
+            })
+
+        # An error row means a fetch failed at the time. It does not mean the game
+        # is missing - the backfill retries - so resolve them against the archive
+        # rather than reporting a scary count that has already been fixed.
+        recovered = 0
+        if error_games:
+            placeholders = ",".join("?" * len(error_games))
+            ids = list(error_games)
+            in_box = {
+                r["game_id"] for r in conn.execute(
+                    f"SELECT DISTINCT game_id FROM box_scores WHERE game_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+            }
+            in_adv = {
+                r["game_id"] for r in conn.execute(
+                    f"SELECT DISTINCT game_id FROM team_game_advanced WHERE game_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+            }
+            recovered = len(in_box & in_adv)
+
+        stamps = sorted(r["logged_at"] for r in rows if r["logged_at"])
+        return {
+            "rows": len(rows),
+            "statuses": statuses,
+            "first_logged": stamps[0] if stamps else None,
+            "last_logged": stamps[-1] if stamps else None,
+            "days_logged": sorted(
+                [{"day": d, "rows": c} for d, c in days.items()], key=lambda x: x["day"]
+            ),
+            "games_validated": len(all_games),
+            "games_with_warning": len(warned_games),
+            "metrics": metrics,
+            "errors": {
+                "rows": error_rows,
+                "games": len(error_games),
+                "recovered": recovered,
+                "still_missing": len(error_games) - recovered,
+            },
+            "caveats": {
+                "current_threshold": 1.0,
+                "legacy_ok_threshold": 3.0,
+                "ratings_double_counted": True,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/health/validation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not read the validation log.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/health/data")
 def get_data_health():
     """

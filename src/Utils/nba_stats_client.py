@@ -193,13 +193,25 @@ class NBAStatsClient:
         season_type: str = "Regular Season",
         per_mode: str = "PerGame",
         measure_type: str = "Base",
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> List[Dict]:
+        """Season-to-date team stats.
+
+        `date_from`/`date_to` are MM/DD/YYYY strings and bound the games included.
+        The daily team-stats snapshot passes date_to=yesterday so a game can never
+        contribute to the stats used to predict it.
+        """
         params = {
             "season": season,
             "season_type_all_star": season_type,
             "per_mode_detailed": per_mode,
             "measure_type_detailed_defense": measure_type,
         }
+        if date_from:
+            params["date_from_nullable"] = date_from
+        if date_to:
+            params["date_to_nullable"] = date_to
         raw = self._fetch("leaguedashteamstats", leaguedashteamstats.LeagueDashTeamStats, params, ttl=_LIVE_TTL_SECONDS)
         return self._parse_result_set(raw, "LeagueDashTeamStats")
 

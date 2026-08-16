@@ -328,6 +328,14 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
         conn.close()
 
 # --- Prediction track record ---
+# Tag for the market-implied fallback in run_predictions(). It is NOT a model:
+# it takes the book's own de-vigged probability and adds a hardcoded edge, so a
+# row carrying this tag is the market's opinion wearing our name. Such rows must
+# never reach predictions_log (the public track record grades what is in there)
+# and are filtered again on the way out, in case any were written historically.
+SIMULATED_MODEL_TAG = "implied_probability_sim"
+
+
 def _ensure_prediction_log_schema(conn) -> None:
     conn.execute(
         """
@@ -372,10 +380,14 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
     try:
         _ensure_prediction_log_schema(conn)
         now = datetime.utcnow()
+        skipped_sim = 0
         for p in predictions:
             home = p.get("home_team")
             away = p.get("away_team")
             if not home or not away:
+                continue
+            if p.get("model") == SIMULATED_MODEL_TAG:
+                skipped_sim += 1
                 continue
             ev = p.get("expected_value") or {}
             conn.execute(
@@ -421,6 +433,12 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                     p.get("model"),
                 )
             )
+        if skipped_sim:
+            logger.info(
+                "Prediction log: skipped %d market-implied row(s) - '%s' output is not a "
+                "model prediction and is never graded as one.",
+                skipped_sim, SIMULATED_MODEL_TAG
+            )
         conn.commit()
     finally:
         conn.close()
@@ -430,6 +448,10 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
 # -- and therefore the days-rest convention the model was trained on -- is the US
 # Eastern calendar date. A 7:30pm ET tip-off is stamped 00:30 UTC the FOLLOWING day, so
 # comparing UTC timestamps against a naive local clock silently shifts games by a day.
+# In season the team-stats snapshot is rewritten every morning; a few days of slack
+# covers the All-Star break and a missed run without crying wolf.
+TEAM_STATS_MAX_AGE_DAYS = 10
+
 DEFAULT_DAYS_REST = 7          # used when a team has no earlier game on record
 MIN_DAYS_REST = 1
 MAX_DAYS_REST = 7
@@ -496,6 +518,22 @@ class PredictionRunner:
                 raise FileNotFoundError("No team statistics tables found in TeamData.sqlite")
             table_name = table_row[0]
             logger.info(f"Loading team stats from SQLite table: {table_name}")
+            # These snapshots are written daily by refresh_team_stats.py. If that
+            # stops running the newest table just gets old, and predictions quietly
+            # keep being served from stale team form - which is how the serving path
+            # ended up on 2024-04-29 data two seasons later. Say so, loudly.
+            try:
+                snapshot_age = (datetime.now().date() - datetime.strptime(table_name, "%Y-%m-%d").date()).days
+                if snapshot_age > TEAM_STATS_MAX_AGE_DAYS:
+                    logger.error(
+                        "Team stats are %d days old (table '%s'). Predictions are being made "
+                        "from stale team form - run refresh_team_stats.py.",
+                        snapshot_age, table_name
+                    )
+                self.team_stats_age_days = snapshot_age
+            except ValueError:
+                self.team_stats_age_days = None
+            self.team_stats_table = table_name
             df = pd.read_sql_query(f"SELECT * FROM `{table_name}`", conn, index_col="index")
             conn.close()
             return df
@@ -705,7 +743,7 @@ class PredictionRunner:
                     "under_over_line": uo_line, "predicted_winner": home_team if winner_idx == 1 else away_team,
                     "winner_confidence": round(winner_confidence * 100, 2),
                     "under_over_prediction": "OVER" if ou_idx == 1 else "UNDER",
-                    "under_over_confidence": round(ou_confidence * 100, 2), "model": "implied_probability_sim",
+                    "under_over_confidence": round(ou_confidence * 100, 2), "model": SIMULATED_MODEL_TAG,
                     "expected_value": {"home_team": ev_home, "away_team": ev_away},
                     "kelly_criterion": {"home_team": kelly_home, "away_team": kelly_away},
                     "game_start_time_utc": game_start_time_str
@@ -1269,15 +1307,20 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
     try:
         _ensure_prediction_log_schema(conn)
         since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        # Market-implied fallback rows are excluded here as well as on write: this
+        # endpoint feeds the public track record, and the record must contain only
+        # what the model actually predicted.
         if sportsbook:
             rows = conn.execute(
-                "SELECT * FROM predictions_log WHERE log_date >= ? AND sportsbook = ? ORDER BY logged_at DESC",
-                (since, sportsbook)
+                "SELECT * FROM predictions_log WHERE log_date >= ? AND sportsbook = ? "
+                "AND (model IS NULL OR model != ?) ORDER BY logged_at DESC",
+                (since, sportsbook, SIMULATED_MODEL_TAG)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM predictions_log WHERE log_date >= ? ORDER BY logged_at DESC",
-                (since,)
+                "SELECT * FROM predictions_log WHERE log_date >= ? "
+                "AND (model IS NULL OR model != ?) ORDER BY logged_at DESC",
+                (since, SIMULATED_MODEL_TAG)
             ).fetchall()
 
         predictions = [dict(r) for r in rows]

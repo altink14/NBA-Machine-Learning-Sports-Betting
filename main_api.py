@@ -5674,6 +5674,87 @@ def get_league_schedule(
     }
 
 
+@app.get("/api/cup")
+def get_nba_cup(season: str = "2026-27"):
+    """
+    The Emirates NBA Cup: six groups, the knockout round, and who plays whom.
+
+    Group membership is not published as a roster anywhere in the feed - it is
+    derived from the games, since a team's group is whichever group its group
+    games carry. Sixty group games across six groups of five teams, each team
+    playing the other four once.
+
+    Standings are deliberately absent. Before the tournament starts there are no
+    results to stand on, and inventing a table of zeroes would imply the section
+    is live when it is not.
+    """
+    sched = get_league_schedule(season=season, cup_only=True)
+    games = [g for d in sched["dates"] for g in d["games"]]
+    if not games:
+        raise HTTPException(status_code=503, detail="No NBA Cup games in this season's feed.")
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    knockout: List[Dict[str, Any]] = []
+    KNOCKOUT_ORDER = {"Quarterfinal": 1, "Semifinal": 2, "Championship": 3}
+
+    for g in games:
+        stage = g.get("sub_label") or ""
+        if stage in KNOCKOUT_ORDER:
+            knockout.append(g)
+            continue
+        if not stage:
+            continue
+        entry = groups.setdefault(stage, {"group": stage, "teams": {}, "games": []})
+        entry["games"].append(g)
+        for side in ("home", "away"):
+            t = g[side]
+            if t.get("tricode"):
+                entry["teams"][t["tricode"]] = t["name"]
+
+    group_list = [
+        {
+            "group": name,
+            "conference": "East" if name.startswith("East") else "West",
+            "teams": [{"tricode": k, "name": v} for k, v in sorted(data["teams"].items())],
+            "games": len(data["games"]),
+            "first_game": min(g["date_est"] for g in data["games"])[:10],
+            "last_game": max(g["date_est"] for g in data["games"])[:10],
+        }
+        for name, data in sorted(groups.items())
+    ]
+    knockout.sort(key=lambda g: (KNOCKOUT_ORDER.get(g.get("sub_label") or "", 9), g["date_est"]))
+
+    return {
+        "season": season,
+        "total_games": len(games),
+        "groups": group_list,
+        "knockout": [
+            {
+                "stage": g.get("sub_label"),
+                "date": g["date_est"][:10],
+                "date_est": g["date_est"],
+                "arena": g["arena"],
+                "arena_city": g["arena_city"],
+                "national_tv": g["national_tv"],
+                # Knockout brackets are seeded by group results, so before the
+                # group stage these carry placeholder teams. Say so rather than
+                # printing whatever the feed has parked there.
+                "teams_decided": bool(g["home"]["tricode"] and g["away"]["tricode"]),
+                "home": g["home"],
+                "away": g["away"],
+            }
+            for g in knockout
+        ],
+        "group_stage": {
+            "first_game": min(g["date_est"] for g in games)[:10],
+            "last_game": max(
+                (g["date_est"] for g in games if (g.get("sub_label") or "") not in KNOCKOUT_ORDER),
+                default="",
+            )[:10],
+        },
+    }
+
+
 @app.get("/api/health/validation")
 def get_validation_health():
     """

@@ -3449,6 +3449,133 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
     finally:
         conn.close()
 
+# --- Scorigami: every final score that has and has not happened ---
+#
+# Built from `game_results`, which covers every NBA game since 1946-47, because
+# "this scoreline has never happened" is only honest against the full history.
+#
+# One real exclusion: a game where BOTH teams scored zero was never played
+# (Celtics-Pacers, 2013-04-16, cancelled after the Boston Marathon bombing).
+# The 19-18 from 1950 is NOT excluded - that is the genuine lowest-scoring game
+# in NBA history and belongs on the board.
+
+_SCORIGAMI_CACHE: Optional[Dict[str, Any]] = None
+_SCORIGAMI_CACHE_ROWS: int = -1
+
+# No score floor. An earlier cut at 55 looked tidier but silently dropped 130
+# real games - most of the pre-shot-clock era, and a 96-54 from the 1998 Finals.
+# Those are genuine scorelines and a board that hides them is lying about what
+# has happened. The sparse bottom-left is the shot clock's arrival, which is
+# worth seeing.
+
+
+@app.get("/api/stats/scorigami")
+def get_scorigami():
+    """
+    Every final scoreline in NBA history, with how often it has happened and
+    when it first did. Cells absent from `cells` have never happened.
+    """
+    global _SCORIGAMI_CACHE, _SCORIGAMI_CACHE_ROWS
+    conn = get_db_conn()
+    try:
+        rows_total = conn.execute("SELECT COUNT(*) FROM game_results").fetchone()[0]
+        if not rows_total:
+            raise HTTPException(
+                status_code=503,
+                detail="Final scores have not been backfilled yet. Run backfill_results.py.",
+            )
+        if _SCORIGAMI_CACHE is not None and _SCORIGAMI_CACHE_ROWS == rows_total:
+            return _SCORIGAMI_CACHE
+
+        games: Dict[str, Dict[str, Any]] = {}
+        for gid, pts, date, season in conn.execute(
+            "SELECT game_id, pts, game_date, season FROM game_results ORDER BY game_date"
+        ):
+            g = games.setdefault(gid, {"pts": [], "date": date, "season": season})
+            g["pts"].append(pts)
+
+        cells: Dict[tuple, Dict[str, Any]] = {}
+        counted = 0
+        excluded: List[Dict[str, Any]] = []
+
+        for gid, g in games.items():
+            if len(g["pts"]) != 2:
+                continue
+            w, l = max(g["pts"]), min(g["pts"])
+            if w == 0 and l == 0:
+                # Never played: Celtics-Pacers 2013-04-16, cancelled after the
+                # Boston Marathon bombing. A 0-0 cell would be a lie.
+                excluded.append({"game_id": gid, "date": g["date"], "reason": "game not played"})
+                continue
+            counted += 1
+            key = (w, l)
+            c = cells.get(key)
+            if c is None:
+                cells[key] = {
+                    "count": 1,
+                    "first_date": g["date"], "first_season": g["season"],
+                    "last_date": g["date"], "last_season": g["season"],
+                }
+            else:
+                c["count"] += 1
+                # Rows arrive in date order, so the last write is the latest.
+                c["last_date"], c["last_season"] = g["date"], g["season"]
+
+        if not cells:
+            raise HTTPException(status_code=503, detail="No usable final scores found.")
+
+        hi = max(w for w, _ in cells)
+        lo = min(l for _, l in cells)
+        # Only winner >= loser is reachable, so that triangle is the real board.
+        possible = sum(1 for w in range(lo, hi + 1) for l in range(lo, w + 1))
+
+        ordered = sorted(cells.items(), key=lambda kv: -kv[1]["count"])
+        top = ordered[0]
+        once = [k for k, v in cells.items() if v["count"] == 1]
+        newest = max(cells.items(), key=lambda kv: kv[1]["first_date"])
+        highest = max(cells.keys(), key=lambda k: k[0] + k[1])
+
+        _SCORIGAMI_CACHE = {
+            "games": counted,
+            "seasons": {
+                "first": conn.execute("SELECT MIN(season) FROM game_results").fetchone()[0],
+                "last": conn.execute("SELECT MAX(season) FROM game_results").fetchone()[0],
+            },
+            "range": {"lo": lo, "hi": hi},
+            "happened": len(cells),
+            "possible": possible,
+            "never": possible - len(cells),
+            # Compact: [winner, loser, count, first_date, last_date]. A dict per
+            # cell would triple the payload for 3,000+ entries.
+            "cells": [
+                [w, l, v["count"], v["first_date"], v["last_date"]]
+                for (w, l), v in cells.items()
+            ],
+            "records": {
+                "most_common": {"winner": top[0][0], "loser": top[0][1], "count": top[1]["count"]},
+                "once_only": len(once),
+                "newest": {
+                    "winner": newest[0][0], "loser": newest[0][1],
+                    "date": newest[1]["first_date"], "season": newest[1]["first_season"],
+                },
+                "highest_total": {"winner": highest[0], "loser": highest[1],
+                                  "total": highest[0] + highest[1]},
+            },
+            "lowest_total": {"winner": min(cells, key=lambda k: k[0] + k[1])[0],
+                             "loser": min(cells, key=lambda k: k[0] + k[1])[1]},
+            "excluded": excluded,
+        }
+        _SCORIGAMI_CACHE_ROWS = rows_total
+        return _SCORIGAMI_CACHE
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building scorigami: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Comeback probabilities from play-by-play ---
 #
 # "Down 15 entering the fourth, teams win 7.7% of the time (n=479)." Every cell

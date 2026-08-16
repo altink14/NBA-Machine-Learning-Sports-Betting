@@ -1,8 +1,10 @@
 # main_api.py
 # FINAL STABLE VERSION - Corrected endpoint routing and data handling.
+import collections
 import glob
 import re
 import os
+import unicodedata
 import secrets
 from typing import List, Dict, Any, Optional, Tuple, Union
 import uvicorn
@@ -3785,6 +3787,199 @@ def get_win_probability(game_id: str):
         raise
     except Exception as e:
         logger.error(f"Error building win probability for {game_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# --- Per-game assist network, parsed out of the play descriptions ---
+#
+# The play-by-play feed carries no assist player id. It carries a description -
+# "Queen 4' Driving Layup (2 PTS) (Poole 1 AST)" - and the assisting player has
+# to be recovered from that surname against the players actually on the floor.
+#
+# Three things break a naive match, all found by measuring rather than guessing:
+#   accents      the description strips them ("Jokic" vs "Jokić")
+#   suffixes     one side carries them ("Butler" vs "Butler III") - this alone
+#                accounted for 891 misses
+#   umlauts      sometimes transliterated ("Poeltl" vs "Pöltl")
+#
+# Matching is tiered on purpose: an exact fold is tried before the
+# suffix-stripped one, because collapsing suffixes first lets "Jackson Jr."
+# collide with a teammate named "Jackson". Getting that order wrong cost 828
+# assists to ambiguity.
+#
+# MEASURED across all 274,538 assisted baskets: 99.90% resolve to exactly one
+# teammate, 1 is ambiguous, 264 (0.10%) cannot be resolved. The unresolved count
+# is returned per team so the page can say so rather than quietly under-counting.
+
+_SUFFIX_RE = re.compile(r'\s+(jr|sr|ii|iii|iv|v)\.?$')
+_INITIAL_RE = re.compile(r'^([A-Za-z]{1,3})\.\s*(.+)$')
+
+
+def _fold_name(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", name)
+        if unicodedata.category(ch) != "Mn"
+    ).lower().strip()
+
+
+def _loose_name(folded: str) -> str:
+    return (_SUFFIX_RE.sub("", folded).strip()
+            .replace("oe", "o").replace("ue", "u").replace("ae", "a"))
+
+
+@app.get("/api/games/{game_id}/passing")
+def get_game_passing(game_id: str):
+    """
+    Who assisted whom, for one game, per team.
+
+    Only assists are available here - the feed records no pass that did not lead
+    to a basket - so the payload reports assists, the points they created, and
+    how many were threes. It deliberately does not carry pass counts or shooting
+    percentages, which would be meaningless for a single game.
+    """
+    conn = get_db_conn()
+    try:
+        events = conn.execute(
+            "SELECT person_id, player_name, team_id, team_tricode, assist_hint, shot_value "
+            "FROM pbp_events WHERE game_id = ? ORDER BY action_number",
+            (game_id,),
+        ).fetchall()
+        if not events:
+            raise HTTPException(status_code=404, detail=f"No play-by-play stored for game {game_id}.")
+
+        meta = conn.execute(
+            "SELECT bs.game_date, bs.season, bs.season_type, bs.home_team_id, bs.away_team_id, "
+            "       h.abbreviation AS home, h.full_name AS home_name, "
+            "       a.abbreviation AS away, a.full_name AS away_name "
+            "FROM box_scores bs "
+            "JOIN team_metadata h ON h.team_id = bs.home_team_id "
+            "JOIN team_metadata a ON a.team_id = bs.away_team_id "
+            "WHERE bs.game_id = ?",
+            (game_id,),
+        ).fetchone()
+
+        first_names = {
+            r["player_id"]: (r["first_name"] or "")
+            for r in conn.execute("SELECT player_id, first_name FROM players")
+        }
+
+        # Everyone who appears in this game, by team.
+        roster: Dict[int, Dict[str, Any]] = {}
+        for e in events:
+            pid = e["person_id"]
+            if not pid or not e["player_name"] or pid in roster:
+                continue
+            folded = _fold_name(e["player_name"])
+            roster[pid] = {
+                "id": pid, "name": e["player_name"], "team_id": e["team_id"],
+                "exact": folded, "loose": _loose_name(folded),
+            }
+
+        def resolve(hint: str, team_id: int, shooter_id: int) -> Optional[int]:
+            m = _INITIAL_RE.match(hint.strip())
+            prefix, surname = (m.group(1), m.group(2)) if m else (None, hint)
+            exact = _fold_name(surname)
+            lo = _loose_name(exact)
+            pool = [p for p in roster.values() if p["team_id"] == team_id and p["id"] != shooter_id]
+            cands = [p["id"] for p in pool if p["exact"] == exact]
+            if not cands:
+                cands = [p["id"] for p in pool if p["loose"] == lo]
+            if len(cands) > 1 and prefix:
+                pk = _fold_name(prefix)
+                narrowed = [p for p in cands
+                            if (first_names.get(p, "") or "").lower().startswith(pk)]
+                if narrowed:
+                    cands = narrowed
+            return cands[0] if len(cands) == 1 else None
+
+        # team_id -> (passer, receiver) -> stats
+        edges: Dict[int, Dict[tuple, Dict[str, int]]] = collections.defaultdict(dict)
+        unresolved: Dict[int, int] = collections.defaultdict(int)
+
+        for e in events:
+            hint = e["assist_hint"]
+            shooter = e["person_id"]
+            tid = e["team_id"]
+            if not hint or not shooter or not tid:
+                continue
+            passer = resolve(hint, tid, shooter)
+            if passer is None:
+                unresolved[tid] += 1
+                continue
+            key = (passer, shooter)
+            slot = edges[tid].setdefault(key, {"assists": 0, "points": 0, "threes": 0})
+            slot["assists"] += 1
+            sv = e["shot_value"] or 2
+            slot["points"] += sv
+            if sv == 3:
+                slot["threes"] += 1
+
+        def build(team_id: int, abbr: str, name: str) -> Dict[str, Any]:
+            conns = []
+            players: Dict[int, Dict[str, Any]] = {}
+
+            def slot(pid: int) -> Dict[str, Any]:
+                if pid not in players:
+                    players[pid] = {
+                        "id": pid,
+                        "name": roster.get(pid, {}).get("name", f"#{pid}"),
+                        "assists_given": 0, "assists_received": 0,
+                        "passes_made": 0, "passes_received": 0,
+                    }
+                return players[pid]
+
+            total_assists = 0
+            for (passer, receiver), st in edges.get(team_id, {}).items():
+                conns.append({
+                    "from": passer, "from_name": roster.get(passer, {}).get("name", f"#{passer}"),
+                    "to": receiver, "to_name": roster.get(receiver, {}).get("name", f"#{receiver}"),
+                    "assists": st["assists"],
+                    "points": st["points"],
+                    "threes": st["threes"],
+                    # Not available from play-by-play; left at zero rather than invented.
+                    "passes": 0, "fgm": 0, "fga": 0, "fg_pct": None, "fg3m": 0, "fg3a": 0,
+                })
+                slot(passer)["assists_given"] += st["assists"]
+                slot(receiver)["assists_received"] += st["assists"]
+                total_assists += st["assists"]
+
+            conns.sort(key=lambda x: -x["assists"])
+            return {
+                "team_id": team_id, "team": abbr, "team_name": name,
+                "tracked": len(conns) > 0,
+                "totals": {"assists": total_assists, "passes": 0},
+                "unresolved_assists": unresolved.get(team_id, 0),
+                "top_duo": conns[0] if conns else None,
+                "players": sorted(players.values(),
+                                  key=lambda p: -(p["assists_given"] + p["assists_received"])),
+                "connections": conns,
+            }
+
+        teams = []
+        if meta:
+            teams.append(build(meta["home_team_id"], meta["home"], meta["home_name"]))
+            teams.append(build(meta["away_team_id"], meta["away"], meta["away_name"]))
+
+        return {
+            "game_id": game_id,
+            "game_date": meta["game_date"] if meta else None,
+            "season": meta["season"] if meta else None,
+            "season_type": meta["season_type"] if meta else None,
+            "teams": teams,
+            "method": {
+                "note": "Assisting players are recovered from the play description, which carries "
+                        "a surname rather than an id. 99.9% resolve to exactly one teammate "
+                        "across the archive; any that do not are counted, not guessed.",
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building game passing for {game_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()

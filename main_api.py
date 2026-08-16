@@ -5312,6 +5312,180 @@ def get_season_info(year: str):
     """
     return get_stats_standings(season=year)
 
+# --- Key numbers -------------------------------------------------------------
+# The historical odds archive stores one table per season. Two quirks, both
+# established by checking the data rather than by assumption:
+#
+# 1. `Spread` is signed (positive = home favoured) only in 2022-23 and 2023-24.
+#    Every earlier season stores the FAVOURITE'S MAGNITUDE, unsigned, so the
+#    column alone cannot say who was favoured - taken at face value it puts home
+#    ATS at 42.7%, about six points below where it belongs. The sign is
+#    recovered from the moneyline: whichever side is shorter was favoured. On the
+#    two seasons that do carry a sign, that rule reproduces it for 99.56% of
+#    games (11 disagreements in 2,510, every one a pick'em with equal or nearly
+#    equal moneylines) and the magnitude matches exactly. Recovered, home ATS
+#    across the archive is 48.60%, which is where NBA home ATS actually sits.
+# 2. A handful of rows are unplayed games (Points = 0) or carry a zero margin,
+#    which the NBA cannot produce. Both are excluded and counted, never silently
+#    dropped - the caller reports the exclusions.
+KEY_NUMBERS_SIGNED_SEASONS = frozenset({"2022-23", "2023-24"})
+
+
+def _load_key_number_games(conn) -> tuple:
+    """Every archived game with a margin, plus the exclusions made getting there."""
+    tables = [
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'odds_%_new' "
+            "ORDER BY name"
+        )
+    ]
+    games: List[Dict[str, Any]] = []
+    excluded = {"unplayed": 0, "zero_margin": 0, "missing_fields": 0}
+
+    for table in tables:
+        season = table.replace("odds_", "").replace("_new", "")
+        rows = conn.execute(
+            f'SELECT Date, Home, Away, OU, Spread, ML_Home, ML_Away, Points, Win_Margin '
+            f'FROM "{table}"'
+        ).fetchall()
+        for r in rows:
+            try:
+                margin = float(r["Win_Margin"])
+                points = float(r["Points"])
+                spread = float(r["Spread"])
+                ml_home = float(r["ML_Home"])
+                ml_away = float(r["ML_Away"])
+            except (TypeError, ValueError):
+                excluded["missing_fields"] += 1
+                continue
+            if points <= 0:
+                excluded["unplayed"] += 1
+                continue
+            if margin == 0:
+                excluded["zero_margin"] += 1
+                continue
+
+            if season in KEY_NUMBERS_SIGNED_SEASONS:
+                spread_signed = spread
+            else:
+                spread_signed = abs(spread) if ml_home < ml_away else -abs(spread)
+
+            games.append({
+                "season": season,
+                "date": r["Date"],
+                "home": r["Home"],
+                "away": r["Away"],
+                "margin": margin,
+                "abs_margin": abs(margin),
+                "spread": spread_signed,
+                "total_line": float(r["OU"]) if r["OU"] is not None else None,
+                "points": points,
+            })
+    return games, excluded
+
+
+@app.get("/api/stats/key-numbers")
+def get_key_numbers(season_from: Optional[str] = None, season_to: Optional[str] = None):
+    """
+    How NBA games actually finish, and therefore what a half-point is worth.
+
+    The betting folklore about buying half-points comes from the NFL, where the
+    margin distribution spikes hard at 3 and 7. Basketball has no such spikes,
+    and this endpoint exists to show that rather than assert it: the margin
+    histogram, the share of games landing on each number, and the observed push
+    rate at each integer spread - each with its own n.
+    """
+    conn = _odds_snapshot_conn()
+    try:
+        games, excluded = _load_key_number_games(conn)
+        if not games:
+            raise HTTPException(status_code=503, detail="Historical odds archive is unavailable.")
+
+        seasons = sorted({g["season"] for g in games})
+        if season_from:
+            games = [g for g in games if g["season"] >= season_from]
+        if season_to:
+            games = [g for g in games if g["season"] <= season_to]
+        if not games:
+            return {
+                "seasons_available": seasons, "season_from": season_from,
+                "season_to": season_to, "games": 0, "margins": [],
+                "pushes": [], "excluded": excluded,
+            }
+
+        total = len(games)
+
+        # Margin histogram. Every entry carries the share of games decided by
+        # exactly that many points - which IS the value of moving a line through
+        # that number, since those are precisely the games whose result flips.
+        counts: Dict[int, int] = {}
+        for g in games:
+            counts[int(g["abs_margin"])] = counts.get(int(g["abs_margin"]), 0) + 1
+        margins = [
+            {
+                "margin": m,
+                "games": counts[m],
+                "pct": round(counts[m] / total * 100, 3),
+            }
+            for m in sorted(counts)
+        ]
+
+        # Observed push rate at each integer spread. A push needs an integer
+        # line, so half-point spreads are excluded from this table only.
+        # A pick'em cannot push in a sport with no ties, so it is not a line the
+        # half-point question applies to.
+        integer_spread = [
+            g for g in games if float(g["spread"]).is_integer() and abs(g["spread"]) >= 1
+        ]
+        push_by_line: Dict[int, Dict[str, int]] = {}
+        for g in integer_spread:
+            k = int(abs(g["spread"]))
+            acc = push_by_line.setdefault(k, {"games": 0, "pushes": 0})
+            acc["games"] += 1
+            if g["margin"] == g["spread"]:
+                acc["pushes"] += 1
+        pushes = [
+            {
+                "line": k,
+                "games": v["games"],
+                "pushes": v["pushes"],
+                "push_pct": round(v["pushes"] / v["games"] * 100, 3) if v["games"] else None,
+            }
+            for k, v in sorted(push_by_line.items())
+        ]
+
+        home_wins = sum(1 for g in games if g["margin"] > 0)
+        covers = sum(1 for g in games if g["margin"] > g["spread"])
+        push_count = sum(1 for g in games if g["margin"] == g["spread"])
+
+        return {
+            "seasons_available": seasons,
+            "season_from": season_from or seasons[0],
+            "season_to": season_to or seasons[-1],
+            "games": total,
+            "margins": margins,
+            "pushes": pushes,
+            "integer_spread_games": len(integer_spread),
+            "summary": {
+                "mean_margin": round(sum(g["abs_margin"] for g in games) / total, 2),
+                "median_margin": sorted(g["abs_margin"] for g in games)[total // 2],
+                "home_win_pct": round(home_wins / total * 100, 2),
+                "home_ats_pct": round(covers / total * 100, 2),
+                "push_pct": round(push_count / total * 100, 2),
+                "most_common_margin": max(margins, key=lambda m: m["games"])["margin"],
+            },
+            "excluded": excluded,
+            "spread_sign_recovered_for": [s for s in seasons if s not in KEY_NUMBERS_SIGNED_SEASONS],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/stats/key-numbers: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute key numbers.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/health/data")
 def get_data_health():
     """

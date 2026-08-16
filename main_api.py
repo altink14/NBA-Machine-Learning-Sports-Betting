@@ -2590,8 +2590,14 @@ def get_player_stats(request: Request, season: str = "2025-26", per_mode: str = 
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+            # Join the name in. player_season_stats carries a player_name column
+            # that is never populated, so this endpoint had been returning rows
+            # of numbers with no way to tell whose they were.
             cursor.execute(
-                "SELECT * FROM player_season_stats WHERE season = ? AND season_type = 'Regular Season'",
+                "SELECT s.*, p.full_name AS joined_name "
+                "FROM player_season_stats s "
+                "LEFT JOIN players p ON p.player_id = s.player_id "
+                "WHERE s.season = ? AND s.season_type = 'Regular Season'",
                 (season,)
             )
             rows = cursor.fetchall()
@@ -2602,6 +2608,9 @@ def get_player_stats(request: Request, season: str = "2025-26", per_mode: str = 
                     rec = dict(r)
                     rec.pop("id", None)
                     rec.pop("fetched_at", None)
+                    joined = rec.pop("joined_name", None)
+                    if joined and not rec.get("player_name"):
+                        rec["player_name"] = joined
                     results.append(rec)
                 conn.close()
                 player_stats_cache[cache_key] = (results, now)

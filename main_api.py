@@ -5674,6 +5674,77 @@ def get_league_schedule(
     }
 
 
+@app.get("/api/hall-of-fame")
+def get_hall_of_fame(category: Optional[str] = None, year: Optional[int] = None, q: Optional[str] = None):
+    """
+    Naismith Hall of Fame inductees, grouped by enshrinement class.
+
+    Ingested from the Hall's own site by ingest_hall_of_fame.py - there is no API
+    for this. Every row carries where it came from and when it was fetched, so a
+    stale table is visible rather than assumed current.
+
+    The Hall enshrines players, coaches, referees, contributors and whole teams.
+    All of them are here, because narrowing to players would quietly redefine
+    what the Hall of Fame is.
+    """
+    conn = get_db_conn()
+    try:
+        try:
+            rows = conn.execute("SELECT * FROM hof_inductees").fetchall()
+        except sqlite3.Error:
+            raise HTTPException(
+                status_code=503,
+                detail="Hall of Fame table not built yet - run ingest_hall_of_fame.py.",
+            )
+        if not rows:
+            raise HTTPException(status_code=503, detail="Hall of Fame table is empty.")
+
+        people = [dict(r) for r in rows]
+        categories = sorted({p["category"] for p in people if p["category"]})
+        years = sorted({p["class_year"] for p in people if p["class_year"]}, reverse=True)
+        fetched = max((p.get("fetched_at") or "" for p in people), default="")
+
+        sel = people
+        if category:
+            sel = [p for p in sel if (p.get("category") or "").lower() == category.lower()]
+        if year:
+            sel = [p for p in sel if p.get("class_year") == year]
+        if q:
+            needle = q.lower()
+            sel = [p for p in sel if needle in (p.get("name") or "").lower()]
+
+        classes: Dict[int, List[Dict[str, Any]]] = {}
+        for p in sel:
+            classes.setdefault(p.get("class_year") or 0, []).append(p)
+        for members in classes.values():
+            members.sort(key=lambda p: p.get("sort_name") or "")
+
+        return {
+            "total": len(people),
+            "shown": len(sel),
+            "source_url": people[0].get("source_url"),
+            "fetched_at": fetched,
+            "options": {
+                "categories": [
+                    {"name": c, "count": sum(1 for p in people if p["category"] == c)}
+                    for c in categories
+                ],
+                "years": years,
+            },
+            "classes": [
+                {"year": y, "members": classes[y]}
+                for y in sorted(classes.keys(), reverse=True)
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/hall-of-fame: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not read the Hall of Fame table.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/cup")
 def get_nba_cup(season: str = "2026-27"):
     """

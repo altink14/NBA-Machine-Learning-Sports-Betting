@@ -5745,6 +5745,108 @@ def get_hall_of_fame(category: Optional[str] = None, year: Optional[int] = None,
         conn.close()
 
 
+@app.get("/api/hall-of-fame/careers")
+def get_hof_careers(sort: str = "pts"):
+    """
+    What a Hall of Fame NBA career actually looks like, in numbers.
+
+    Built from the career totals of the inducted players who played in the NBA.
+    The point is descriptive, not predictive: it shows the range the Hall has
+    actually accepted, including how low the bottom of that range goes, rather
+    than asserting a threshold nobody at the Hall has ever published.
+
+    Three honesty constraints are baked into the response:
+      - `nba_players` vs `inducted_players` makes clear this covers a subset. The
+        Naismith Hall enshrines WNBA players, Globetrotters and international
+        figures with no NBA career, and they are counted but not measured.
+      - Percentiles are reported alongside the min, because the interesting fact
+        about the Hall is its floor, and a median alone hides it.
+      - Counting stats reward longevity and era. The response carries era spans
+        so a caller can show that a 1950s career is not comparable to a modern one.
+    """
+    conn = get_db_conn()
+    try:
+        try:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM hof_career_totals").fetchall()]
+        except sqlite3.Error:
+            raise HTTPException(
+                status_code=503,
+                detail="Career table not built yet - run ingest_hof_careers.py.",
+            )
+        if not rows:
+            raise HTTPException(status_code=503, detail="No Hall of Fame career totals stored.")
+
+        inducted = conn.execute(
+            "SELECT COUNT(*) c FROM hof_inductees WHERE category = 'Player'"
+        ).fetchone()["c"]
+
+        # Some inductees played most of their career in the ABA or the BAA and
+        # only a handful of NBA games - Mel Daniels is in the Hall on an ABA
+        # career and has 11 NBA games to his name. Their NBA totals are real but
+        # they describe a fragment, so they are listed and flagged while being
+        # kept out of the distribution: left in, they would set a "lowest Hall of
+        # Famer" mark that is an artefact of which league the stats come from.
+        PARTIAL_CAREER_GP = 200
+        for r in rows:
+            r["partial_nba_career"] = (r.get("gp") or 0) < PARTIAL_CAREER_GP
+        full = [r for r in rows if not r["partial_nba_career"]]
+        partial = [r for r in rows if r["partial_nba_career"]]
+
+        def stat_summary(key: str) -> Dict[str, Any]:
+            rows_for_stat = full
+            vals = sorted(r[key] for r in rows_for_stat if r.get(key) is not None)
+            if not vals:
+                return {}
+            n = len(vals)
+
+            def q(p: float):
+                return vals[min(n - 1, int(p * n))]
+
+            lowest = min(rows_for_stat, key=lambda r: r.get(key) if r.get(key) is not None else 10**9)
+            highest = max(rows_for_stat, key=lambda r: r.get(key) if r.get(key) is not None else -1)
+            return {
+                "stat": key,
+                "n": n,
+                "min": vals[0],
+                "p10": q(0.10),
+                "median": q(0.50),
+                "p90": q(0.90),
+                "max": vals[-1],
+                "lowest_holder": lowest["name"],
+                "highest_holder": highest["name"],
+            }
+
+        players = sorted(
+            rows,
+            key=lambda r: (r.get(sort) if r.get(sort) is not None else -1),
+            reverse=True,
+        )
+        eras = [r["from_year"] for r in rows if r.get("from_year")]
+
+        return {
+            "nba_players": len(rows),
+            "measured_players": len(full),
+            "partial_career_players": len(partial),
+            "partial_career_names": sorted(r["name"] for r in partial),
+            "partial_career_gp_threshold": PARTIAL_CAREER_GP,
+            "inducted_players": inducted,
+            "never_played_nba": inducted - len(rows),
+            "era": {"earliest_debut": min(eras) if eras else None,
+                    "latest_debut": max(eras) if eras else None},
+            "summaries": [stat_summary(k) for k in ("pts", "reb", "ast", "gp", "seasons", "ppg")],
+            "players": players,
+            "sorted_by": sort,
+            "fetched_at": max((r.get("fetched_at") or "" for r in rows), default=""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/hall-of-fame/careers: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not read Hall of Fame careers.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/cup")
 def get_nba_cup(season: str = "2026-27"):
     """

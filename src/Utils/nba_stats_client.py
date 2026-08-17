@@ -279,10 +279,12 @@ class NBAStatsClient:
     def player_career_stats(
         self, player_id: int, per_mode: str = "PerGame"
     ) -> Dict[str, List[Dict]]:
+        # nba_api's parameter is per_mode36, not per_mode_36. With the underscore
+        # this raised TypeError on every call - the method had no callers, so it
+        # had never been exercised.
         params = {
             "player_id": player_id,
-            "per_mode_36": per_mode,
-            "league_id": "00",
+            "per_mode36": per_mode,
         }
         raw = self._fetch("playercareerstats", playercareerstats.PlayerCareerStats, params, ttl=_LIVE_TTL_SECONDS)
         return self._parse_all_result_sets(raw)

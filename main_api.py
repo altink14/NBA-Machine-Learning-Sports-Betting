@@ -2161,18 +2161,31 @@ def get_draft_class(year: int):
     conn = get_db_conn()
     try:
         _ensure_draft_history(conn)
+        # position / height / weight / country come from player_bio, filled for
+        # recent classes by ingest_draft_bios.py. They are LEFT JOINed so an
+        # unfilled class still returns its picks rather than nothing - a board
+        # missing a weight column is fine, a board missing its picks is not.
         rows = conn.execute(
             """
             SELECT d.*,
-                   CASE WHEN p.player_id IS NOT NULL THEN 1 ELSE 0 END AS in_database
+                   CASE WHEN p.player_id IS NOT NULL THEN 1 ELSE 0 END AS in_database,
+                   b.position, b.height, b.weight, b.country
             FROM draft_history d
             LEFT JOIN players p ON p.player_id = d.person_id
+            LEFT JOIN player_bio b ON b.player_id = d.person_id
             WHERE d.season = ?
             ORDER BY d.overall_pick ASC
             """,
             (year,),
         ).fetchall()
-        return {"year": year, "count": len(rows), "picks": [dict(r) for r in rows]}
+        picks = [dict(r) for r in rows]
+        return {
+            "year": year,
+            "count": len(picks),
+            "rounds": sorted({p["round_number"] for p in picks if p.get("round_number")}),
+            "bios_available": sum(1 for p in picks if p.get("height")),
+            "picks": picks,
+        }
     except Exception as e:
         logger.error(f"Error fetching draft class {year}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

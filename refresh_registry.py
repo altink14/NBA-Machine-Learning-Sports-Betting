@@ -126,6 +126,25 @@ def _player_directory() -> str:
     return f"{total} players, {active or 0} active"
 
 
+def _draft_bios() -> str:
+    """Position, height, weight and country for recent draft classes, which the
+    draft board shows alongside each pick. Only players missing a bio are
+    fetched, so this costs nothing once a class is filled - and it keeps trying
+    the handful whose bio the league has not published yet."""
+    from ingest_draft_bios import main as run
+    if run() != 0:
+        raise RuntimeError("ingest_draft_bios reported failure")
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        filled = conn.execute(
+            "SELECT COUNT(*) FROM draft_history d JOIN player_bio b "
+            "ON b.player_id = d.person_id WHERE d.season = (SELECT MAX(season) FROM draft_history)"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return f"{filled} bios in the newest class"
+
+
 # Cadences are set by how fast the underlying truth moves, not by habit.
 # The Hall inducts once a year; weekly means a new class appears within days
 # without hammering a site that changes eleven times a decade.
@@ -134,6 +153,7 @@ JOBS: List[Job] = [
     Job("hof_careers", 7, _hof_careers, "Career totals for any newly inducted players"),
     Job("player_directory", 1, _player_directory, "Roster status moves daily; new players arrive mid-season"),
     Job("draft_history", 7, _draft_history, "New draft class each June, plus late pick corrections"),
+    Job("draft_bios", 7, _draft_bios, "Bios for the newest picks appear over the weeks after the draft"),
 ]
 
 

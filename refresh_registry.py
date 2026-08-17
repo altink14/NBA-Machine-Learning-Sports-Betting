@@ -87,12 +87,31 @@ def _hof_careers() -> str:
     return f"{n} careers"
 
 
+def _draft_history() -> str:
+    """Draft classes. A one-time helper in main_api populated this and then
+    returned early forever, so the 2026 class never appeared - the table sat on
+    2025 while the league had all 60 picks. Re-checking the recent classes
+    weekly costs two requests and closes that hole for good."""
+    from ingest_draft import main as run
+    if run() != 0:
+        raise RuntimeError("ingest_draft reported failure")
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        n, newest = conn.execute(
+            "SELECT COUNT(*), MAX(season) FROM draft_history"
+        ).fetchone()
+    finally:
+        conn.close()
+    return f"{n} picks, newest {newest}"
+
+
 # Cadences are set by how fast the underlying truth moves, not by habit.
 # The Hall inducts once a year; weekly means a new class appears within days
 # without hammering a site that changes eleven times a decade.
 JOBS: List[Job] = [
     Job("hall_of_fame", 7, _hall_of_fame, "New class enshrined each September"),
     Job("hof_careers", 7, _hof_careers, "Career totals for any newly inducted players"),
+    Job("draft_history", 7, _draft_history, "New draft class each June, plus late pick corrections"),
 ]
 
 
@@ -144,7 +163,16 @@ def run_due(force: Optional[str] = None) -> bool:
 
             logger.info("%s: running - %s", job.name, job.why)
             try:
-                detail = job.run()
+                # The ingests are also standalone scripts and parse sys.argv in
+                # main(). Called from here they would inherit ours and argparse
+                # would reject the job name, so argv is neutralised for the call
+                # - centrally, because every job added later has the same trap.
+                saved_argv = sys.argv
+                sys.argv = [job.name]
+                try:
+                    detail = job.run()
+                finally:
+                    sys.argv = saved_argv
                 conn.execute(
                     """
                     INSERT INTO ingest_runs (name, last_run_at, last_status, last_detail,

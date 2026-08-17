@@ -2169,7 +2169,8 @@ def get_draft_class(year: int):
             """
             SELECT d.*,
                    CASE WHEN p.player_id IS NOT NULL THEN 1 ELSE 0 END AS in_database,
-                   b.position, b.height, b.weight, b.country
+                   b.position, b.height, b.weight, b.country,
+                   b.team_abbr AS current_team
             FROM draft_history d
             LEFT JOIN players p ON p.player_id = d.person_id
             LEFT JOIN player_bio b ON b.player_id = d.person_id
@@ -2179,6 +2180,16 @@ def get_draft_class(year: int):
             (year,),
         ).fetchall()
         picks = [dict(r) for r in rows]
+
+        # Where a pick ended up. No feed maps a draft-night trade to the pick it
+        # moved, but the player's current team is on record, and a current team
+        # that differs from the drafting team IS the move - 26 of the 2026 class.
+        # Called "moved_to" rather than "traded_to" because a later trade or a
+        # waiver-and-signing produces the same difference, and the endpoint should
+        # not claim to know which happened.
+        for p in picks:
+            cur = p.get("current_team")
+            p["moved_to"] = cur if cur and cur != p.get("team_abbreviation") else None
         return {
             "year": year,
             "count": len(picks),

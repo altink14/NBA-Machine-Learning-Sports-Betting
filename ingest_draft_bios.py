@@ -54,6 +54,40 @@ def _int(v):
         return None
 
 
+def _combine_measurements(season: int) -> dict:
+    """Height and weight from the draft combine, keyed by player id.
+
+    A second source because commonplayerinfo leaves measurements blank for some
+    players - Bryce Hopkins was drafted 49th in 2026 with no height or weight on
+    his bio - and because the combine is published BEFORE bios exist, which is
+    exactly the window each June when a new class lands and the board is busiest.
+    """
+    from nba_api.stats.endpoints import draftcombineplayeranthro
+
+    try:
+        d = draftcombineplayeranthro.DraftCombinePlayerAnthro(
+            season_year=str(season), timeout=60
+        ).get_dict()
+    except Exception as exc:
+        logger.warning("Combine measurements unavailable for %s: %s", season, exc)
+        return {}
+    rs = d["resultSets"][0]
+    idx = {h: i for i, h in enumerate(rs["headers"])}
+    out = {}
+    for r in rs["rowSet"]:
+        pid = r[idx["PLAYER_ID"]]
+        if pid is None:
+            continue
+        weight = r[idx["WEIGHT"]] if "WEIGHT" in idx else None
+        height = r[idx.get("HEIGHT_W_SHOES_FT_IN", -1)] if "HEIGHT_W_SHOES_FT_IN" in idx else None
+        out[int(pid)] = {
+            # Combine weights carry a decimal ("218.80"); the board shows pounds.
+            "weight": str(round(float(weight))) if weight else None,
+            "height": height or None,
+        }
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seasons", type=int, default=2,
@@ -77,17 +111,27 @@ def main() -> int:
         placeholders = ",".join("?" * len(seasons))
         missing = conn.execute(
             f"""
-            SELECT d.person_id, d.player_name
+            SELECT d.person_id, d.player_name, d.season
             FROM draft_history d
             LEFT JOIN player_bio b ON b.player_id = d.person_id
-            WHERE d.season IN ({placeholders}) AND b.player_id IS NULL
+            WHERE d.season IN ({placeholders})
+              AND (b.player_id IS NULL
+                   OR b.height IS NULL OR b.height = ''
+                   OR b.weight IS NULL OR b.weight = '')
             ORDER BY d.season DESC, d.overall_pick ASC
             """,
             seasons,
         ).fetchall()
-        logger.info("%d picks need a bio.", len(missing))
+        logger.info("%d picks need a bio or measurements.", len(missing))
         if not missing:
             return 0
+
+        # Combine data is fetched once per season, not per player.
+        combine = {}
+        for season in {row["season"] for row in missing}:
+            combine.update(_combine_measurements(season))
+        if combine:
+            logger.info("Combine measurements on hand for %d players.", len(combine))
 
         now = datetime.now(timezone.utc).isoformat()
         written = failed = 0
@@ -106,6 +150,11 @@ def main() -> int:
                 failed += 1
                 continue
 
+            # Whichever measurement the bio leaves blank, take the combine's.
+            fallback = combine.get(pid, {})
+            height = info.get("HEIGHT") or fallback.get("height")
+            weight = info.get("WEIGHT") or fallback.get("weight")
+
             conn.execute(
                 """
                 INSERT INTO player_bio (
@@ -115,8 +164,10 @@ def main() -> int:
                     is_active, fetched_at
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(player_id) DO UPDATE SET
-                    position=excluded.position, height=excluded.height,
-                    weight=excluded.weight, country=excluded.country,
+                    position=excluded.position,
+                    height=COALESCE(NULLIF(excluded.height, ''), player_bio.height),
+                    weight=COALESCE(NULLIF(excluded.weight, ''), player_bio.weight),
+                    country=excluded.country,
                     school=excluded.school, fetched_at=excluded.fetched_at
                 """,
                 (
@@ -128,8 +179,8 @@ def main() -> int:
                     info.get("TEAM_ABBREVIATION"),
                     info.get("JERSEY"),
                     info.get("POSITION"),
-                    info.get("HEIGHT"),
-                    info.get("WEIGHT"),
+                    height,
+                    weight,
                     info.get("BIRTHDATE"),
                     info.get("COUNTRY"),
                     info.get("SCHOOL"),

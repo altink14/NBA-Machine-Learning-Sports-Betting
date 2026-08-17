@@ -12,6 +12,8 @@ morning (e.g. 9 AM via Windows Task Scheduler):
 5. Grades yesterday's logged predictions against final scores.
 6. Runs today's predictions and logs them PRE-GAME to predictions_log, which is
    the evidence behind the public track record.
+7. Re-runs any periodic ingest that has come due (refresh_registry.py) - the
+   datasets with no live feed, like the Hall of Fame register.
 
 Step 6 used to be an HTTP ping at localhost:8000, on the assumption that the API
 was running. It is a dev server that nobody starts, so the ping was refused every
@@ -134,6 +136,21 @@ def log_todays_predictions() -> str:
     return "logged"
 
 
+def refresh_periodic_ingests() -> bool:
+    """Re-run any dataset that is not read live from a feed and has come due.
+
+    Registered in refresh_registry.py. Nothing here needs to be remembered or
+    run by hand - a job that has not run for its interval runs itself, and a job
+    that failed retries the next morning instead of waiting out its interval.
+    """
+    try:
+        from refresh_registry import run_due
+        return run_due()
+    except Exception as exc:
+        logger.error("Periodic refresh failed: %s", exc, exc_info=True)
+        return False
+
+
 def _nba_games_expected(today: Optional[date] = None) -> bool:
     """Whether the NBA is in season today (October-June).
 
@@ -161,6 +178,7 @@ def main() -> int:
     stats_ok = refresh_team_stats_snapshot()
     grade_logged_predictions()
     prediction_status = log_todays_predictions()
+    ingests_ok = refresh_periodic_ingests()
 
     failures = []
     if not backfill_ok:
@@ -169,6 +187,8 @@ def main() -> int:
         failures.append("team-stats refresh")
     if prediction_status == "failed":
         failures.append("prediction logging")
+    if not ingests_ok:
+        failures.append("periodic ingests")
 
     if failures:
         logger.error("=== Daily update finished WITH ERRORS: %s ===", ", ".join(failures))

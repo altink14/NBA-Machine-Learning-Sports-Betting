@@ -105,12 +105,35 @@ def _draft_history() -> str:
     return f"{n} picks, newest {newest}"
 
 
+def _roster_status() -> str:
+    """Whether each player in the directory is currently on a roster.
+
+    players.is_active was hardcoded to 1 by the box-score pipeline, so all 891
+    rows read Active and the directory badge was decoration. This writes the
+    league's own ROSTERSTATUS back over it. Daily rather than weekly because
+    roster status moves constantly during the season - and because the league's
+    flag itself lags a retirement announcement by days, so checking often is the
+    only way to track it closely."""
+    from ingest_roster_status import main as run
+    if run() != 0:
+        raise RuntimeError("ingest_roster_status reported failure")
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        active, total = conn.execute(
+            "SELECT SUM(is_active), COUNT(*) FROM players"
+        ).fetchone()
+    finally:
+        conn.close()
+    return f"{active or 0} of {total} active"
+
+
 # Cadences are set by how fast the underlying truth moves, not by habit.
 # The Hall inducts once a year; weekly means a new class appears within days
 # without hammering a site that changes eleven times a decade.
 JOBS: List[Job] = [
     Job("hall_of_fame", 7, _hall_of_fame, "New class enshrined each September"),
     Job("hof_careers", 7, _hof_careers, "Career totals for any newly inducted players"),
+    Job("roster_status", 1, _roster_status, "Signings and retirements move roster status daily"),
     Job("draft_history", 7, _draft_history, "New draft class each June, plus late pick corrections"),
 ]
 

@@ -2061,6 +2061,97 @@ def get_draft_years():
         conn.close()
 
 
+# NOTE: this route must stay ABOVE /api/draft/{year}. FastAPI matches in
+# definition order, and "pipeline" cannot be parsed as an int - below it, this
+# path would 422 instead of resolving.
+@app.get("/api/draft/pipeline")
+def get_draft_pipeline(since: int = 2000, limit: int = 40):
+    """
+    Where drafted players actually come from: programs ranked by picks produced.
+
+    This is the honest version of a "prospects" page. Pre-draft rankings are
+    scouting opinion and no feed we can reach publishes them, but which programs
+    have actually produced NBA picks is a matter of record - 8,434 of them.
+
+    Volume and quality are reported separately on purpose. A program can send
+    plenty of players to the league without sending high ones, and one number
+    covering both would hide the more interesting half.
+    """
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT organization AS org,
+                   organization_type AS org_type,
+                   COUNT(*) AS picks,
+                   SUM(CASE WHEN overall_pick <= 14 THEN 1 ELSE 0 END) AS lottery,
+                   SUM(CASE WHEN round_number = 1 THEN 1 ELSE 0 END) AS first_round,
+                   MIN(overall_pick) AS best_pick,
+                   MIN(season) AS first_season,
+                   MAX(season) AS last_season
+            FROM draft_history
+            WHERE season >= ? AND organization IS NOT NULL AND organization != ''
+            GROUP BY organization, organization_type
+            ORDER BY picks DESC, lottery DESC
+            LIMIT ?
+            """,
+            (since, limit),
+        ).fetchall()
+
+        programs = []
+        for r in rows:
+            d = dict(r)
+            picks = d["picks"] or 0
+            d["lottery_rate"] = round((d["lottery"] or 0) / picks * 100, 1) if picks else None
+            # Who the program's highest pick actually was, since "best pick 1" is
+            # a number until it has a name attached.
+            top = conn.execute(
+                """
+                SELECT player_name, season, overall_pick, team_abbreviation
+                FROM draft_history
+                WHERE organization = ? AND season >= ? AND overall_pick = ?
+                ORDER BY season DESC LIMIT 1
+                """,
+                (d["org"], since, d["best_pick"]),
+            ).fetchone()
+            d["best_player"] = dict(top) if top else None
+            programs.append(d)
+
+        totals = conn.execute(
+            """
+            SELECT COUNT(*) AS picks,
+                   COUNT(DISTINCT organization) AS orgs,
+                   MIN(season) AS first_season,
+                   MAX(season) AS last_season
+            FROM draft_history WHERE season >= ?
+            """,
+            (since,),
+        ).fetchone()
+
+        by_type = [
+            dict(r) for r in conn.execute(
+                """
+                SELECT organization_type AS org_type, COUNT(*) AS picks
+                FROM draft_history WHERE season >= ?
+                GROUP BY organization_type ORDER BY picks DESC
+                """,
+                (since,),
+            ).fetchall()
+        ]
+
+        return {
+            "since": since,
+            "totals": dict(totals) if totals else {},
+            "by_type": by_type,
+            "programs": programs,
+        }
+    except Exception as e:
+        logger.error(f"Error in /api/draft/pipeline: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute the draft pipeline.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/draft/{year}")
 def get_draft_class(year: int):
     """

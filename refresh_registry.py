@@ -105,26 +105,25 @@ def _draft_history() -> str:
     return f"{n} picks, newest {newest}"
 
 
-def _roster_status() -> str:
-    """Whether each player in the directory is currently on a roster.
+def _player_directory() -> str:
+    """Every player in league history, with roster status and career span.
 
-    players.is_active was hardcoded to 1 by the box-score pipeline, so all 891
-    rows read Active and the directory badge was decoration. This writes the
-    league's own ROSTERSTATUS back over it. Daily rather than weekly because
-    roster status moves constantly during the season - and because the league's
-    flag itself lags a retirement announcement by days, so checking often is the
-    only way to track it closely."""
-    from ingest_roster_status import main as run
+    Supersedes the roster-status job: same upstream request, and the directory was
+    the bigger problem. It used to hold only players from our ingested box scores,
+    so the player encyclopedia could not find Michael Jordan. Daily because roster
+    status moves constantly in season, and because the league's own flag lags a
+    retirement announcement by days."""
+    from ingest_players import main as run
     if run() != 0:
-        raise RuntimeError("ingest_roster_status reported failure")
+        raise RuntimeError("ingest_players reported failure")
     conn = sqlite3.connect(DB_PATH)
     try:
-        active, total = conn.execute(
-            "SELECT SUM(is_active), COUNT(*) FROM players"
+        total, active = conn.execute(
+            "SELECT COUNT(*), SUM(is_active) FROM players"
         ).fetchone()
     finally:
         conn.close()
-    return f"{active or 0} of {total} active"
+    return f"{total} players, {active or 0} active"
 
 
 # Cadences are set by how fast the underlying truth moves, not by habit.
@@ -133,7 +132,7 @@ def _roster_status() -> str:
 JOBS: List[Job] = [
     Job("hall_of_fame", 7, _hall_of_fame, "New class enshrined each September"),
     Job("hof_careers", 7, _hof_careers, "Career totals for any newly inducted players"),
-    Job("roster_status", 1, _roster_status, "Signings and retirements move roster status daily"),
+    Job("player_directory", 1, _player_directory, "Roster status moves daily; new players arrive mid-season"),
     Job("draft_history", 7, _draft_history, "New draft class each June, plus late pick corrections"),
 ]
 

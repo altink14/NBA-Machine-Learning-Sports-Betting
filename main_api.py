@@ -3058,9 +3058,40 @@ def search_players(q: str):
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
+        # The directory covers all of league history now, so ordering decides
+        # whether this is useful. Surname matches outrank forename matches: a
+        # search for "jordan" means Michael and DeAndre before Jordan Clarkson,
+        # and "james" means LeBron before James Harden. Sorting active-first
+        # alone buried every retired great under whoever is on a roster today.
+        #
+        # Within a tier, current players come first and then the most recent,
+        # because a bare surname is ambiguous and recency is the best tiebreak
+        # available without a prominence measure we do not have.
         cursor.execute(
-            "SELECT player_id, full_name, first_name, last_name, is_active FROM players WHERE full_name LIKE ? LIMIT 25",
-            (f"%{q}%",)
+            """
+            SELECT player_id, full_name, first_name, last_name, is_active,
+                   from_year, to_year
+            FROM players
+            WHERE full_name LIKE ?
+            ORDER BY
+                CASE
+                    WHEN lower(full_name) = lower(?) THEN 0
+                    WHEN lower(last_name) = lower(?) THEN 1
+                    WHEN lower(last_name) LIKE lower(?) THEN 2
+                    WHEN lower(full_name) LIKE lower(?) THEN 3
+                    ELSE 4
+                END,
+                is_active DESC,
+                -- Career length as a prominence proxy, which is the best signal
+                -- already on the row. Alphabetical put Bronny ahead of LeBron and
+                -- Seth ahead of Stephen; twenty-three seasons against two is a
+                -- better guess at who was meant than the letter B against L.
+                (COALESCE(to_year, 0) - COALESCE(from_year, 0)) DESC,
+                COALESCE(to_year, 0) DESC,
+                full_name
+            LIMIT 25
+            """,
+            (f"%{q}%", q, q, f"{q}%", f"{q}%")
         )
         rows = cursor.fetchall()
 

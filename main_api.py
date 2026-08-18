@@ -2061,6 +2061,169 @@ def get_draft_years():
         conn.close()
 
 
+# --- Pick value curve ---------------------------------------------------------
+# What a draft slot has actually been worth, from outcomes rather than opinion.
+#
+# The whole exercise turns on one methodological trap: a pick from 2024 has had two
+# seasons to accumulate a career and a pick from 2000 has had twenty, so comparing
+# their career totals measures how long ago they were drafted. Every curve of this
+# kind that ignores censoring is really a chart of draft year.
+#
+# So classes are only included when they have had `min_years` of opportunity, and
+# the cutoff is a parameter the caller can move rather than a hidden constant. The
+# response reports which classes were used and which were excluded for being too
+# recent, because that choice changes the answer.
+#
+# Career totals come from player_career_span, summed from 1996-97 onward, so a
+# player who debuted before that window has a clipped career and is excluded too.
+DEFAULT_PICK_VALUE_MIN_YEARS = 9
+
+
+@app.get("/api/draft/pick-value")
+def get_pick_value(
+    min_years: int = DEFAULT_PICK_VALUE_MIN_YEARS,
+    metric: str = "gp",
+    max_pick: int = 60,
+):
+    """
+    Career outcome by draft slot, for classes old enough to have finished.
+
+    `metric` is one of gp, min, pts - games played, minutes, points. Games is the
+    default because it is the least era-sensitive of the three: scoring rates have
+    moved a lot since 1996 and a game is a game.
+    """
+    METRICS = {"gp": "gp", "min": "min", "pts": "pts"}
+    if metric not in METRICS:
+        raise HTTPException(status_code=400, detail=f"metric must be one of {sorted(METRICS)}")
+
+    conn = get_db_conn()
+    try:
+        span = conn.execute(
+            "SELECT MIN(window_first), MAX(window_last), COUNT(*) FROM player_career_span"
+        ).fetchone()
+        if not span or not span[0]:
+            raise HTTPException(
+                status_code=503,
+                detail="Career table not built yet - run ingest_career_totals.py.",
+            )
+        window_first, window_last, n_players = span[0], span[1], span[2]
+
+        # A class is eligible when it was drafted inside the career window AND has
+        # had min_years of seasons since. Drafted-in-window matters because a
+        # player whose career began before 1996-97 has totals clipped at the left.
+        latest_eligible = window_last - min_years
+        rows = conn.execute(
+            f"""
+            SELECT d.overall_pick AS pick, d.season AS class, d.player_name,
+                   d.person_id,
+                   COALESCE(c.gp, 0) AS gp, COALESCE(c.min, 0) AS min,
+                   COALESCE(c.pts, 0) AS pts, COALESCE(c.seasons, 0) AS seasons,
+                   CASE WHEN c.player_id IS NULL THEN 1 ELSE 0 END AS never_played
+            FROM draft_history d
+            LEFT JOIN player_career_span c ON c.player_id = d.person_id
+            WHERE d.season >= ? AND d.season <= ? AND d.overall_pick BETWEEN 1 AND ?
+            ORDER BY d.overall_pick, d.season
+            """,
+            (window_first, latest_eligible, max_pick),
+        ).fetchall()
+
+        by_pick: Dict[int, List[Dict[str, Any]]] = {}
+        for r in rows:
+            by_pick.setdefault(r["pick"], []).append(dict(r))
+
+        col = METRICS[metric]
+        picks = []
+        for pick in sorted(by_pick):
+            group = by_pick[pick]
+            vals = sorted(float(g[col] or 0) for g in group)
+            n = len(vals)
+            if not n:
+                continue
+            # Median, not mean: one Hall of Famer at pick 13 would drag a mean up
+            # and imply every pick 13 is worth that.
+            median = vals[n // 2]
+            best = max(group, key=lambda g: g[col] or 0)
+            picks.append({
+                "pick": pick,
+                "n_players": n,
+                "median": round(median, 1),
+                "p25": round(vals[int(0.25 * n)], 1),
+                "p75": round(vals[int(0.75 * n)], 1),
+                "mean": round(sum(vals) / n, 1),
+                "max": round(vals[-1], 1),
+                "best_player": {"name": best["player_name"], "class": best["class"],
+                                "value": round(float(best[col] or 0), 1)},
+                # Two rates that say more than an average: how often a slot returns
+                # a real NBA career, and how often it returns nothing at all.
+                "share_400_games": round(
+                    sum(1 for g in group if (g["gp"] or 0) >= 400) / n * 100, 1),
+                "share_never_played": round(
+                    sum(1 for g in group if g["never_played"]) / n * 100, 1),
+            })
+
+        excluded = conn.execute(
+            "SELECT COUNT(DISTINCT season) FROM draft_history WHERE season > ?",
+            (latest_eligible,),
+        ).fetchone()[0]
+
+        lottery = [p for p in picks if p["pick"] <= 14]
+        second = [p for p in picks if p["pick"] >= 31]
+
+        # Twenty-one players per slot is not enough to rank slot against slot: in
+        # this window the median at pick 5 is HIGHER than at pick 1, which is noise,
+        # not a finding about pick 5. Bands pool slots until the sample is large
+        # enough for the trend to be the signal, and the page leads with these.
+        BANDS = [(1, 3), (4, 7), (8, 14), (15, 20), (21, 30), (31, 45), (46, 60)]
+        bands = []
+        for lo, hi in BANDS:
+            group = [g for pick in range(lo, hi + 1) for g in by_pick.get(pick, [])]
+            if not group:
+                continue
+            vals = sorted(float(g[col] or 0) for g in group)
+            n = len(vals)
+            bands.append({
+                "label": f"{lo}-{hi}" if lo != hi else str(lo),
+                "from_pick": lo, "to_pick": hi,
+                "n_players": n,
+                "median": round(vals[n // 2], 1),
+                "p25": round(vals[int(0.25 * n)], 1),
+                "p75": round(vals[int(0.75 * n)], 1),
+                "share_400_games": round(
+                    sum(1 for g in group if (g["gp"] or 0) >= 400) / n * 100, 1),
+                "share_never_played": round(
+                    sum(1 for g in group if g["never_played"]) / n * 100, 1),
+            })
+        return {
+            "metric": metric,
+            "metric_label": {"gp": "career games", "min": "career minutes",
+                             "pts": "career points"}[metric],
+            "min_years": min_years,
+            "classes": {"first": window_first, "last": latest_eligible,
+                        "excluded_recent": excluded},
+            "career_window": {"first_season": window_first, "last_season": window_last,
+                              "players": n_players},
+            "picks": picks,
+            "bands": bands,
+            # The two numbers the curve exists to produce.
+            "summary": {
+                "pick1_median": next((p["median"] for p in picks if p["pick"] == 1), None),
+                "pick14_median": next((p["median"] for p in picks if p["pick"] == 14), None),
+                "pick30_median": next((p["median"] for p in picks if p["pick"] == 30), None),
+                "lottery_median": round(
+                    sum(p["median"] for p in lottery) / len(lottery), 1) if lottery else None,
+                "second_round_median": round(
+                    sum(p["median"] for p in second) / len(second), 1) if second else None,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in pick-value curve: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute the pick value curve.")
+    finally:
+        conn.close()
+
+
 # NOTE: this route must stay ABOVE /api/draft/{year}. FastAPI matches in
 # definition order, and "pipeline" cannot be parsed as an int - below it, this
 # path would 422 instead of resolving.

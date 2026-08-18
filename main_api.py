@@ -7231,6 +7231,162 @@ def _summary_from_legacy_artifact() -> Dict[str, Any]:
     }
 
 
+# --- Model diary --------------------------------------------------------------
+# A public changelog of the model. Every entry is assembled from the sealed
+# artifacts on disk rather than written by hand, because a page whose whole point
+# is honesty cannot have its numbers typed in from memory.
+#
+# The two artifacts carry more than their own results: backtest_results.json
+# records the claim it replaced ("68.9% test accuracy") and why that claim was
+# wrong, so even the retired figure is sourced to a file rather than to a
+# recollection. Nothing on this page is authored except the labels.
+@app.get("/api/model/diary")
+def get_model_diary():
+    """
+    Version history of the serving model, with each version's sealed result and
+    its pre-registered gates - passes and failures alike.
+
+    Read straight from backtest_results_candidate.json and backtest_results.json.
+    If an artifact is missing its entry is omitted rather than approximated, and
+    the response says which files it found.
+    """
+    entries: List[Dict[str, Any]] = []
+    sources: List[Dict[str, Any]] = []
+
+    def load(path: str):
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:
+            logger.error("Could not read %s: %s", path, exc)
+            return None
+
+    cand = load(CANDIDATE_RESULTS_PATH)
+    old = load(BACKTEST_RESULTS_PATH)
+
+    # ---- current serving model -------------------------------------------
+    if cand:
+        sources.append({
+            "file": os.path.basename(CANDIDATE_RESULTS_PATH),
+            "generated_at": cand.get("generated_at_utc"),
+            "role": "sealed evaluation of the serving model",
+        })
+        res = (cand.get("results_candidate") or {}).get("overall") or {}
+        ev = cand.get("evaluation") or {}
+        thresholds = cand.get("preregistered_thresholds") or {}
+
+        gates = []
+        for key, t in thresholds.items():
+            if not isinstance(t, dict):
+                continue
+            gates.append({
+                "id": key,
+                "requirement": t.get("requirement"),
+                "passed": bool(t.get("PASS")),
+                # Whatever numbers the gate recorded, minus the requirement text,
+                # so the page can show a gate's own evidence without the endpoint
+                # deciding which figures matter.
+                "detail": {k: v for k, v in t.items()
+                           if k not in ("requirement", "PASS")},
+            })
+
+        entries.append({
+            "version": "candidate_2026-08",
+            "status": "serving",
+            "serving_since": "2026-08-11",
+            "sealed_at": cand.get("generated_at_utc"),
+            "headline_pct": res.get("model_accuracy_pct"),
+            "ci95": res.get("model_accuracy_95ci"),
+            "n_games": ev.get("n_games_scored"),
+            "seasons": ev.get("seasons"),
+            "date_range": ev.get("date_range"),
+            "baselines": {
+                "home_team_pct": res.get("home_team_baseline_pct"),
+                "better_record_pct": res.get("better_record_baseline_pct"),
+                "better_point_margin_pct": res.get("better_point_margin_baseline_pct"),
+            },
+            "brier": res.get("brier_score"),
+            "log_loss": res.get("log_loss"),
+            "architecture": (cand.get("model") or {}).get("architecture"),
+            "n_features": (cand.get("model") or {}).get("n_features"),
+            "gates": gates,
+            "gates_passed": sum(1 for g in gates if g["passed"]),
+            "gates_total": len(gates),
+            "calibration": cand.get("calibration_reliability_home_prob"),
+            "methodology_notes": cand.get("methodology_notes"),
+            "by_season": (cand.get("results_candidate") or {}).get("by_season"),
+        })
+
+    # ---- previous model ---------------------------------------------------
+    if old:
+        sources.append({
+            "file": os.path.basename(BACKTEST_RESULTS_PATH),
+            "generated_at": old.get("generated_at_utc"),
+            "role": "evaluation of the previous model",
+        })
+        head = old.get("headline") or {}
+        entries.append({
+            "version": "previous production model",
+            "status": "retired",
+            "retired_on": "2026-08-11",
+            "sealed_at": old.get("generated_at_utc"),
+            "headline_pct": head.get("number_pct"),
+            "ci95": head.get("ci95_pct"),
+            "n_games": head.get("n_games"),
+            "seasons": head.get("seasons"),
+            # This artifact nests its baselines one level deeper and names them
+            # differently from the candidate's. Reading the candidate's key names
+            # against it returned None for both, which would have shown the
+            # previous model with no baseline to judge it against.
+            "baselines": {
+                "home_team_pct": ((old.get("baseline") or {}).get("always_pick_home") or {}).get("accuracy_pct"),
+                "better_record_pct": ((old.get("baseline") or {}).get("pick_better_win_pct") or {}).get("accuracy_pct"),
+            },
+            "gates": [],
+            "gates_passed": None,
+            "gates_total": None,
+            # The most useful thing this artifact says is what it could NOT show.
+            "caveats": old.get("caveats"),
+            "methodology_notes": old.get("methodology_notes"),
+        })
+
+        # ---- the claim this replaced --------------------------------------
+        if head.get("replaces_claim"):
+            entries.append({
+                "version": "withdrawn claim",
+                "status": "withdrawn",
+                "retired_on": old.get("generated_at_utc", "")[:10],
+                "claim": head.get("replaces_claim"),
+                "why_wrong": head.get("why_the_old_claim_is_wrong"),
+                "gates": [],
+            })
+
+    if not entries:
+        raise HTTPException(
+            status_code=503,
+            detail="No model artifacts on disk - nothing to publish.",
+        )
+
+    return {
+        "entries": entries,
+        "sources": sources,
+        # Stated once, here, so no page has to remember it: accuracy is not
+        # profitability and this project has never measured the latter.
+        "no_roi_note": (
+            "No return on investment has ever been measured. There is no closing-odds "
+            "archive for these seasons, so profitability is unknown and no figure on "
+            "this page implies it."
+        ),
+        "sealed_note": (
+            "The test set is spent. It was scored once, and re-running the model against "
+            "it after seeing the result would turn a held-out evaluation into a tuning "
+            "set, so it will not be re-used."
+        ),
+    }
+
+
 @app.get("/api/model/backtest")
 def get_model_backtest():
     """

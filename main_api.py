@@ -5633,6 +5633,264 @@ def get_game_shot_chart(request: Request, game_id: str):
         logger.error(f"Error fetching game shot chart: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- Streak board -------------------------------------------------------------
+# Streak length alone is a bad ranking. A forty-game run of scoring ten points is
+# less of an achievement than a twelve-game run of scoring thirty, so this board
+# sorts by how rare a streak of that length has been rather than by how long it is.
+#
+# Rarity is measured against our own archive, 2022-23 onward. That is not
+# "historical" in the all-time sense and the response says so rather than
+# implying a century of context.
+#
+# "Active" needs care as well. The last game on record is the 2026 Finals, so a
+# streak unbroken when a team's season ended is active in the only sense
+# available: nobody has ended it. It is reported as of each team's last game.
+STREAK_DEFS = [
+    {"key": "team_win", "label": "Team wins", "scope": "team"},
+    {"key": "team_loss", "label": "Team losses", "scope": "team"},
+    {"key": "pts10", "label": "10+ points", "scope": "player"},
+    {"key": "pts20", "label": "20+ points", "scope": "player"},
+    {"key": "pts30", "label": "30+ points", "scope": "player"},
+    {"key": "three", "label": "Made a three", "scope": "player"},
+    {"key": "dd", "label": "Double-doubles", "scope": "player"},
+]
+
+# Below this a streak is not a streak, it is two games in a row. Set per type
+# because three straight 30-point games is notable and three straight games with
+# a three is not.
+STREAK_FLOOR = {"team_win": 4, "team_loss": 4, "pts10": 12, "pts20": 6,
+                "pts30": 3, "three": 12, "dd": 4}
+
+
+def _qualifies(row, key: str) -> bool:
+    pts = row["pts"] or 0
+    if key == "pts10":
+        return pts >= 10
+    if key == "pts20":
+        return pts >= 20
+    if key == "pts30":
+        return pts >= 30
+    if key == "three":
+        return (row["fg3m"] or 0) >= 1
+    if key == "dd":
+        # Any two of the five counting categories, which is the real definition -
+        # not points and rebounds only.
+        cats = (row["pts"], row["reb"], row["ast"], row["stl"], row["blk"])
+        return sum(1 for c in cats if (c or 0) >= 10) >= 2
+    return False
+
+
+_streak_cache: Dict[str, Any] = {"key": None, "payload": None}
+
+
+def _slice_streaks(payload: Dict[str, Any], kind: Optional[str], mode: str, limit: int):
+    """Pick a mode's board out of the cached payload and filter it."""
+    board = payload["longest"] if mode == "longest" else payload["streaks"]
+    if kind:
+        board = [b for b in board if b["kind"] == kind]
+    return {
+        **{k: v for k, v in payload.items() if k not in ("streaks", "longest")},
+        "mode": mode,
+        "total": len(board),
+        "streaks": board[: max(1, min(limit, 200))],
+    }
+
+
+@app.get("/api/stats/streaks")
+def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "active"):
+    """
+    Every unbroken streak in the archive, ranked by how rare its length is.
+
+    Each entry carries how many streaks have reached that length in the archive,
+    which is both the sort key and the number a reader needs to judge it. A player
+    streak counts consecutive games PLAYED, the league's own convention - a missed
+    game does not end it.
+
+    Two modes, because "active" is systematically skewed at a season boundary.
+    Every team except the champion ends its season on a loss, so at the end of a
+    season there are almost no active team win streaks (five teams, longest two
+    games) while losing streaks are inflated by playoff eliminations. `mode=active`
+    is the live-season board; `mode=longest` is the rarest streaks in the archive
+    however they ended, which is the one worth reading in the offseason.
+    """
+    conn = get_db_conn()
+    try:
+        # The whole board is computed at once and cached against the archive's
+        # last game, so a backfill invalidates it and a filter change does not
+        # rescan 120,000 rows.
+        stamp = conn.execute(
+            "SELECT MAX(DATE(game_date)) || ':' || COUNT(*) FROM player_game_log"
+        ).fetchone()[0]
+        if _streak_cache["key"] == stamp and _streak_cache["payload"]:
+            return _slice_streaks(_streak_cache["payload"], kind, mode, limit)
+        team_rows = conn.execute(
+            """
+            SELECT t.team_id, DATE(t.game_date) AS date, t.pts, t.opp_pts,
+                   m.abbreviation AS team, m.full_name AS team_name
+            FROM team_game_advanced t
+            LEFT JOIN team_metadata m ON m.team_id = t.team_id
+            WHERE t.pts IS NOT NULL AND t.opp_pts IS NOT NULL
+            ORDER BY t.team_id, DATE(t.game_date)
+            """
+        ).fetchall()
+
+        player_rows = conn.execute(
+            """
+            SELECT g.player_id, DATE(g.game_date) AS date, g.pts, g.reb, g.ast,
+                   g.stl, g.blk, g.fg3m, p.full_name,
+                   (SELECT abbreviation FROM team_metadata WHERE team_id = g.team_id) AS team
+            FROM player_game_log g
+            JOIN players p ON p.player_id = g.player_id
+            ORDER BY g.player_id, DATE(g.game_date)
+            """
+        ).fetchall()
+
+        lengths: Dict[str, List[int]] = {d["key"]: [] for d in STREAK_DEFS}
+        actives: Dict[str, List[Dict[str, Any]]] = {d["key"]: [] for d in STREAK_DEFS}
+        completed: Dict[str, List[Dict[str, Any]]] = {d["key"]: [] for d in STREAK_DEFS}
+
+        def walk(rows, group_key, tests, meta):
+            """One pass per entity, recording every streak plus the trailing one.
+
+            The trailing streak is the active one: it ran to the entity's last game
+            without being broken.
+            """
+            current = {k: 0 for k in tests}
+            start = {k: None for k in tests}
+            prev_group = None
+            last_row = None
+
+            def flush():
+                for k in tests:
+                    if current[k]:
+                        lengths[k].append(current[k])
+                        actives[k].append(meta(last_row, current[k], start[k]))
+
+            for r in rows:
+                g = r[group_key]
+                if g != prev_group:
+                    if prev_group is not None:
+                        flush()
+                    for k in tests:
+                        current[k] = 0
+                        start[k] = None
+                    prev_group = g
+                for k, test in tests.items():
+                    if test(r):
+                        if not current[k]:
+                            start[k] = r["date"]
+                        current[k] += 1
+                    else:
+                        if current[k]:
+                            lengths[k].append(current[k])
+                            # Keep the streak itself, not only its length, so the
+                            # longest board can name who did it. last_row is the
+                            # final game OF THE STREAK, since r broke it.
+                            completed[k].append(meta(last_row, current[k], start[k]))
+                        current[k] = 0
+                        start[k] = None
+                last_row = r
+            if prev_group is not None:
+                flush()
+
+        walk(
+            team_rows, "team_id",
+            {
+                "team_win": lambda r: (r["pts"] or 0) > (r["opp_pts"] or 0),
+                "team_loss": lambda r: (r["pts"] or 0) < (r["opp_pts"] or 0),
+            },
+            lambda r, n, st: {
+                "name": r["team_name"] or r["team"], "team": r["team"],
+                "team_id": r["team_id"], "length": n, "started": st,
+                "last_game": r["date"],
+            },
+        )
+        # Bind the key per lambda, or every test closes over the last one.
+        player_tests = {
+            d["key"]: (lambda key: (lambda r: _qualifies(r, key)))(d["key"])
+            for d in STREAK_DEFS if d["scope"] == "player"
+        }
+        walk(
+            player_rows, "player_id", player_tests,
+            lambda r, n, st: {
+                "name": r["full_name"], "team": r["team"], "player_id": r["player_id"],
+                "length": n, "started": st, "last_game": r["date"],
+            },
+        )
+
+        def reached(key: str, n: int) -> int:
+            return sum(1 for L in lengths[key] if L >= n)
+
+        def decorate(entries, k, d, active):
+            out = []
+            for a in entries:
+                if a["length"] < STREAK_FLOOR[k]:
+                    continue
+                out.append({
+                    **a,
+                    "kind": k,
+                    "kind_label": d["label"],
+                    "scope": d["scope"],
+                    "active": active,
+                    "as_long_or_longer": reached(k, a["length"]),
+                    "longest_ever": max(lengths[k]) if lengths[k] else a["length"],
+                })
+            return out
+
+        board, longest = [], []
+        for d in STREAK_DEFS:
+            k = d["key"]
+            board.extend(decorate(actives[k], k, d, True))
+            # The longest board draws on every streak, ended or not, so it is not
+            # hostage to where the season happened to stop.
+            longest.extend(decorate(actives[k], k, d, True))
+            longest.extend(decorate(completed[k], k, d, False))
+
+        # Rarest first; a longer streak breaks a tie, being further into the tail.
+        rank = lambda b: (b["as_long_or_longer"], -b["length"])
+        board.sort(key=rank)
+        longest.sort(key=rank)
+
+        span = conn.execute(
+            "SELECT MIN(season), MAX(season), MAX(DATE(game_date)) FROM team_game_advanced"
+        ).fetchone()
+        payload = {
+            "archive": {"first_season": span[0], "last_season": span[1], "last_game": span[2]},
+            "kinds": [
+                {
+                    "key": d["key"], "label": d["label"], "scope": d["scope"],
+                    "floor": STREAK_FLOOR[d["key"]],
+                    "longest": max(lengths[d["key"]]) if lengths[d["key"]] else None,
+                    "streaks_recorded": len(lengths[d["key"]]),
+                }
+                for d in STREAK_DEFS
+            ],
+            "streaks": board,
+            "longest": longest,
+            # Why an active board looks strange at a season boundary, in numbers
+            # rather than as a warning a reader has to take on trust.
+            "season_boundary": {
+                "teams_ending_on_a_win": sum(
+                    1 for a in actives["team_win"]
+                ),
+                "teams_ending_on_a_loss": sum(
+                    1 for a in actives["team_loss"]
+                ),
+                "longest_active_team_win": max(
+                    (a["length"] for a in actives["team_win"]), default=0
+                ),
+            },
+        }
+        _streak_cache["key"] = stamp
+        _streak_cache["payload"] = payload
+        return _slice_streaks(payload, kind, mode, limit)
+    except Exception as e:
+        logger.error(f"Error building streak board: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not build the streak board.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/stats/daily-leaders")
 def get_daily_leaders(
     date: Optional[str] = None,

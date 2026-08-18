@@ -6026,6 +6026,58 @@ def get_scoring_runs(
         conn.close()
 
 
+# --- Hustle stats ---------------------------------------------------------------
+# Raw material for the hustle index builder. The endpoint ships totals plus games
+# and minutes and nothing derived: the page computes per-36 and the 0-100 scaling
+# itself, the same shape as Build-a-Metric, so a slider move never round-trips.
+@app.get("/api/stats/hustle")
+def get_hustle_stats(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    Season hustle totals for every player: the effort plays the box score skips.
+
+    Tracked by the league from 2015-16 onward. Charges drawn are genuinely rare -
+    a handful of players a season reach double digits - which the builder page
+    should surface rather than smooth over.
+    """
+    try:
+        from src.Utils.nba_stats_client import get_client
+
+        rows = get_client().league_hustle_stats(season=season, season_type=season_type)
+    except Exception as e:
+        logger.error(f"Error fetching hustle stats: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Could not reach the hustle feed.")
+
+    if not rows:
+        return {"season": season, "season_type": season_type, "players": []}
+
+    players = []
+    for r in rows:
+        players.append({
+            "player_id": r.get("PLAYER_ID"),
+            "name": r.get("PLAYER_NAME"),
+            "team": r.get("TEAM_ABBREVIATION"),
+            "gp": r.get("G"),
+            "min": r.get("MIN"),
+            "deflections": r.get("DEFLECTIONS"),
+            "screen_assists": r.get("SCREEN_ASSISTS"),
+            "screen_assist_pts": r.get("SCREEN_AST_PTS"),
+            "loose_balls": r.get("LOOSE_BALLS_RECOVERED"),
+            "charges_drawn": r.get("CHARGES_DRAWN"),
+            "contested_shots": r.get("CONTESTED_SHOTS"),
+            "box_outs": r.get("BOX_OUTS"),
+        })
+
+    return {
+        "season": season,
+        "season_type": season_type,
+        "players": players,
+        "source_note": (
+            "Hustle tracking is the league's own, recorded from 2015-16. These are "
+            "counted events, not estimates."
+        ),
+    }
+
+
 @app.get("/api/stats/streaks")
 def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "active"):
     """

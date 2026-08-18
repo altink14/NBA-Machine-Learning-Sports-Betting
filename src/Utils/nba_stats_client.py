@@ -34,7 +34,8 @@ from nba_api.stats.endpoints import (
     shotchartdetail,
     scheduleleaguev2,
     leaguedashlineups,
-    playerindex
+    playerindex,
+    leaguehustlestatsplayer
 )
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,26 @@ class NBAStatsClient:
         params = {"season": season, "league_id": "00"}
         raw = self._fetch("playerindex", playerindex.PlayerIndex, params, ttl=7 * 24 * 3600)
         return self._parse_result_set(raw, "PlayerIndex")
+
+    def league_hustle_stats(
+        self, season: str = "2025-26", season_type: str = "Regular Season"
+    ) -> List[Dict]:
+        """Season hustle totals per player: deflections, screen assists, loose
+        balls, charges drawn, contested shots, box-outs. Tracked from 2015-16.
+
+        Cached for an hour in season; the numbers only move when games are played.
+        """
+        params = {
+            "season": season,
+            "season_type_all_star": season_type,
+            "per_mode_time": "Totals",
+        }
+        raw = self._fetch(
+            "leaguehustlestatsplayer",
+            leaguehustlestatsplayer.LeagueHustleStatsPlayer,
+            params, ttl=3600,
+        )
+        return self._parse_result_set(raw, "HustleStatsPlayer")
 
     def common_all_players(
         self, season: str = "2024-25", is_only_current_season: int = 1

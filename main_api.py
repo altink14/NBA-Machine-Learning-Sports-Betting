@@ -6074,6 +6074,153 @@ def get_nba_cup(season: str = "2026-27"):
     }
 
 
+# --- Lineups ------------------------------------------------------------------
+# Two thousand five-man combinations come back per season and the median one
+# played twenty minutes. A leaderboard sorted by net rating with no minutes floor
+# is therefore not a leaderboard: the best figure in 2025-26 belongs to a lineup
+# that played thirteen minutes and outscored people by 106 per 100 possessions,
+# which will not happen again. The floor is the feature here, so it is a
+# first-class parameter with a real default rather than a filter nobody finds.
+LINEUP_MIN_MINUTES_DEFAULT = 100
+
+LINEUP_SORTS = {
+    "net_rating": "NET_RATING", "off_rating": "OFF_RATING", "def_rating": "DEF_RATING",
+    "min": "MIN", "gp": "GP", "poss": "POSS", "ts_pct": "TS_PCT", "pace": "PACE",
+}
+
+
+@app.get("/api/lineups")
+def get_lineups(
+    season: str = CURRENT_SEASON,
+    season_type: str = "Regular Season",
+    group_quantity: int = 5,
+    team: Optional[str] = None,
+    min_minutes: float = LINEUP_MIN_MINUTES_DEFAULT,
+    sort: str = "net_rating",
+    limit: int = 60,
+):
+    """
+    Lineup combinations, with the sample-size problem made explicit.
+
+    `defensive` ratings here are the lineup's own, per 100 possessions. Sorting
+    defaults to net rating and the minutes floor defaults to 100, because the
+    unfiltered version of this table is actively misleading.
+
+    The response carries what the floor removed - how many lineups exist, how
+    many survive, and the best figure below the cut - so a page can show the
+    reader why the floor is there instead of asserting it.
+    """
+    if group_quantity not in (2, 3, 4, 5):
+        raise HTTPException(status_code=400, detail="group_quantity must be 2, 3, 4 or 5.")
+    if sort not in LINEUP_SORTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sort must be one of: {', '.join(sorted(LINEUP_SORTS))}",
+        )
+
+    try:
+        from src.Utils.nba_stats_client import get_client
+
+        rows = get_client().league_dash_lineups(
+            season=season, season_type=season_type,
+            group_quantity=group_quantity, measure_type="Advanced",
+        )
+    except Exception as e:
+        logger.error(f"Error fetching lineups: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Could not reach the lineup feed.")
+
+    if not rows:
+        return {
+            "season": season, "season_type": season_type,
+            "group_quantity": group_quantity, "total_lineups": 0, "lineups": [],
+        }
+
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) else None
+
+    all_lineups = []
+    for r in rows:
+        mins = num(r.get("MIN")) or 0.0
+        all_lineups.append({
+            "group_id": r.get("GROUP_ID"),
+            "name": r.get("GROUP_NAME"),
+            # The feed gives one string of abbreviated names; split it so a page
+            # can render them as separate players rather than one long line.
+            "players": [p.strip() for p in (r.get("GROUP_NAME") or "").split(" - ") if p.strip()],
+            "team": r.get("TEAM_ABBREVIATION"),
+            "team_id": r.get("TEAM_ID"),
+            "gp": r.get("GP"), "w": r.get("W"), "l": r.get("L"),
+            "min": round(mins, 1),
+            "poss": num(r.get("POSS")),
+            "off_rating": num(r.get("OFF_RATING")),
+            "def_rating": num(r.get("DEF_RATING")),
+            "net_rating": num(r.get("NET_RATING")),
+            "ts_pct": num(r.get("TS_PCT")),
+            "pace": num(r.get("PACE")),
+            "reb_pct": num(r.get("REB_PCT")),
+            "tov_pct": num(r.get("TM_TOV_PCT")),
+        })
+
+    total = len(all_lineups)
+    if team:
+        pool = [l for l in all_lineups if (l["team"] or "").upper() == team.upper()]
+    else:
+        pool = all_lineups
+
+    qualified = [l for l in pool if (l["min"] or 0) >= min_minutes]
+    below = [l for l in pool if (l["min"] or 0) < min_minutes]
+
+    key = LINEUP_SORTS[sort]
+    field = {
+        "NET_RATING": "net_rating", "OFF_RATING": "off_rating", "DEF_RATING": "def_rating",
+        "MIN": "min", "GP": "gp", "POSS": "poss", "TS_PCT": "ts_pct", "PACE": "pace",
+    }[key]
+    # Defence is the one column where lower is better.
+    reverse = field != "def_rating"
+    qualified.sort(key=lambda l: (l.get(field) is None, l.get(field) or 0), reverse=reverse)
+    if reverse:
+        qualified = [l for l in qualified if l.get(field) is not None] +                     [l for l in qualified if l.get(field) is None]
+
+    # What the floor is protecting the reader from, by name.
+    noise = None
+    if below:
+        worst_offender = max(below, key=lambda l: l.get("net_rating") or -999)
+        if worst_offender.get("net_rating") is not None:
+            noise = {
+                "name": worst_offender["name"],
+                "team": worst_offender["team"],
+                "min": worst_offender["min"],
+                "net_rating": worst_offender["net_rating"],
+            }
+
+    mins_sorted = sorted((l["min"] or 0) for l in pool)
+    n = len(mins_sorted) or 1
+
+    return {
+        "season": season,
+        "season_type": season_type,
+        "group_quantity": group_quantity,
+        "team": team,
+        "sort": sort,
+        "min_minutes": min_minutes,
+        "total_lineups": total,
+        "in_scope": len(pool),
+        "qualified": len(qualified),
+        "excluded": len(below),
+        "median_minutes": round(mins_sorted[n // 2], 1),
+        "max_minutes": round(mins_sorted[-1], 1) if mins_sorted else 0,
+        # The single most useful honesty figure on the page: how few combinations
+        # have played enough to say anything.
+        "minute_bands": [
+            {"at_least": t, "lineups": sum(1 for m in mins_sorted if m >= t)}
+            for t in (25, 50, 100, 200, 400)
+        ],
+        "excluded_best": noise,
+        "lineups": qualified[:limit],
+        "teams": sorted({l["team"] for l in all_lineups if l["team"]}),
+    }
+
+
 @app.get("/api/health/validation")
 def get_validation_health():
     """

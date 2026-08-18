@@ -32,7 +32,8 @@ from nba_api.stats.endpoints import (
     playergamelog,
     playerdashptpass,
     shotchartdetail,
-    scheduleleaguev2
+    scheduleleaguev2,
+    leaguedashlineups
 )
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,32 @@ class NBAStatsClient:
             "scheduleleaguev2", scheduleleaguev2.ScheduleLeagueV2, params, ttl=3600
         )
         return raw.get("leagueSchedule", {})
+
+    def league_dash_lineups(
+        self,
+        season: str = "2025-26",
+        season_type: str = "Regular Season",
+        group_quantity: int = 5,
+        measure_type: str = "Advanced",
+        per_mode: str = "Per100Possessions",
+    ) -> List[Dict]:
+        """Lineup combinations for a season, as rows keyed by GROUP_ID.
+
+        Two thousand five-man combinations come back per season, so this is
+        cached for an hour: the underlying numbers only move when games are
+        played, and a filter change on the page should not re-fetch.
+        """
+        params = {
+            "season": season,
+            "season_type_all_star": season_type,
+            "group_quantity": group_quantity,
+            "measure_type_detailed_defense": measure_type,
+            "per_mode_detailed": per_mode,
+        }
+        raw = self._fetch(
+            "leaguedashlineups", leaguedashlineups.LeagueDashLineups, params, ttl=3600
+        )
+        return self._parse_result_set(raw, "Lineups")
 
     def common_all_players(
         self, season: str = "2024-25", is_only_current_season: int = 1

@@ -5859,6 +5859,173 @@ def _slice_streaks(payload: Dict[str, Any], kind: Optional[str], mode: str, limi
     }
 
 
+# --- Run detector -------------------------------------------------------------
+# Unanswered scoring runs, precomputed by ingest_scoring_runs.py. A run is
+# consecutive points by one team with the opponent scoring nothing in between -
+# what "an 8-0 run" means, and a definition with no parameters to argue about.
+#
+# Runs are stored down to 6 points and filtered upward here, so the threshold is a
+# reader's choice rather than baked into the table.
+@app.get("/api/stats/runs")
+def get_scoring_runs(
+    min_points: int = 10,
+    season: Optional[str] = None,
+    season_type: str = "Regular Season",
+    team: Optional[str] = None,
+    limit: int = 40,
+):
+    """
+    Biggest runs, who delivers them, who concedes them, and in which quarter.
+
+    Per-team figures are per game rather than totals, because a team that played
+    more games would otherwise look more run-prone for having existed longer.
+    """
+    conn = get_db_conn()
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scoring_runs'"
+        ).fetchone()
+        if not exists:
+            raise HTTPException(
+                status_code=503,
+                detail="Run table not built yet - run ingest_scoring_runs.py.",
+            )
+
+        where = ["points >= ?", "season_type = ?"]
+        params: List[Any] = [min_points, season_type]
+        if season:
+            where.append("season = ?")
+            params.append(season)
+        clause = " AND ".join(where)
+
+        biggest_sql = f"SELECT * FROM scoring_runs WHERE {clause}"
+        biggest_params = list(params)
+        if team:
+            biggest_sql += " AND (team_tricode = ? OR opp_tricode = ?)"
+            biggest_params += [team.upper(), team.upper()]
+        biggest = [
+            dict(r) for r in conn.execute(
+                biggest_sql + " ORDER BY points DESC, game_date DESC LIMIT ?",
+                biggest_params + [max(1, min(limit, 200))],
+            )
+        ]
+
+        # Games per team in scope, so runs can be expressed per game.
+        games = {
+            r["tri"]: r["n"] for r in conn.execute(
+                f"""
+                SELECT m.abbreviation AS tri, COUNT(DISTINCT t.game_id) AS n
+                FROM team_game_advanced t
+                JOIN team_metadata m ON m.team_id = t.team_id
+                WHERE t.season_type = ?{" AND t.season = ?" if season else ""}
+                GROUP BY m.abbreviation
+                """,
+                [season_type] + ([season] if season else []),
+            )
+        }
+
+        delivered = {
+            r["team_tricode"]: dict(r) for r in conn.execute(
+                f"""
+                SELECT team_tricode, COUNT(*) AS runs, SUM(points) AS points,
+                       MAX(points) AS biggest
+                FROM scoring_runs WHERE {clause} GROUP BY team_tricode
+                """,
+                params,
+            )
+        }
+        allowed = {
+            r["opp_tricode"]: dict(r) for r in conn.execute(
+                f"""
+                SELECT opp_tricode, COUNT(*) AS runs, SUM(points) AS points,
+                       MAX(points) AS biggest
+                FROM scoring_runs WHERE {clause} GROUP BY opp_tricode
+                """,
+                params,
+            )
+        }
+
+        teams = []
+        for tri, n_games in sorted(games.items()):
+            d = delivered.get(tri, {})
+            a = allowed.get(tri, {})
+            if not n_games:
+                continue
+            teams.append({
+                "team": tri,
+                "games": n_games,
+                "runs_delivered": d.get("runs", 0),
+                "runs_allowed": a.get("runs", 0),
+                "delivered_per_game": round((d.get("runs", 0)) / n_games, 2),
+                "allowed_per_game": round((a.get("runs", 0)) / n_games, 2),
+                "biggest_delivered": d.get("biggest"),
+                "biggest_allowed": a.get("biggest"),
+                "net_per_game": round(
+                    ((d.get("runs", 0)) - (a.get("runs", 0))) / n_games, 2),
+            })
+
+        # Which quarter a run started in. The vault's interest here is the third,
+        # where a team coming out of the break flat is a live-betting tell.
+        by_quarter = [
+            dict(r) for r in conn.execute(
+                f"""
+                SELECT start_period AS period, COUNT(*) AS runs,
+                       ROUND(AVG(points), 2) AS avg_points, MAX(points) AS biggest
+                FROM scoring_runs WHERE {clause}
+                GROUP BY start_period ORDER BY start_period
+                """,
+                params,
+            )
+        ]
+
+        # Teams that concede most in the third specifically.
+        third_allowed = [
+            dict(r) for r in conn.execute(
+                f"""
+                SELECT opp_tricode AS team, COUNT(*) AS runs_allowed_q3,
+                       MAX(points) AS biggest
+                FROM scoring_runs WHERE {clause} AND start_period = 3
+                GROUP BY opp_tricode ORDER BY runs_allowed_q3 DESC LIMIT 10
+                """,
+                params,
+            )
+        ]
+
+        totals = conn.execute(
+            f"SELECT COUNT(*) n, MAX(points) mx FROM scoring_runs WHERE {clause}", params
+        ).fetchone()
+        seasons = [
+            r["season"] for r in conn.execute(
+                "SELECT DISTINCT season FROM scoring_runs ORDER BY season DESC"
+            )
+        ]
+
+        return {
+            "min_points": min_points,
+            "season": season,
+            "season_type": season_type,
+            "seasons": seasons,
+            "totals": {"runs": totals["n"], "biggest": totals["mx"]},
+            "biggest": biggest,
+            "teams": sorted(teams, key=lambda t: -t["allowed_per_game"]),
+            "by_quarter": by_quarter,
+            "third_quarter_allowed": third_allowed,
+            "definition": (
+                "A run is consecutive points by one team with the opponent scoring "
+                "nothing in between. Runs can cross a period break, because a team "
+                "closing one quarter and opening the next without reply has gone on "
+                "one run, not two."
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in run detector: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not read scoring runs.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/stats/streaks")
 def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "active"):
     """

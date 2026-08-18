@@ -2848,11 +2848,32 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
                         "distance": row[col_map["SHOT_DISTANCE"]],
                         "x": row[col_map["LOC_X"]],
                         "y": row[col_map["LOC_Y"]],
-                        "made": row[col_map["SHOT_MADE_FLAG"]] == 1
+                        "made": row[col_map["SHOT_MADE_FLAG"]] == 1,
+                        "period": row[col_map["PERIOD"]],
+                        "game_event_id": row[col_map["GAME_EVENT_ID"]]
                     })
                 except Exception:
                     continue
-                    
+
+        # 1b. Annotate each shot with the run the player was on coming into it,
+        # within that game: streak_before > 0 means that many straight makes
+        # immediately before this attempt, < 0 straight misses, 0 first attempt
+        # of the game. GAME_EVENT_ID is monotonic within a game, so ordering
+        # needs no play-by-play join. Field goals only - free throws neither
+        # extend nor break a run here.
+        by_game = {}
+        for s in shots:
+            by_game.setdefault(s["game_id"], []).append(s)
+        for game_shots in by_game.values():
+            game_shots.sort(key=lambda s: s.get("game_event_id") or 0)
+            streak = 0
+            for s in game_shots:
+                s["streak_before"] = streak
+                if s["made"]:
+                    streak = streak + 1 if streak > 0 else 1
+                else:
+                    streak = streak - 1 if streak < 0 else -1
+
         # 2. Parse league averages
         avg_set = next((rs for rs in result_sets if rs.get("name") == "LeagueAverages"), None)
         averages = []

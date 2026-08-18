@@ -7567,8 +7567,28 @@ def _summary_from_candidate_artifact() -> Dict[str, Any]:
             "n": row["n"],
             "predicted_pct": row["mean_predicted_pct"],
             "actual_pct": row["actual_win_pct"],
+            # Additive: the artifact's own uncertainty figures, so the
+            # calibration playground can show error bars instead of implying
+            # a 20-game bucket is as settled as a 700-game one.
+            "actual_95ci": row.get("actual_95ci"),
+            "error_pp": row.get("calibration_error_pp"),
         }
         for row in artifact["results_candidate"]["calibration_by_confidence"]
+    ]
+    # The second reliability table in the artifact: by predicted HOME win
+    # probability rather than by pick confidence. This is the one that carries
+    # the failed pre-registration gate (40-50% bucket, -5.15pp) - shown, not
+    # hidden.
+    calibration_home = [
+        {
+            "bucket": row["bucket"].rstrip("%"),
+            "n": row["n"],
+            "predicted_pct": row["mean_predicted_home_win_pct"],
+            "actual_pct": row["actual_home_win_pct"],
+            "actual_95ci": row.get("actual_95ci"),
+            "error_pp": row.get("calibration_error_pp"),
+        }
+        for row in artifact.get("calibration_reliability_home_prob", [])
     ]
     return {
         "headline": {
@@ -7586,6 +7606,7 @@ def _summary_from_candidate_artifact() -> Dict[str, Any]:
             "mcnemar_p_vs_current": artifact["paired_tests"]["candidate_vs_old_model"]["p_value"],
         },
         "calibration": calibration,
+        "calibration_home_prob": calibration_home,
         "generated_at": artifact["generated_at_utc"],
         "methodology_note": (
             f"Sealed, pre-registered, one-shot evaluation on {overall['n']:,} games from the "

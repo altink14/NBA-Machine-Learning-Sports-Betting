@@ -3533,6 +3533,132 @@ def get_player_by_slug(request: Request, slug: str, season: str = CURRENT_SEASON
     # 500'd every player page).
     return get_player_by_id(request, player_id, season=season)
 
+# --- Heat calendar ------------------------------------------------------------
+# Season and season type are read from the game id rather than the date. The id
+# encodes both - prefix 002 is regular season and 004 is playoffs, characters four
+# and five are the season's start year - which matters because a season straddles
+# the new year, so deriving it from a date means a rule about October, and the
+# playoffs would be indistinguishable from late regular-season games either way.
+#
+# Game Score is Hollinger's, kept exactly as he defined it:
+#   PTS + 0.4*FGM - 0.7*FGA - 0.4*(FTA-FTM) + 0.7*OREB + 0.3*DREB
+#        + STL + 0.7*AST + 0.7*BLK - 0.4*PF - TOV
+# It is a one-number summary of a single game, roughly on a points-like scale, and
+# it is the colour on the calendar because points alone call a 30-point night on
+# 30 shots a good game.
+GAME_SCORE_SQL = (
+    "(g.pts + 0.4 * g.fgm - 0.7 * g.fga - 0.4 * (g.fta - g.ftm) "
+    "+ 0.7 * g.oreb + 0.3 * g.dreb + g.stl + 0.7 * g.ast + 0.7 * g.blk "
+    "- 0.4 * g.pf - g.tov)"
+)
+
+
+@app.get("/api/players/{id}/heat-calendar")
+def get_player_heat_calendar(id: int, season: Optional[str] = None):
+    """
+    Every game a player played in a season, dated, for a calendar heat map.
+
+    Returns the seasons this player actually has games for, so a caller can offer
+    only those rather than a season list the player was not in - the game-log
+    archive starts in 2022-23, and a calendar rendered empty for a retired player
+    would look broken rather than out of range.
+    """
+    conn = get_db_conn()
+    try:
+        exists = conn.execute(
+            "SELECT full_name FROM players WHERE player_id = ?", (id,)
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Player ID {id} not found.")
+
+        # Seasons this player has games in, newest first.
+        season_rows = conn.execute(
+            """
+            SELECT DISTINCT CAST(SUBSTR(game_id, 4, 2) AS INTEGER) AS yy
+            FROM player_game_log WHERE player_id = ? AND LENGTH(game_id) >= 5
+            ORDER BY yy DESC
+            """,
+            (id,),
+        ).fetchall()
+        seasons = [f"20{r['yy']:02d}-{(r['yy'] + 1) % 100:02d}" for r in season_rows]
+
+        if not seasons:
+            return {
+                "player_id": id, "player": exists["full_name"], "season": None,
+                "seasons": [], "games": 0, "entries": [],
+                "note": "No game logs on record for this player.",
+            }
+
+        target = season if season in seasons else seasons[0]
+        yy = int(target[2:4])
+
+        rows = conn.execute(
+            f"""
+            SELECT g.game_id, DATE(g.game_date) AS date, g.min, g.pts, g.reb, g.ast,
+                   g.stl, g.blk, g.tov, g.fgm, g.fga, g.fg3m, g.ftm, g.fta,
+                   g.plus_minus, g.starter,
+                   CASE SUBSTR(g.game_id, 1, 3)
+                        WHEN '004' THEN 'Playoffs'
+                        WHEN '005' THEN 'Play-In'
+                        WHEN '001' THEN 'Preseason'
+                        ELSE 'Regular Season' END AS season_type,
+                   {GAME_SCORE_SQL} AS game_score
+            FROM player_game_log g
+            WHERE g.player_id = ? AND CAST(SUBSTR(g.game_id, 4, 2) AS INTEGER) = ?
+            ORDER BY DATE(g.game_date)
+            """,
+            (id, yy),
+        ).fetchall()
+
+        entries = [dict(r) for r in rows]
+        for e in entries:
+            e["game_score"] = round(e["game_score"], 1) if e["game_score"] is not None else None
+
+        scores = [e["game_score"] for e in entries if e["game_score"] is not None]
+        pts = [e["pts"] for e in entries if e["pts"] is not None]
+        scale = {}
+        if scores:
+            ordered = sorted(scores)
+            n = len(ordered)
+            # The colour scale is built from THIS player's season rather than a
+            # league-wide one, so a role player's good night is visible instead of
+            # every cell being cold next to a star's.
+            scale = {
+                "min": round(ordered[0], 1),
+                "p25": round(ordered[int(0.25 * n)], 1),
+                "median": round(ordered[n // 2], 1),
+                "p75": round(ordered[int(0.75 * n)], 1),
+                "max": round(ordered[-1], 1),
+            }
+
+        best = max(entries, key=lambda e: e["game_score"] or -99) if entries else None
+        return {
+            "player_id": id,
+            "player": exists["full_name"],
+            "season": target,
+            "seasons": seasons,
+            "games": len(entries),
+            "scale": scale,
+            "totals": {
+                "pts": sum(pts) if pts else 0,
+                "mean_game_score": round(sum(scores) / len(scores), 1) if scores else None,
+            },
+            "best_game": {
+                "date": best["date"], "game_id": best["game_id"],
+                "game_score": best["game_score"], "pts": best["pts"],
+                "reb": best["reb"], "ast": best["ast"],
+            } if best else None,
+            "entries": entries,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in heat calendar for {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not build the heat calendar.")
+    finally:
+        conn.close()
+
+
 @app.get("/api/players/{id}/game-log")
 def get_player_game_log(id: int, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """

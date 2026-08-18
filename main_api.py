@@ -3069,6 +3069,153 @@ def get_matchup_availability_endpoint(home: str, away: str, season: str = CURREN
         raise HTTPException(status_code=500, detail="Failed to compute matchup availability.")
 
 
+@app.get("/api/players/browse")
+def browse_players(
+    letter: Optional[str] = None,
+    team: Optional[str] = None,
+    position: Optional[str] = None,
+    college: Optional[str] = None,
+    era: Optional[str] = None,
+    active: Optional[bool] = None,
+    sort: str = "name",
+    limit: int = 120,
+    offset: int = 0,
+):
+    """
+    Browse the directory instead of searching it.
+
+    Search only helps a reader who already knows a name. With 5,210 players on
+    record that leaves most of the league unreachable, so this exposes the same
+    axes nba.com's roster page does - initial, team, position, college - plus era,
+    which theirs does not need because theirs is current players only.
+
+    Filter option lists are computed over the whole directory rather than the
+    current result, so narrowing by team does not empty the position menu.
+    """
+    conn = get_db_conn()
+    try:
+        where, params = [], []
+        if letter:
+            where.append("UPPER(last_name) LIKE ?")
+            params.append(f"{letter[:1].upper()}%")
+        if team:
+            where.append("UPPER(last_team) = ?")
+            params.append(team.upper())
+        if position:
+            # playerindex stores positions as single letters and hyphenated pairs:
+            # C, C-F, F, F-C, F-G, G, G-F. It does NOT spell them out - the
+            # draft-board path uses commonplayerinfo, which does, and matching the
+            # spelled-out word here returned zero active centres.
+            #
+            # Matching on the letter catches the combinations, which is what a
+            # reader picking "Center" wants: a C-F is a centre who also plays
+            # forward, not a different position. The alphabet is only C/F/G so a
+            # substring match cannot collide.
+            token = {"guard": "G", "forward": "F", "center": "C"}.get(
+                position.strip().lower(), position.strip().upper()
+            )
+            where.append("position LIKE ?")
+            params.append(f"%{token}%")
+        if college:
+            where.append("college = ?")
+            params.append(college)
+        if active is not None:
+            where.append("is_active = ?")
+            params.append(1 if active else 0)
+        if era:
+            # "1990s" style buckets, matched on any overlap with the decade rather
+            # than on debut year - a player who spanned 1998-2010 belongs to both.
+            try:
+                decade = int(str(era)[:4])
+                where.append("COALESCE(to_year, 0) >= ? AND COALESCE(from_year, 9999) <= ?")
+                params.extend([decade, decade + 9])
+            except ValueError:
+                pass
+
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        order = {
+            "name": "last_name COLLATE NOCASE, first_name COLLATE NOCASE",
+            "recent": "COALESCE(to_year, 0) DESC, last_name COLLATE NOCASE",
+            "career": "(COALESCE(to_year,0) - COALESCE(from_year,0)) DESC, last_name COLLATE NOCASE",
+            "debut": "COALESCE(from_year, 9999), last_name COLLATE NOCASE",
+        }.get(sort, "last_name COLLATE NOCASE, first_name COLLATE NOCASE")
+
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM players{clause}", params
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"""
+            SELECT player_id, full_name, first_name, last_name, is_active,
+                   from_year, to_year, position, height, weight, college,
+                   country, jersey, last_team, last_team_id
+            FROM players{clause}
+            ORDER BY {order}
+            LIMIT ? OFFSET ?
+            """,
+            params + [max(1, min(limit, 300)), max(0, offset)],
+        ).fetchall()
+
+        # Option lists over the whole directory, and the per-initial counts the
+        # A-Z rail needs to grey out letters nobody is filed under.
+        letters = {
+            r["ltr"]: r["n"] for r in conn.execute(
+                "SELECT UPPER(SUBSTR(last_name,1,1)) AS ltr, COUNT(*) AS n FROM players "
+                "WHERE last_name IS NOT NULL AND last_name != '' GROUP BY ltr ORDER BY ltr"
+            )
+        }
+        teams = [
+            r["last_team"] for r in conn.execute(
+                "SELECT DISTINCT last_team FROM players WHERE last_team IS NOT NULL "
+                "AND last_team != '' ORDER BY last_team"
+            )
+        ]
+        colleges = [
+            {"name": r["college"], "players": r["n"]}
+            for r in conn.execute(
+                "SELECT college, COUNT(*) AS n FROM players WHERE college IS NOT NULL "
+                "AND college != '' GROUP BY college ORDER BY n DESC, college LIMIT 80"
+            )
+        ]
+        bios = conn.execute(
+            "SELECT COUNT(*) FROM players WHERE position IS NOT NULL AND position != ''"
+        ).fetchone()[0]
+        directory_total = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "directory_total": directory_total,
+            # How much of the directory has a bio yet, so the page can be honest
+            "with_bio": bios,
+            "filters": {
+                "letter": letter, "team": team, "position": position,
+                "college": college, "era": era, "active": active, "sort": sort,
+            },
+            "options": {
+                "letters": letters,
+                "teams": teams,
+                "positions": ["Guard", "Forward", "Center"],
+                # The raw values, so a caller can see that C-F exists and that
+                # picking Center includes it.
+                "position_codes": [
+                    r["position"] for r in conn.execute(
+                        "SELECT DISTINCT position FROM players WHERE position IS NOT NULL "
+                        "AND position != '' ORDER BY position"
+                    )
+                ],
+                "colleges": colleges,
+                "eras": ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s", "1950s"],
+            },
+            "players": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        logger.error(f"Error browsing players: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not browse the directory.")
+    finally:
+        conn.close()
+
+
 # NOTE: must be registered before /api/players/{id} or FastAPI matches
 # the literal path segment "search" as an id.
 @app.get("/api/players/search")

@@ -145,6 +145,35 @@ def _draft_bios() -> str:
     return f"{filled} bios in the newest class"
 
 
+def _player_bios() -> str:
+    """Position, height, college and last team for the directory.
+
+    Only the current season's bucket is refreshed on a schedule. playerindex
+    partitions on TO_YEAR, so historical buckets are closed sets that never
+    change - re-walking eighty of them weekly would be eighty requests to learn
+    nothing. A player who retires moves into a past bucket, and the current-season
+    call is where that shows up.
+
+    Run ingest_player_bios_bulk.py by hand with no flag to rebuild all of history.
+    """
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO_ROOT, "ingest_player_bios_bulk.py"), "--only-current"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "ingest_player_bios_bulk failed")[-300:])
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        withbio, total = conn.execute(
+            "SELECT SUM(CASE WHEN position IS NOT NULL AND position != '' THEN 1 ELSE 0 END), "
+            "COUNT(*) FROM players"
+        ).fetchone()
+    finally:
+        conn.close()
+    return f"{withbio or 0} of {total} with a bio"
+
+
 # Cadences are set by how fast the underlying truth moves, not by habit.
 # The Hall inducts once a year; weekly means a new class appears within days
 # without hammering a site that changes eleven times a decade.
@@ -154,6 +183,7 @@ JOBS: List[Job] = [
     Job("player_directory", 1, _player_directory, "Roster status moves daily; new players arrive mid-season"),
     Job("draft_history", 7, _draft_history, "New draft class each June, plus late pick corrections"),
     Job("draft_bios", 7, _draft_bios, "Bios for the newest picks appear over the weeks after the draft"),
+    Job("player_bios", 7, _player_bios, "Current-season bios; historical buckets never change"),
 ]
 
 

@@ -33,7 +33,8 @@ from nba_api.stats.endpoints import (
     playerdashptpass,
     shotchartdetail,
     scheduleleaguev2,
-    leaguedashlineups
+    leaguedashlineups,
+    playerindex
 )
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,23 @@ class NBAStatsClient:
             "leaguedashlineups", leaguedashlineups.LeagueDashLineups, params, ttl=3600
         )
         return self._parse_result_set(raw, "Lineups")
+
+    def player_index(self, season: str) -> List[Dict]:
+        """Full bios for players whose LAST season was `season`.
+
+        Not a roster for that year - the endpoint partitions on TO_YEAR, so a
+        player appears in exactly one season bucket, the one they retired after.
+        Walking every season from 1946-47 forward therefore yields every player in
+        league history exactly once, with position, height, weight, college,
+        country, jersey and draft slot, in about eighty requests instead of one
+        per player.
+
+        Cached permanently for completed seasons; the current season is the only
+        bucket that changes, so callers pass a short TTL for it.
+        """
+        params = {"season": season, "league_id": "00"}
+        raw = self._fetch("playerindex", playerindex.PlayerIndex, params, ttl=7 * 24 * 3600)
+        return self._parse_result_set(raw, "PlayerIndex")
 
     def common_all_players(
         self, season: str = "2024-25", is_only_current_season: int = 1

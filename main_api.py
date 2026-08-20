@@ -46,6 +46,7 @@ from src.DataProviders.SbrOddsProvider import SbrOddsProvider
 from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
 from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import LineupEngine as lineup_engine
+from src.Utils import ShotQuality as shot_quality
 from src.Utils import devig
 from src.Utils import elo as elo_engine
 from src.Utils import nba_live
@@ -1544,6 +1545,36 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
     finally:
         conn.close()
     _onoff_cache[key] = result
+    return result
+
+
+# --- Shot quality / shooting over expected --------------------------------------
+# 12 league-average cells (rim/mid/three x defender distance) price every
+# player's shot diet; SOE is making minus diet. Eight cached tracking fetches
+# per season-type, so the first cold call takes ~15s and every later one is
+# instant per process.
+_shot_quality_cache: Dict[tuple, Any] = {}
+
+
+@app.get("/api/shot-quality")
+def get_shot_quality(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    League-wide shot quality table: expected points per shot from the diet
+    (xPPS), actual PPS, shooting over expected per 100 attempts, and rim
+    pressure (rim share + how contested those rim shots are). The 12-cell
+    league matrix ships with the response - the whole model is inspectable.
+    """
+    key = (season, season_type)
+    if key in _shot_quality_cache:
+        return _shot_quality_cache[key]
+    try:
+        result = shot_quality.compute_shot_quality(season, season_type)
+    except Exception as e:
+        logger.error(f"Error computing shot quality for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not fetch tracking shot data from nba.com.")
+    if not result.get("players"):
+        raise HTTPException(status_code=404, detail=f"No tracking shot data for {season} {season_type}.")
+    _shot_quality_cache[key] = result
     return result
 
 

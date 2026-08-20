@@ -36,7 +36,8 @@ from nba_api.stats.endpoints import (
     leaguedashlineups,
     playerindex,
     leaguehustlestatsplayer,
-    leagueseasonmatchups
+    leagueseasonmatchups,
+    leaguedashplayerptshot
 )
 
 logger = logging.getLogger(__name__)
@@ -446,6 +447,38 @@ class NBAStatsClient:
             params, ttl=_LIVE_TTL_SECONDS
         )
         return self._parse_result_set(raw, "SeasonMatchups")
+
+    def player_pt_shots(
+        self,
+        season: str,
+        season_type: str = "Regular Season",
+        close_def_dist_range: Optional[str] = None,
+        general_range: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        League-wide tracking shot table: one row per player with FGM/FGA split
+        into 2s and 3s, filtered by closest-defender distance and/or shot
+        range. One call returns every player, so a defender-distance x range
+        cross of the whole league is a handful of requests, not thousands.
+
+        SecondSpectrum tracking data, recorded from 2013-14. Defender distance
+        is measured at release. FG2A minus a 'Less Than 10 ft' fetch of the
+        same bucket isolates non-rim twos.
+        """
+        params: Dict[str, Any] = {
+            "season": season,
+            "season_type_all_star": season_type,
+            "per_mode_simple": "Totals",
+        }
+        if close_def_dist_range:
+            params["close_def_dist_range_nullable"] = close_def_dist_range
+        if general_range:
+            params["general_range_nullable"] = general_range
+        raw = self._fetch(
+            "leaguedashplayerptshot", leaguedashplayerptshot.LeagueDashPlayerPtShot,
+            params, ttl=_LIVE_TTL_SECONDS
+        )
+        return self._parse_result_set(raw, "LeagueDashPTShots")
 
     def player_game_log(
         self,

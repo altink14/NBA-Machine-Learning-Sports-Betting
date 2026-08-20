@@ -1271,6 +1271,133 @@ def _parlay_correlation_matrix() -> Dict[str, Any]:
     return _parlay_corr_cache["matrix"]
 
 
+# --- Line shop -------------------------------------------------------------------
+# The latest quote per (game, book) from the odds archive, with a Shin no-vig
+# fair price column. The fair price is the hook: it is the number that says
+# whether ANY of the quoted prices is actually good.
+
+def _american(decimal_odds: float) -> int:
+    if decimal_odds >= 2.0:
+        return round((decimal_odds - 1) * 100)
+    return round(-100 / (decimal_odds - 1))
+
+
+@app.get("/api/lineshop")
+def get_lineshop(sport: str = "NBA", max_age_hours: int = 168):
+    """
+    Multi-book board: for every upcoming game, each book's latest archived
+    moneylines, spread and total, plus the market's de-vigged fair moneyline
+    (median of per-book Shin de-vigs). Every game carries the timestamp of its
+    freshest quote - staleness is shown, never hidden.
+    """
+    conn = _odds_snapshot_conn()
+    try:
+        since = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
+        rows = conn.execute(
+            """
+            SELECT s.* FROM odds_snapshots s
+            JOIN (
+                SELECT game_key, sportsbook, MAX(captured_at) mc
+                FROM odds_snapshots
+                WHERE sport = ? AND captured_at >= ?
+                GROUP BY game_key, sportsbook
+            ) t ON s.game_key = t.game_key AND s.sportsbook = t.sportsbook
+               AND s.captured_at = t.mc
+            WHERE s.sport = ?
+            """,
+            (sport, since, sport),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    games: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        start = r["game_start_time_utc"]
+        # No start time = a legacy row from the old scraper; games already
+        # started are history, not a shopping board.
+        if not start or start < now_iso:
+            continue
+        g = games.setdefault(r["game_key"], {
+            "game_key": r["game_key"],
+            "home_team": r["home_team"],
+            "away_team": r["away_team"],
+            "start": start,
+            "books": {},
+            "as_of": r["captured_at"],
+        })
+        keys = r.keys()
+        g["books"][r["sportsbook"]] = {
+            "captured_at": r["captured_at"],
+            "home_ml": r["home_ml"],
+            "away_ml": r["away_ml"],
+            "spread_home": r["spread_home"] if "spread_home" in keys else None,
+            "spread_home_price": r["spread_home_price"] if "spread_home_price" in keys else None,
+            "spread_away_price": r["spread_away_price"] if "spread_away_price" in keys else None,
+            "ou_line": r["ou_line"],
+            "ou_over_price": r["ou_over_price"] if "ou_over_price" in keys else None,
+            "ou_under_price": r["ou_under_price"] if "ou_under_price" in keys else None,
+        }
+        g["as_of"] = max(g["as_of"], r["captured_at"])
+
+    out = []
+    for g in games.values():
+        fair_home_probs = []
+        for b in g["books"].values():
+            hm, am = b["home_ml"], b["away_ml"]
+            if hm is None or am is None:
+                continue
+            try:
+                dec = [parlay.american_to_true_decimal(float(hm)),
+                       parlay.american_to_true_decimal(float(am))]
+                fair_home_probs.append(devig.fair_probs(dec)[0])
+            except (ValueError, TypeError):
+                continue
+        fair = None
+        if fair_home_probs:
+            fair_home_probs.sort()
+            n = len(fair_home_probs)
+            median = (fair_home_probs[n // 2] if n % 2
+                      else (fair_home_probs[n // 2 - 1] + fair_home_probs[n // 2]) / 2)
+            fair = {
+                "home_prob": round(median, 4),
+                "away_prob": round(1 - median, 4),
+                "home_ml_fair": _american(1 / median),
+                "away_ml_fair": _american(1 / (1 - median)),
+                "books_used": n,
+            }
+
+        def best(side: str):
+            candidates = [(book, b[side]) for book, b in g["books"].items() if b[side] is not None]
+            if not candidates:
+                return None
+            book, price = max(candidates, key=lambda x: x[1])  # higher American = better payout
+            entry: Dict[str, Any] = {"book": book, "price": price}
+            if fair:
+                prob = fair["home_prob"] if side == "home_ml" else fair["away_prob"]
+                dec = parlay.american_to_true_decimal(float(price))
+                entry["ev_pct_at_fair"] = round((prob * dec - 1) * 100, 2)
+            return entry
+
+        g["fair"] = fair
+        g["best"] = {"home_ml": best("home_ml"), "away_ml": best("away_ml")}
+        out.append(g)
+
+    out.sort(key=lambda x: x["start"])
+    return {
+        "sport": sport,
+        "games": out,
+        "books": sorted({bk for g in out for bk in g["books"]}),
+        "devig_method": devig.ACTIVE_METHOD,
+        "note": (
+            "Latest archived quote per book; the 'as of' stamp is each game's freshest "
+            "capture. Fair price = median of per-book de-vigged moneylines - the market's "
+            "opinion with the margin removed. EV at the best price is measured against "
+            "that consensus, not against our model."
+        ),
+    }
+
+
 # --- Defensive matchups ----------------------------------------------------------
 # LeagueSeasonMatchups: literal player-vs-player defensive possessions, the
 # tracking system's attribution of who guarded whom. Recorded from 2017-18.

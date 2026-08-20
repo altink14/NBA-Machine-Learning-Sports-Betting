@@ -170,6 +170,37 @@ def grade_logged_predictions() -> None:
         logger.warning("Prediction grading failed (non-fatal): %s", exc)
 
 
+def snapshot_odds_board() -> str:
+    """
+    Archive today's odds board from The Odds API (moneylines, spreads, totals,
+    every US book) into odds_snapshots. One run costs ~3 API credits, so the
+    daily cadence fits the free tier; the in-season high-frequency cadence is
+    snapshot_odds_api.py --loop (see that file's quota math).
+
+    Returns 'ok', 'skipped' (no key configured), or 'failed'. A missing key is
+    logged loudly every day rather than silently: an empty archive that LOOKS
+    fine is how the predictions_log bug lived for weeks.
+    """
+    if not os.environ.get("ODDS_API_KEY", "").strip():
+        logger.warning(
+            "ODDS_API_KEY is not set - odds board NOT archived. CLV/line-shop "
+            "features starve without this. Create a key at the-odds-api.com."
+        )
+        return "skipped"
+    try:
+        from src.Utils.odds_api_client import snapshot_nba_board
+        db_path = os.path.join(REPO_ROOT, "Data", "OddsData.sqlite")
+        summary = snapshot_nba_board(db_path)
+        logger.info(
+            "Odds board archived: %s events, %s rows written, quota remaining %s",
+            summary["events"], summary["written"], summary["quota_remaining"],
+        )
+        return "ok"
+    except Exception as exc:
+        logger.error("Odds board snapshot failed: %s", exc, exc_info=True)
+        return "failed"
+
+
 def main() -> int:
     season = current_season(date.today())
     logger.info("=== Daily update starting for season %s ===", season)
@@ -178,6 +209,7 @@ def main() -> int:
     stats_ok = refresh_team_stats_snapshot()
     grade_logged_predictions()
     prediction_status = log_todays_predictions()
+    odds_status = snapshot_odds_board()
     ingests_ok = refresh_periodic_ingests()
 
     failures = []
@@ -187,6 +219,10 @@ def main() -> int:
         failures.append("team-stats refresh")
     if prediction_status == "failed":
         failures.append("prediction logging")
+    # A failed snapshot only fails the task in season: July has no board, and
+    # a missing key is a loud warning rather than a red run.
+    if odds_status == "failed" and _nba_games_expected():
+        failures.append("odds board snapshot")
     if not ingests_ok:
         failures.append("periodic ingests")
 

@@ -47,6 +47,7 @@ from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
 from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
+from src.Utils import ClutchLedger as clutch_ledger
 from src.Utils import devig
 from src.Utils import elo as elo_engine
 from src.Utils import nba_live
@@ -1546,6 +1547,56 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
         conn.close()
     _onoff_cache[key] = result
     return result
+
+
+# --- Clutch ledger ----------------------------------------------------------------
+# Every clutch event in the PBP archive (last 5:00 of Q4/OT, margin <= 5 at
+# the moment of the event), attributed to players. One walk per season-type,
+# cached per process; the per-player possession lists ride in the same cache
+# and are served by the /events endpoint.
+_clutch_cache: Dict[tuple, Any] = {}
+
+
+def _clutch_for(season: str, season_type: str) -> Dict[str, Any]:
+    key = (season, season_type)
+    if key not in _clutch_cache:
+        conn = get_db_conn()
+        try:
+            _clutch_cache[key] = clutch_ledger.compute_clutch(conn, season, season_type)
+        finally:
+            conn.close()
+    return _clutch_cache[key]
+
+
+@app.get("/api/clutch")
+def get_clutch(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    Per-player clutch aggregates with Wilson 95% intervals on FG% and the
+    player's own full-season FG% for comparison. Clutch = last 5:00 of the
+    4th or OT, margin <= 5 before the event.
+    """
+    try:
+        result = _clutch_for(season, season_type)
+    except Exception as e:
+        logger.error(f"Error computing clutch ledger for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute the clutch ledger.")
+    return {k: v for k, v in result.items() if k != "_ledger"}
+
+
+@app.get("/api/clutch/events")
+def get_clutch_events(player_id: int, season: str = CURRENT_SEASON,
+                      season_type: str = "Regular Season"):
+    """The browsable possession list: every clutch event for one player."""
+    try:
+        result = _clutch_for(season, season_type)
+    except Exception as e:
+        logger.error(f"Error computing clutch ledger for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute the clutch ledger.")
+    events = (result.get("_ledger") or {}).get(player_id)
+    if events is None:
+        raise HTTPException(status_code=404, detail="No clutch events for that player-season.")
+    return {"season": season, "season_type": season_type, "player_id": player_id,
+            "events": events}
 
 
 # --- Rebounding chances ----------------------------------------------------------

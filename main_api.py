@@ -1548,6 +1548,72 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
     return result
 
 
+# --- Rebounding chances ----------------------------------------------------------
+# Tracking's answer to "who WINS rebounds vs who collects them": contested vs
+# uncontested boards, chances (within 3.5 ft of the ball) vs converted, and
+# chances deferred to a teammate. One league-wide fetch per season-type.
+_rebounding_cache: Dict[tuple, Any] = {}
+
+
+@app.get("/api/rebounding")
+def get_rebounding_chances(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    Per-player rebounding tracking: for each of OREB/DREB/overall - total,
+    contested, contested share, chances, chance conversion, deferred chances,
+    deferral-adjusted conversion, and average rebound distance. A rebound
+    CHANCE is being within 3.5 feet of the ball; DEFERRED chances (a teammate
+    took it) are excluded by the adjusted rate.
+    """
+    key = (season, season_type)
+    if key in _rebounding_cache:
+        return _rebounding_cache[key]
+    from src.Utils.nba_stats_client import get_client
+    try:
+        rows = get_client().league_pt_stats(season, season_type, "Rebounding")
+    except Exception as e:
+        logger.error(f"Error fetching rebounding tracking for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not fetch tracking rebounding data from nba.com.")
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No tracking rebounding data for {season} {season_type}.")
+
+    players = []
+    for r in rows:
+        p = {
+            "player_id": r.get("PLAYER_ID"),
+            "name": r.get("PLAYER_NAME"),
+            "team": r.get("TEAM_ABBREVIATION"),
+            "gp": r.get("GP"),
+            "min": r.get("MIN"),
+        }
+        for side, pre in (("oreb", "OREB"), ("dreb", "DREB"), ("reb", "REB")):
+            p[side] = {
+                "total": r.get(pre),
+                "contest": r.get(f"{pre}_CONTEST"),
+                "contest_pct": r.get(f"{pre}_CONTEST_PCT"),
+                "chances": r.get(f"{pre}_CHANCES"),
+                "chance_pct": r.get(f"{pre}_CHANCE_PCT"),
+                "defer": r.get(f"{pre}_CHANCE_DEFER"),
+                "chance_pct_adj": r.get(f"{pre}_CHANCE_PCT_ADJ"),
+                "avg_dist": r.get(f"AVG_{pre}_DIST"),
+            }
+        players.append(p)
+
+    result = {
+        "season": season,
+        "season_type": season_type,
+        "players": players,
+        "method": (
+            "nba.com SecondSpectrum tracking (recorded from 2013-14). A rebound chance "
+            "is being within 3.5 feet of a live rebound; a contested rebound had an "
+            "opponent within that same radius. Deferred chances - a teammate collected "
+            "the ball - are removed from the adjusted conversion rate, which is the "
+            "fairer number for guards standing next to their center."
+        ),
+    }
+    _rebounding_cache[key] = result
+    return result
+
+
 # --- Shot quality / shooting over expected --------------------------------------
 # 12 league-average cells (rim/mid/three x defender distance) price every
 # player's shot diet; SOE is making minus diet. Eight cached tracking fetches

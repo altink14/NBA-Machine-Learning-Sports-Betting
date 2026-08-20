@@ -37,7 +37,8 @@ from nba_api.stats.endpoints import (
     playerindex,
     leaguehustlestatsplayer,
     leagueseasonmatchups,
-    leaguedashplayerptshot
+    leaguedashplayerptshot,
+    leaguedashptstats
 )
 
 logger = logging.getLogger(__name__)
@@ -479,6 +480,35 @@ class NBAStatsClient:
             params, ttl=_LIVE_TTL_SECONDS
         )
         return self._parse_result_set(raw, "LeagueDashPTShots")
+
+    def league_pt_stats(
+        self,
+        season: str,
+        season_type: str = "Regular Season",
+        pt_measure_type: str = "Rebounding",
+    ) -> List[Dict]:
+        """
+        League-wide player tracking table for one measure type (Rebounding,
+        Drives, Possessions, ...): one row per player, one request for the
+        whole league. SecondSpectrum tracking, recorded from 2013-14.
+
+        The Rebounding measure is the interesting one for us: contested vs
+        uncontested boards, rebound CHANCES (being within 3.5 ft of the ball)
+        vs rebounds actually converted, chances deferred to a teammate, and
+        average rebound distance.
+        """
+        params = {
+            "season": season,
+            "season_type_all_star": season_type,
+            "per_mode_simple": "Totals",
+            "player_or_team": "Player",
+            "pt_measure_type": pt_measure_type,
+        }
+        raw = self._fetch(
+            "leaguedashptstats", leaguedashptstats.LeagueDashPtStats,
+            params, ttl=_LIVE_TTL_SECONDS
+        )
+        return self._parse_result_set(raw, "LeagueDashPtStats")
 
     def player_game_log(
         self,

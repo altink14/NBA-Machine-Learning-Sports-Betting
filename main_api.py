@@ -1543,6 +1543,118 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
     return result
 
 
+@app.get("/api/injury-impact")
+def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    The measured line impact of who is OUT right now.
+
+    For every player on the ESPN wire with status Out or Doubtful, this joins
+    the live absence against our stint engine and prices it:
+
+        impact (points on the margin) = -(floor share) x (on/off diff per 100)
+                                        x (team pace / 100)
+
+    with a 95% interval from the stint-clustered standard error. Questionable
+    and day-to-day players are DELIBERATELY absent - most of them play, and
+    pricing them poisons more than it informs (the wire enforces this policy).
+
+    On/off measures what happened, not why: an impact here is "the team has
+    been this much worse per game without him", not a causal guarantee.
+    """
+    absences = espn_injuries.get_absences()
+
+    # Team pace for converting per-100-possession impact to per-game points.
+    pace_by_abbr: Dict[str, float] = {}
+    conn = get_db_conn()
+    try:
+        for r in conn.execute(
+            "SELECT m.abbreviation, s.pace FROM team_season_advanced s "
+            "JOIN team_metadata m ON m.team_id = s.team_id "
+            "WHERE s.season = ? AND s.season_type = ?",
+            (season, season_type),
+        ):
+            if r["pace"]:
+                pace_by_abbr[r["abbreviation"]] = float(r["pace"])
+    finally:
+        conn.close()
+
+    teams_out: List[Dict[str, Any]] = []
+    for abbr, entries in sorted((absences.get("by_team") or {}).items()):
+        try:
+            onoff = get_team_onoff(abbr, season, season_type)
+        except HTTPException:
+            continue
+        by_id = {p["player_id"]: p for p in onoff.get("players", [])}
+        pace = pace_by_abbr.get(abbr, 100.0)
+        games_proc = onoff.get("games_processed") or 0
+
+        players: List[Dict[str, Any]] = []
+        total = 0.0
+        var_total = 0.0
+        measured_any = False
+        for e in entries:
+            item: Dict[str, Any] = {
+                "name": e.get("name"),
+                "status": e.get("status"),
+                "detail": e.get("detail"),
+                "measured": False,
+            }
+            p = by_id.get(e.get("player_id"))
+            if p and p.get("diff_per100") is not None and games_proc > 0:
+                share = min(1.0, p["min_on"] / (games_proc * 48.0))
+                impact = -share * p["diff_per100"] * pace / 100.0
+                se = share * (p.get("se_diff_per100") or 0.0) * pace / 100.0
+                item.update({
+                    "measured": True,
+                    "diff_per100": p["diff_per100"],
+                    "min_share": round(share, 3),
+                    "min_on": p["min_on"],
+                    "impact_pts": round(impact, 2),
+                    "impact_ci95": [round(impact - 1.96 * se, 2), round(impact + 1.96 * se, 2)],
+                    "thin": p["min_on"] < 200,
+                })
+                total += impact
+                var_total += se * se
+                measured_any = True
+            else:
+                item["why_unmeasured"] = (
+                    "no resolvable stint data this season - a rookie, a new "
+                    "arrival, or too few minutes"
+                )
+            players.append(item)
+
+        se_total = var_total ** 0.5
+        teams_out.append({
+            "team": abbr,
+            "pace": round(pace, 1),
+            "games_processed": games_proc,
+            "players": players,
+            "team_impact_pts": round(total, 2) if measured_any else None,
+            "team_impact_ci95": [round(total - 1.96 * se_total, 2), round(total + 1.96 * se_total, 2)]
+                if measured_any else None,
+        })
+
+    return {
+        "season": season,
+        "season_type": season_type,
+        "teams": teams_out,
+        "wire": {
+            "source": absences.get("source"),
+            "fetched_at": absences.get("fetched_at"),
+            "total_counted": absences.get("total_counted"),
+            "match_rate": absences.get("match_rate"),
+            "counted_statuses": absences.get("counted_statuses"),
+        },
+        "method": (
+            "Impact = -(floor share) x (measured on/off diff per 100) x (pace/100), "
+            "the same removal math as the Trade Machine, in points per game on the "
+            "margin. The interval is a stint-clustered 95% band - a floor on the real "
+            "uncertainty, not a ceiling. Out/Doubtful only; game-time decisions are "
+            "never priced, by policy."
+        ),
+    }
+
+
 @app.get("/api/parlay/correlation")
 def get_parlay_correlation():
     """

@@ -386,10 +386,36 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
     def per100(net: float, poss: float) -> Optional[float]:
         return round(net / poss * 100.0, 2) if poss >= 1 else None
 
+    # Stint-clustered standard error of the on/off diff (delta method on the
+    # two ratio estimators, stints as the sampling unit). This is what lets a
+    # consumer say "-4.1 ± 2.3" instead of pretending the point estimate is
+    # exact. It understates true uncertainty a little (stints within a game
+    # correlate), so it is a floor on the error bar, never a ceiling.
+    var_acc: Dict[int, Dict[str, float]] = {}
+    for pid, gids in games_with.items():
+        a = on_acc[pid]
+        r_on = a["net_on"] / a["poss_on"] if a["poss_on"] >= 1 else None
+        r_off = a["net_off"] / a["poss_off"] if a["poss_off"] >= 1 else None
+        v = var_acc.setdefault(pid, {"on": 0.0, "off": 0.0})
+        for gid in gids:
+            for st in team_stints_by_game[gid]:
+                if pid in st["_ours"]:
+                    if r_on is not None:
+                        v["on"] += (st["_net"] - r_on * st["_poss"]) ** 2
+                else:
+                    if r_off is not None:
+                        v["off"] += (st["_net"] - r_off * st["_poss"]) ** 2
+
     players_out = []
     for pid, a in on_acc.items():
         net_on = per100(a["net_on"], a["poss_on"])
         net_off = per100(a["net_off"], a["poss_off"])
+        se_diff = None
+        if net_on is not None and net_off is not None:
+            v = var_acc.get(pid, {"on": 0.0, "off": 0.0})
+            se_diff = round(100.0 * (
+                v["on"] / (a["poss_on"] ** 2) + v["off"] / (a["poss_off"] ** 2)
+            ) ** 0.5, 2)
         players_out.append({
             "player_id": pid,
             "name": names.get(pid, f"#{pid}"),
@@ -402,6 +428,7 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
             "net_off_per100": net_off,
             "diff_per100": round(net_on - net_off, 2)
                 if net_on is not None and net_off is not None else None,
+            "se_diff_per100": se_diff,
         })
     players_out.sort(key=lambda p: (p["diff_per100"] is None, -(p["diff_per100"] or 0)))
 

@@ -24,6 +24,12 @@ name shared by two teammates, is EXCLUDED AND COUNTED, and the API reports the
 count. Possessions are the same Dean Oliver estimate used elsewhere on the
 site (FGA + 0.44*FTA - OREB + TO), computed per stint; free-throw-interleaved
 substitutions attribute points by event order, the standard approximation.
+
+GARBAGE TIME. Every stint is classified against a published rule (see
+GARBAGE_DEFINITION); flagged stints are always counted in the output and
+removed from every table only when exclude_garbage is requested. The rule is
+deliberately conservative and end-anchored: a blowout that turns into a real
+comeback retroactively stops being garbage.
 """
 
 import json
@@ -33,6 +39,34 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 # "SUB: Harper FOR Fox" -> ("Harper", "Fox")
 _SUB_RE = re.compile(r"^SUB:\s*(.+?)\s+FOR\s+(.+?)\s*$")
+
+# The published garbage-time rule. A stint is garbage when ALL of:
+#   - it starts in the 4th quarter (overtime is never garbage - the game was
+#     tied after 48 minutes);
+#   - the margin when the stint begins clears a time-scaled bar:
+#     25+ at any point in the 4th, 20+ inside 9:00, 15+ inside 6:00,
+#     10+ inside 3:00;
+#   - the game ends with a double-digit margin. If a comeback brings it back
+#     inside 10, nothing in that game counts as garbage.
+GARBAGE_DEFINITION = (
+    "4th-quarter stints beginning with a margin of 25+ at any time, 20+ inside "
+    "9:00, 15+ inside 6:00, or 10+ inside 3:00, in games that end with a "
+    "double-digit margin. Overtime is never garbage time, and a game a comeback "
+    "brings back inside 10 has none."
+)
+_GARBAGE_FINAL_MARGIN = 10
+
+
+def _stint_is_garbage(period: int, clock_start: float, margin_start: int,
+                      final_margin: Optional[int]) -> bool:
+    if period != 4 or final_margin is None or final_margin < _GARBAGE_FINAL_MARGIN:
+        return False
+    return (
+        margin_start >= 25
+        or (margin_start >= 20 and clock_start <= 540.0)
+        or (margin_start >= 15 and clock_start <= 360.0)
+        or (margin_start >= 10 and clock_start <= 180.0)
+    )
 
 
 def _norm(name: str) -> str:
@@ -134,7 +168,8 @@ def _infer_period_starters(events: List[Any], roster_teams: Dict[str, Dict[str, 
 def _period_stints(events: List[Any], starters: Dict[str, Set[int]],
                    roster_teams: Dict[str, Dict[str, List[int]]],
                    tricodes: Tuple[str, str], period_start_clock: float,
-                   score_in: Tuple[int, int]) -> Tuple[List[Dict[str, Any]], Tuple[int, int]]:
+                   score_in: Tuple[int, int],
+                   period: int) -> Tuple[List[Dict[str, Any]], Tuple[int, int]]:
     """
     Walk one period's events into stints. Each stint carries both fives, the
     clock span, the score movement, and per-team possession ingredients.
@@ -160,6 +195,9 @@ def _period_stints(events: List[Any], starters: Dict[str, Set[int]],
         seconds = max(0.0, stint_open["clock_start"] - clock_end)
         stints.append({
             "seconds": seconds,
+            "period": period,
+            "clock_start": stint_open["clock_start"],
+            "margin_start": abs(stint_open["score_start"][0] - stint_open["score_start"][1]),
             "home_on": stint_open["home_on"],
             "away_on": stint_open["away_on"],
             "home_pts": score[0] - stint_open["score_start"][0],
@@ -245,7 +283,8 @@ def _possessions(counts: Dict[str, Dict[str, int]], tricodes: Tuple[str, str]) -
 
 
 def compute_team_onoff(conn, team_abbr: str, season: str,
-                       season_type: str = "Regular Season") -> Dict[str, Any]:
+                       season_type: str = "Regular Season",
+                       exclude_garbage: bool = False) -> Dict[str, Any]:
     team_abbr = team_abbr.upper()
     row = conn.execute(
         "SELECT team_id FROM team_metadata WHERE abbreviation = ?", (team_abbr,)
@@ -262,6 +301,7 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
     ).fetchall()
 
     excluded = {"games_no_pbp": 0, "games_no_roster": 0, "periods_dropped": 0, "periods_total": 0}
+    garbage = {"stints": 0, "min": 0.0, "poss": 0.0}
     names: Dict[int, str] = {}
     # player_id -> per-game presence and on/off accumulators
     on_acc: Dict[int, Dict[str, float]] = {}
@@ -325,7 +365,8 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
             try:
                 starters = _infer_period_starters(evs, roster["teams"], tricodes)
                 stints, score_carry = _period_stints(
-                    evs, starters, roster["teams"], tricodes, start_clock, score_carry
+                    evs, starters, roster["teams"], tricodes, start_clock, score_carry,
+                    period
                 )
                 game_stints.extend(stints)
             except _PeriodDrop:
@@ -336,6 +377,27 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
                         score_carry = (int(pr["score_home"]), int(pr["score_away"]))
                 continue
 
+        if not game_stints:
+            continue
+
+        # Garbage-time classification needs the final margin: the rule only
+        # fires in games that END as blowouts. Read it off the last scored
+        # event rather than trusting score_carry past dropped periods.
+        final_margin = None
+        for ev in reversed(events):
+            if ev["score_home"] is not None and ev["score_away"] is not None:
+                final_margin = abs(int(ev["score_home"]) - int(ev["score_away"]))
+                break
+        kept = []
+        for st in game_stints:
+            if _stint_is_garbage(st["period"], st["clock_start"], st["margin_start"], final_margin):
+                garbage["stints"] += 1
+                garbage["min"] += st["seconds"] / 60.0
+                garbage["poss"] += _possessions(st["counts"], tricodes)
+                if exclude_garbage:
+                    continue
+            kept.append(st)
+        game_stints = kept
         if not game_stints:
             continue
         games_processed += 1
@@ -453,6 +515,13 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
         "games_scheduled": len(games),
         "games_processed": games_processed,
         "excluded": excluded,
+        "garbage_time": {
+            "excluded": exclude_garbage,
+            "stints": garbage["stints"],
+            "min": round(garbage["min"], 1),
+            "poss": round(garbage["poss"], 1),
+            "definition": GARBAGE_DEFINITION,
+        },
         "players": players_out,
         "lineups": lineups_out[:60],
         "method": (

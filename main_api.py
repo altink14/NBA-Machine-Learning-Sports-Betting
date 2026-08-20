@@ -1519,19 +1519,23 @@ _onoff_cache: Dict[tuple, Any] = {}
 
 
 @app.get("/api/teams/{abbr}/onoff")
-def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "Regular Season",
+                   exclude_garbage: bool = False):
     """
     Per-player on/off splits (team net per 100 possessions on vs off the
     floor) and five-man lineup plus-minus, parsed from the play-by-play
     archive. Periods that cannot be resolved honestly are dropped and counted
-    in `excluded` - never guessed.
+    in `excluded` - never guessed. exclude_garbage=true recomputes everything
+    with garbage-time stints removed (rule published in the response's
+    garbage_time.definition); flagged stints are counted either way.
     """
-    key = (abbr.upper(), season, season_type)
+    key = (abbr.upper(), season, season_type, exclude_garbage)
     if key in _onoff_cache:
         return _onoff_cache[key]
     conn = get_db_conn()
     try:
-        result = lineup_engine.compute_team_onoff(conn, abbr, season, season_type)
+        result = lineup_engine.compute_team_onoff(conn, abbr, season, season_type,
+                                                  exclude_garbage=exclude_garbage)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

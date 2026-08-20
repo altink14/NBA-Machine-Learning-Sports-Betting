@@ -45,6 +45,7 @@ except ImportError:
 from src.DataProviders.SbrOddsProvider import SbrOddsProvider
 from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
 from src.Utils import ParlayCorrelation as parlay_corr
+from src.Utils import LineupEngine as lineup_engine
 from src.Utils import devig
 from src.Utils import elo as elo_engine
 from src.Utils import nba_live
@@ -1268,6 +1269,38 @@ def _parlay_correlation_matrix() -> Dict[str, Any]:
         matrix["archive_exclusions"] = excluded
         _parlay_corr_cache["matrix"] = matrix
     return _parlay_corr_cache["matrix"]
+
+
+# --- Lineup on/off engine ------------------------------------------------------
+# Stints from play-by-play substitutions -> per-player on/off and five-man
+# lineup net ratings. Computed on demand per team-season (sub-second on the
+# archive) and cached per process.
+_onoff_cache: Dict[tuple, Any] = {}
+
+
+@app.get("/api/teams/{abbr}/onoff")
+def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    Per-player on/off splits (team net per 100 possessions on vs off the
+    floor) and five-man lineup plus-minus, parsed from the play-by-play
+    archive. Periods that cannot be resolved honestly are dropped and counted
+    in `excluded` - never guessed.
+    """
+    key = (abbr.upper(), season, season_type)
+    if key in _onoff_cache:
+        return _onoff_cache[key]
+    conn = get_db_conn()
+    try:
+        result = lineup_engine.compute_team_onoff(conn, abbr, season, season_type)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error computing on/off for {abbr} {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute on/off splits.")
+    finally:
+        conn.close()
+    _onoff_cache[key] = result
+    return result
 
 
 @app.get("/api/parlay/correlation")

@@ -6,10 +6,11 @@ of FiveThirtyEight's NBA Elo.
 
 Methodology and constants
 -------------------------
-- BASE_RATING = 1500. Every team starts at 1500 at the beginning of 2022-23.
-  That is the earliest season in the database — we have no pre-2022-23 games,
-  so unlike 538 (which carries ratings back to 1946) the first few months of
-  2022-23 are a cold start and early-2022-23 numbers should be read as rough.
+- BASE_RATING = 1500. Every team starts at 1500 at the beginning of 2021-22,
+  the earliest season in the database. Unlike 538 (which carries ratings back
+  to 1946) the first few months of the FIRST archived season are a cold start
+  and should be read as rough; each backfilled season pushes that cold start
+  further into the past.
 - K_FACTOR = 20 (538's NBA value). Published sensitivity checks (and 538's own
   notes) show final orderings are insensitive to K anywhere in the 20-50 range,
   so the exact choice is not load-bearing.
@@ -31,7 +32,7 @@ Home-court resolution
 ---------------------
 team_game_advanced holds TWO rows per game (one per team) and has no
 home/away flag. box_scores (same database, one row per game) stores
-home_team_id and away_team_id for every game in 2022-23 through 2025-26, so
+home_team_id and away_team_id for every archived game (2021-22 onward), so
 one row per game is derived by joining team_game_advanced to box_scores on
 (game_id, team_id = home_team_id): pts is then the home score and opp_pts the
 away score.
@@ -52,7 +53,7 @@ MEAN_REVERT_TARGET = 1505.0
 K_FACTOR = 20.0
 HOME_ADVANTAGE = 70.0
 SEASON_CARRYOVER = 0.75
-HISTORY_START_SEASON = "2022-23"
+HISTORY_START_SEASON = "2021-22"
 
 
 def _expected_home_score(home_elo: float, away_elo: float) -> float:

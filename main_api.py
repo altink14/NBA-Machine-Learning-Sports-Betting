@@ -44,6 +44,7 @@ except ImportError:
 # Local Imports
 from src.DataProviders.SbrOddsProvider import SbrOddsProvider
 from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
+from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import devig
 from src.Utils import elo as elo_engine
 from src.Utils import nba_live
@@ -1231,12 +1232,58 @@ def evaluate_parlay_endpoint(request: Request, payload: ParlayRequest):
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Same-game moneyline+total pairs get correlation-adjusted pricing from
+    # the measured archive matrix; any failure leaves the honest independent
+    # math (and its UNRELIABLE verdict) untouched.
+    if any(w.get("type") == "SAME_GAME" for w in result.get("warnings", [])):
+        try:
+            parlay_corr.adjust_same_game_pairs(result, _parlay_correlation_matrix())
+        except Exception as e:
+            logger.warning(f"Parlay correlation adjustment skipped: {e}")
+
     if not cached_predictions and any(l["model_prob"] is None for l in legs_payload):
         result["note"] = (
             "No live model predictions were available (call /predictions first during the "
             "season); legs without an explicit model_prob used bookmaker implied probability."
         )
     return result
+
+
+# The measured correlation matrix is built once per process from the same
+# archive rows key-numbers reads (every archived game with closing spread,
+# total and moneylines).
+_parlay_corr_cache: Dict[str, Any] = {}
+
+
+def _parlay_correlation_matrix() -> Dict[str, Any]:
+    if "matrix" not in _parlay_corr_cache:
+        conn = _odds_snapshot_conn()
+        try:
+            games, excluded = _load_key_number_games(conn)
+        finally:
+            conn.close()
+        matrix = parlay_corr.build_correlation_matrix(games)
+        matrix["seasons"] = sorted({g["season"] for g in games})
+        matrix["games_loaded"] = len(games)
+        matrix["archive_exclusions"] = excluded
+        _parlay_corr_cache["matrix"] = matrix
+    return _parlay_corr_cache["matrix"]
+
+
+@app.get("/api/parlay/correlation")
+def get_parlay_correlation():
+    """
+    The measured same-game correlation matrix: for each favorite-strength
+    bucket, how often 'favorite wins' and 'game goes over' actually co-occur
+    across the historical odds archive, versus what independence would say.
+    Feeds the correlation-adjusted pricing in /api/parlay/evaluate and the
+    matrix panel on /parlay.
+    """
+    try:
+        return _parlay_correlation_matrix()
+    except Exception as e:
+        logger.error(f"Error building parlay correlation matrix: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Historical odds archive is unavailable.")
 
 # --- Line movements (from real odds snapshots) ---
 @app.get("/api/line-movements")
@@ -6565,6 +6612,10 @@ def _load_key_number_games(conn) -> tuple:
                 "spread": spread_signed,
                 "total_line": float(r["OU"]) if r["OU"] is not None else None,
                 "points": points,
+                # Carried for the parlay correlation matrix, which buckets by
+                # the favorite's moneyline-implied probability.
+                "ml_home": ml_home,
+                "ml_away": ml_away,
             })
     return games, excluded
 

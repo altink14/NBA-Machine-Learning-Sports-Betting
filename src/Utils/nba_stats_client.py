@@ -35,7 +35,8 @@ from nba_api.stats.endpoints import (
     scheduleleaguev2,
     leaguedashlineups,
     playerindex,
-    leaguehustlestatsplayer
+    leaguehustlestatsplayer,
+    leagueseasonmatchups
 )
 
 logger = logging.getLogger(__name__)
@@ -411,6 +412,40 @@ class NBAStatsClient:
             ttl=_LIVE_TTL_SECONDS
         )
         return self._parse_result_set(raw, "PassesMade")
+
+    def season_matchups(
+        self,
+        season: str,
+        season_type: str = "Regular Season",
+        off_player_id: Optional[int] = None,
+        def_player_id: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        Player-vs-player defensive matchups for a season: who guarded whom,
+        for how many partial possessions, and what the offensive player did
+        during them (points, FG, threes, turnovers, shooting fouls drawn).
+
+        Pass off_player_id for "who guarded this player", def_player_id for
+        "who this player guarded". Tracking-derived; recorded from 2017-18.
+        A partial possession is the tracking system's share attribution - one
+        offensive possession splits across every defender who guarded the
+        ball-handler during it.
+        """
+        params: Dict[str, Any] = {
+            "season": season,
+            "season_type_playoffs": season_type,
+            "per_mode_simple": "Totals",
+            "league_id": "00",
+        }
+        if off_player_id:
+            params["off_player_id_nullable"] = off_player_id
+        if def_player_id:
+            params["def_player_id_nullable"] = def_player_id
+        raw = self._fetch(
+            "leagueseasonmatchups", leagueseasonmatchups.LeagueSeasonMatchups,
+            params, ttl=_LIVE_TTL_SECONDS
+        )
+        return self._parse_result_set(raw, "SeasonMatchups")
 
     def player_game_log(
         self,

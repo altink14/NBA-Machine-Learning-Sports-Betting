@@ -1271,6 +1271,119 @@ def _parlay_correlation_matrix() -> Dict[str, Any]:
     return _parlay_corr_cache["matrix"]
 
 
+# --- Defensive matchups ----------------------------------------------------------
+# LeagueSeasonMatchups: literal player-vs-player defensive possessions, the
+# tracking system's attribution of who guarded whom. Recorded from 2017-18.
+MATCHUP_FIRST_SEASON = "2017-18"
+
+
+def _matchup_minutes(v) -> Optional[float]:
+    """'25:05' -> 25.1; tolerate numbers and junk."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return round(float(v), 1)
+    try:
+        mm, _, ss = str(v).partition(":")
+        return round(int(mm) + (int(ss) if ss else 0) / 60.0, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_matchup_row(r: Dict[str, Any], opponent_side: str) -> Dict[str, Any]:
+    poss = float(r.get("PARTIAL_POSS") or 0)
+    pts = r.get("PLAYER_PTS") or 0
+    return {
+        "opponent_id": r.get(f"{opponent_side}_PLAYER_ID"),
+        "opponent": r.get(f"{opponent_side}_PLAYER_NAME"),
+        "gp": r.get("GP"),
+        "matchup_min": _matchup_minutes(r.get("MATCHUP_MIN")),
+        "poss": round(poss, 1),
+        "pts": pts,
+        "pts_per100": round(pts / poss * 100, 1) if poss > 0 else None,
+        "fgm": r.get("MATCHUP_FGM"),
+        "fga": r.get("MATCHUP_FGA"),
+        "fg_pct": r.get("MATCHUP_FG_PCT"),
+        "fg3m": r.get("MATCHUP_FG3M"),
+        "fg3a": r.get("MATCHUP_FG3A"),
+        "ftm": r.get("MATCHUP_FTM"),
+        "fta": r.get("MATCHUP_FTA"),
+        "tov": r.get("MATCHUP_TOV"),
+        "shooting_fouls": r.get("SFL"),
+    }
+
+
+@app.get("/api/players/{player_id}/matchups")
+def get_player_matchups(player_id: int, season: str = CURRENT_SEASON,
+                        season_type: str = "Regular Season"):
+    """
+    Who guarded this player, and who he guarded - partial possessions, points,
+    and shooting during the matchup. The props-bettor question ("how has he
+    done against THIS defender?") answered with the league's own tracking
+    attribution rather than anecdote.
+    """
+    if season < MATCHUP_FIRST_SEASON:
+        return {
+            "player_id": player_id, "season": season, "season_type": season_type,
+            "tracked": False, "guarded_by": [], "guarded": [],
+            "note": f"Matchup tracking begins in {MATCHUP_FIRST_SEASON}.",
+        }
+    from src.Utils.nba_stats_client import get_client
+    client = get_client()
+    try:
+        as_offense = client.season_matchups(season=season, season_type=season_type,
+                                            off_player_id=player_id)
+        as_defense = client.season_matchups(season=season, season_type=season_type,
+                                            def_player_id=player_id)
+    except Exception as e:
+        logger.error(f"Matchup fetch failed for {player_id} {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="stats.nba.com did not answer for matchup data.")
+
+    guarded_by = sorted(
+        (_normalize_matchup_row(r, "DEF") for r in as_offense),
+        key=lambda x: -(x["poss"] or 0),
+    )
+    guarded = sorted(
+        (_normalize_matchup_row(r, "OFF") for r in as_defense),
+        key=lambda x: -(x["poss"] or 0),
+    )
+
+    # Best-effort team labels for every opponent, from the local archive.
+    opp_ids = {r["opponent_id"] for r in guarded_by + guarded if r["opponent_id"]}
+    teams: Dict[int, str] = {}
+    if opp_ids:
+        conn = get_db_conn()
+        try:
+            marks = ",".join("?" for _ in opp_ids)
+            for row in conn.execute(
+                f"SELECT t.player_id, GROUP_CONCAT(DISTINCT m.abbreviation) abbrs "
+                f"FROM player_season_totals t JOIN team_metadata m ON m.team_id = t.team_id "
+                f"WHERE t.season = ? AND t.season_type = ? AND t.player_id IN ({marks}) "
+                f"GROUP BY t.player_id",
+                (season, season_type, *opp_ids),
+            ):
+                teams[row["player_id"]] = row["abbrs"]
+        finally:
+            conn.close()
+    for r in guarded_by + guarded:
+        r["opponent_team"] = teams.get(r["opponent_id"])
+
+    return {
+        "player_id": player_id,
+        "season": season,
+        "season_type": season_type,
+        "tracked": bool(guarded_by or guarded),
+        "guarded_by": guarded_by,
+        "guarded": guarded,
+        "note": (
+            "Partial possessions are the tracking system's attribution: one offensive "
+            "possession splits across every defender who guarded the player during it. "
+            "Matchup data is recorded from 2017-18 and cannot see help defense, "
+            "switches it didn't credit, or scheme."
+        ),
+    }
+
+
 # --- Lineup on/off engine ------------------------------------------------------
 # Stints from play-by-play substitutions -> per-player on/off and five-man
 # lineup net ratings. Computed on demand per team-season (sub-second on the

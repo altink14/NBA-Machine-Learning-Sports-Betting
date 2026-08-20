@@ -38,7 +38,8 @@ from nba_api.stats.endpoints import (
     leaguehustlestatsplayer,
     leagueseasonmatchups,
     leaguedashplayerptshot,
-    leaguedashptstats
+    leaguedashptstats,
+    synergyplaytypes
 )
 
 logger = logging.getLogger(__name__)
@@ -509,6 +510,37 @@ class NBAStatsClient:
             params, ttl=_LIVE_TTL_SECONDS
         )
         return self._parse_result_set(raw, "LeagueDashPtStats")
+
+    def synergy_play_types(
+        self,
+        season: str,
+        season_type: str = "Regular Season",
+        type_grouping: str = "offensive",
+        play_type: str = "Isolation",
+        player_or_team: str = "T",
+    ) -> List[Dict]:
+        """
+        Synergy play-type table for one play type and one side of the ball:
+        possessions, frequency (POSS_PCT), points per possession, and
+        nba.com's own percentile. One call covers the whole league (30 rows
+        for teams). Play types: Isolation, Transition, PRBallHandler,
+        PRRollman, Postup, Spotup, Handoff, Cut, OffScreen, OffRebound
+        (putbacks), Misc.
+        """
+        params = {
+            "season": season,
+            "season_type_all_star": season_type,
+            "per_mode_simple": "Totals",
+            "player_or_team_abbreviation": player_or_team,
+            "type_grouping_nullable": type_grouping,
+            "play_type_nullable": play_type,
+            "league_id": "00",
+        }
+        raw = self._fetch(
+            "synergyplaytypes", synergyplaytypes.SynergyPlayTypes,
+            params, ttl=_LIVE_TTL_SECONDS
+        )
+        return self._parse_result_set(raw, "SynergyPlayType")
 
     def player_game_log(
         self,

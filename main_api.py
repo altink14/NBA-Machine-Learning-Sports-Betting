@@ -1549,6 +1549,85 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
     return result
 
 
+# --- Play-type profiles -----------------------------------------------------------
+# Synergy play types, both sides of the ball, whole league in 22 cached
+# fetches per season-type. The frontend builds fingerprints and matchup
+# panels from this one payload.
+_playtypes_cache: Dict[tuple, Any] = {}
+
+_PLAY_TYPES = [
+    "Transition", "Isolation", "PRBallHandler", "PRRollman", "Postup",
+    "Spotup", "Handoff", "Cut", "OffScreen", "OffRebound", "Misc",
+]
+
+
+@app.get("/api/playtypes/teams")
+def get_team_play_types(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+    """
+    Every team's play-type fingerprint: for each of the 11 Synergy play
+    types, offensive frequency / PPP / percentile and the same on defense
+    (what the team ALLOWS when opponents run it). League PPP per play type
+    ships alongside for baseline math.
+    """
+    key = (season, season_type)
+    if key in _playtypes_cache:
+        return _playtypes_cache[key]
+    from src.Utils.nba_stats_client import get_client
+    client = get_client()
+
+    teams: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    league: Dict[str, Dict[str, Any]] = {}
+    try:
+        for pt in _PLAY_TYPES:
+            for grouping in ("offensive", "defensive"):
+                rows = client.synergy_play_types(season, season_type, grouping, pt)
+                side = "offense" if grouping == "offensive" else "defense"
+                for r in rows:
+                    abbr = r.get("TEAM_ABBREVIATION")
+                    if not abbr:
+                        continue
+                    entry = teams.setdefault(abbr, {"offense": {}, "defense": {}})
+                    entry[side][pt] = {
+                        "poss": r.get("POSS"),
+                        "freq": r.get("POSS_PCT"),
+                        "ppp": r.get("PPP"),
+                        "percentile": r.get("PERCENTILE"),
+                        "score_pct": r.get("SCORE_POSS_PCT"),
+                        "tov_pct": r.get("TOV_POSS_PCT"),
+                    }
+                if grouping == "offensive" and rows:
+                    tot_poss = sum(r.get("POSS") or 0 for r in rows)
+                    tot_pts = sum(r.get("PTS") or 0 for r in rows)
+                    league[pt] = {
+                        "poss": tot_poss,
+                        "ppp": round(tot_pts / tot_poss, 4) if tot_poss else None,
+                    }
+    except Exception as e:
+        logger.error(f"Error fetching play types for {season}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not fetch Synergy play-type data from nba.com.")
+
+    if not teams:
+        raise HTTPException(status_code=404, detail=f"No play-type data for {season} {season_type}.")
+
+    result = {
+        "season": season,
+        "season_type": season_type,
+        "play_types": _PLAY_TYPES,
+        "teams": teams,
+        "league": league,
+        "method": (
+            "Synergy play-type tracking from nba.com. Frequency is the share of the "
+            "team's possessions ending in that play type; PPP is points per such "
+            "possession; percentiles are nba.com's own. Defense rows describe what a "
+            "team ALLOWS when opponents run the play. Possessions are attributed by "
+            "how they END - a pick-and-roll that swings to a corner shooter counts as "
+            "a spot-up, so frequencies describe finishes, not intentions."
+        ),
+    }
+    _playtypes_cache[key] = result
+    return result
+
+
 # --- Clutch ledger ----------------------------------------------------------------
 # Every clutch event in the PBP archive (last 5:00 of Q4/OT, margin <= 5 at
 # the moment of the event), attributed to players. One walk per season-type,

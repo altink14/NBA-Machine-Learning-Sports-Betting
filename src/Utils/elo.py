@@ -6,7 +6,7 @@ of FiveThirtyEight's NBA Elo.
 
 Methodology and constants
 -------------------------
-- BASE_RATING = 1500. Every team starts at 1500 at the beginning of 2021-22,
+- BASE_RATING = 1500. Every team starts at 1500 at the beginning of 2013-14,
   the earliest season in the database. Unlike 538 (which carries ratings back
   to 1946) the first few months of the FIRST archived season are a cold start
   and should be read as rough; each backfilled season pushes that cold start
@@ -37,8 +37,8 @@ one row per game is derived by joining team_game_advanced to box_scores on
 (game_id, team_id = home_team_id): pts is then the home score and opp_pts the
 away score.
 
-The full history (~5,255 games) computes in well under a second; callers
-should cache the result in memory (main_api.py does, per process).
+The full history (~16,800 games, 2013-14 onward) computes in about a second;
+callers should cache the result in memory (main_api.py does, per process).
 """
 
 import logging
@@ -53,7 +53,7 @@ MEAN_REVERT_TARGET = 1505.0
 K_FACTOR = 20.0
 HOME_ADVANTAGE = 70.0
 SEASON_CARRYOVER = 0.75
-HISTORY_START_SEASON = "2021-22"
+HISTORY_START_SEASON = "2013-14"
 
 
 def _expected_home_score(home_elo: float, away_elo: float) -> float:

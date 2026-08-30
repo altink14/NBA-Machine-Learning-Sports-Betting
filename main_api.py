@@ -49,6 +49,7 @@ from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
 from src.Utils import Officials as officials_engine
 from src.Utils import BuildLab as build_lab
+_buildlab_era_cache: dict = {}
 from src.Utils import ClutchLedger as clutch_ledger
 from src.Utils import devig
 from src.Utils import elo as elo_engine
@@ -1636,6 +1637,81 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
             "priorities - they reference no 2K-internal data."
         ),
     }
+
+
+@app.get("/api/2k/eras")
+def get_build_eras():
+    """
+    League context for the archive seasons matching NBA 2K27's MyCAREER era
+    paths, plus today as the baseline: pace, scoring, three-point share,
+    free-throw rate, whistle rate, and that season's leading scorers - all
+    computed from our own archive. The 1984 and 1991 paths predate the
+    archive and are returned as explicitly uncovered rather than invented.
+    """
+    if "eras" in _buildlab_era_cache:
+        return _buildlab_era_cache["eras"]
+    conn = get_db_conn()
+    try:
+        def season_context(season: str):
+            adv = conn.execute(
+                "SELECT AVG(pace) pace, AVG(pts) ppg, COUNT(DISTINCT game_id) games "
+                "FROM team_game_advanced WHERE season = ? AND season_type = 'Regular Season'",
+                (season,),
+            ).fetchone()
+            if not adv or not adv["games"]:
+                return None
+            mix = conn.execute(
+                "SELECT SUM(fg3a)*1.0/SUM(fga) three_share, SUM(fta)*1.0/SUM(fga) ft_rate, "
+                "SUM(pf) pf, SUM(min) mins "
+                "FROM player_season_totals WHERE season = ? AND season_type = 'Regular Season'",
+                (season,),
+            ).fetchone()
+            scorers = conn.execute(
+                "SELECT p.full_name, t.pts*1.0/t.gp ppg FROM player_season_totals t "
+                "JOIN players p ON p.player_id = t.player_id "
+                "WHERE t.season = ? AND t.season_type = 'Regular Season' AND t.gp >= 50 "
+                "ORDER BY t.pts*1.0/t.gp DESC LIMIT 3",
+                (season,),
+            ).fetchall()
+            # fouls per 48 team-minutes: SUM(pf) over all player-minutes -> per-game whistle proxy
+            fouls_per_game = (mix["pf"] / (adv["games"] * 2)) if mix["pf"] else None
+            return {
+                "season": season,
+                "games": adv["games"],
+                "pace": round(adv["pace"], 1),
+                "team_ppg": round(adv["ppg"], 1),
+                "three_share": round(mix["three_share"], 3),
+                "ft_rate": round(mix["ft_rate"], 3),
+                "team_fouls_per_game": round(fouls_per_game, 1) if fouls_per_game else None,
+                "top_scorers": [
+                    {"name": r["full_name"], "ppg": round(r["ppg"], 1)} for r in scorers
+                ],
+            }
+
+        eras = [
+            {"era": "Magic vs Bird", "start_year": 1984, "season": "1983-84", "covered": False},
+            {"era": "Jordan", "start_year": 1991, "season": "1990-91", "covered": False},
+            {"era": "Kobe", "start_year": 2003, "season": "2002-03", "covered": True},
+            {"era": "LeBron", "start_year": 2010, "season": "2009-10", "covered": True},
+            {"era": "Steph", "start_year": 2016, "season": "2015-16", "covered": True},
+        ]
+        today = season_context("2025-26")
+        for e in eras:
+            e["context"] = season_context(e["season"]) if e["covered"] else None
+        result = {
+            "today": today,
+            "eras": eras,
+            "method": (
+                "Every figure is computed from our own box-score archive (1996-97 "
+                "onward): pace and scoring from per-game team advanced rows, shot mix "
+                "and whistle rate from season totals. The 1984 and 1991 eras predate "
+                "the archive and carry no numbers rather than invented ones."
+            ),
+        }
+    finally:
+        conn.close()
+    _buildlab_era_cache["eras"] = result
+    return result
 
 
 @app.get("/api/2k/comp")

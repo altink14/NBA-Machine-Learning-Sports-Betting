@@ -48,6 +48,7 @@ from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
 from src.Utils import Officials as officials_engine
+from src.Utils import BuildLab as build_lab
 from src.Utils import ClutchLedger as clutch_ledger
 from src.Utils import devig
 from src.Utils import elo as elo_engine
@@ -1547,6 +1548,117 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
     finally:
         conn.close()
     _onoff_cache[key] = result
+    return result
+
+
+# --- Build Lab (the 2K section) -----------------------------------------------------
+# The bridge between the real league and MyPLAYER builds. Everything here is
+# computed from our own archive; BuildLab.py deliberately knows nothing about
+# 2K's internals (no badge thresholds, no tested outcomes - see its docstring).
+
+
+@app.get("/api/2k/dna/{player_id}")
+def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
+    """
+    One player-season translated into build language: body, per-36 profile,
+    tracking extras where the era supports them (shot quality 2013-14+,
+    rebounding 2013-14+, clutch 2022-23+), and editorial build notes derived
+    from those measured numbers.
+    """
+    conn = get_db_conn()
+    try:
+        player = conn.execute(
+            "SELECT player_id, full_name, height, weight, position, from_year, to_year "
+            "FROM players WHERE player_id = ?", (player_id,)
+        ).fetchone()
+        if not player:
+            raise HTTPException(status_code=404, detail="Unknown player id.")
+        rows = conn.execute(
+            "SELECT * FROM player_season_totals WHERE player_id = ? AND season = ? "
+            "AND season_type = 'Regular Season' ORDER BY min DESC", (player_id, season)
+        ).fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"No {season} regular-season row for this player.")
+        totals = dict(rows[0])  # traded players: the row where he logged the most minutes
+    finally:
+        conn.close()
+
+    p36 = build_lab.per36(totals)
+
+    # Tracking extras, each behind its era floor and each already process-cached.
+    sq_row = reb_row = clutch_row = None
+    if season >= "2013-14":
+        try:
+            sq = get_shot_quality(season)
+            sq_row = next((p for p in sq.get("players", []) if p.get("player_id") == player_id), None)
+        except Exception:
+            sq_row = None
+        try:
+            rb = get_rebounding_chances(season)
+            reb_row = next((p for p in rb.get("players", []) if p.get("player_id") == player_id), None)
+        except Exception:
+            reb_row = None
+    if season >= "2022-23":
+        try:
+            cl = _clutch_for(season, "Regular Season")
+            clutch_row = next((p for p in cl.get("players", []) if p.get("player_id") == player_id), None)
+        except Exception:
+            clutch_row = None
+
+    return {
+        "player": {
+            "player_id": player["player_id"],
+            "name": player["full_name"],
+            "height": player["height"],
+            "weight": player["weight"],
+            "position": player["position"],
+        },
+        "season": season,
+        "totals": {k: totals.get(k) for k in
+                   ("gp", "min", "pts", "reb", "ast", "stl", "blk", "tov",
+                    "fgm", "fga", "fg_pct", "fg3m", "fg3a", "fg3_pct", "ftm", "fta", "ft_pct")},
+        "per36": p36,
+        "shot_quality": sq_row,
+        "rebounding": reb_row and {"reb": reb_row.get("reb"), "oreb": reb_row.get("oreb")},
+        "clutch": clutch_row,
+        "eras": {
+            "shot_quality": season >= "2013-14",
+            "rebounding": season >= "2013-14",
+            "clutch": season >= "2022-23",
+        },
+        "build_notes": build_lab.build_notes(totals, p36, sq_row,
+                                             reb_row and {"reb": reb_row.get("reb")}, clutch_row),
+        "method": (
+            "All figures are computed from our own box-score and tracking archive; "
+            "tracking sections appear only for seasons their data exists (shot "
+            "quality and rebounding 2013-14+, clutch 2022-23+). The build notes are "
+            "our editorial translation of those measured numbers into builder "
+            "priorities - they reference no 2K-internal data."
+        ),
+    }
+
+
+@app.get("/api/2k/comp")
+def get_build_comp(three: int = 50, inside: int = 50, playmaking: int = 50,
+                   rebounding: int = 50, steals: int = 50, blocks: int = 50,
+                   security: int = 50, height: int = 78, weight: int = 210):
+    """
+    'Who did you just build?' Sliders (25-99) become percentile targets over
+    ~7,400 qualified real player-seasons; returns the closest real profiles.
+    Descriptive resemblance only - not a rating, and 2K-blind by design.
+    """
+    clamp = lambda v: max(25, min(99, int(v)))
+    sliders = {"three": clamp(three), "inside": clamp(inside), "playmaking": clamp(playmaking),
+               "rebounding": clamp(rebounding), "steals": clamp(steals), "blocks": clamp(blocks),
+               "security": clamp(security)}
+    h = max(69, min(88, int(height)))   # 5'9" to 7'4", the 2K builder's own range
+    w = max(150, min(350, int(weight)))
+    conn = get_db_conn()
+    try:
+        result = build_lab.nearest_comps(conn, sliders, float(h), float(w))
+    finally:
+        conn.close()
+    result["inputs"] = {**sliders, "height": h, "weight": w}
     return result
 
 

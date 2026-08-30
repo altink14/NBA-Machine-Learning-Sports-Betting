@@ -47,6 +47,7 @@ from src.Utils import Expected_Value, Kelly_Criterion as kc, Parlay as parlay
 from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
+from src.Utils import Officials as officials_engine
 from src.Utils import ClutchLedger as clutch_ledger
 from src.Utils import devig
 from src.Utils import elo as elo_engine
@@ -1546,6 +1547,43 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
     finally:
         conn.close()
     _onoff_cache[key] = result
+    return result
+
+
+# --- Officiating crews ------------------------------------------------------------
+# Who worked a game (nba.com Officials feed, ingested by backfill_officials.py)
+# joined to what the game looked like in our own archive. Descriptive only -
+# see Officials.py for why the baseline is season-matched and why this is not
+# evidence about how anyone calls a game.
+_officials_cache: Dict[tuple, Any] = {}
+
+
+@app.get("/api/officials")
+def get_officials(season_from: str = None, min_games: int = 25,
+                  season_type: str = "Regular Season"):
+    """
+    Per-official game profiles: combined points, total fouls, free-throw rate,
+    pace and home win rate, each against a season-matched league baseline with
+    95% intervals, plus a coverage block saying how many games actually have a
+    crew on file.
+    """
+    key = (season_from, min_games, season_type)
+    if key in _officials_cache:
+        return _officials_cache[key]
+    conn = get_db_conn()
+    try:
+        result = officials_engine.compute_officials(
+            conn, season_from=season_from, min_games=min_games, season_type=season_type
+        )
+    except Exception as e:
+        logger.error(f"Error computing officials: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute officiating profiles.")
+    finally:
+        conn.close()
+    if not result.get("officials"):
+        # Not an error: the crew archive may simply not be deep enough yet.
+        result["note"] = "No official has reached the minimum game count yet."
+    _officials_cache[key] = result
     return result
 
 

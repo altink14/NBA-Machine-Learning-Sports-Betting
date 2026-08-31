@@ -228,3 +228,152 @@ def compute_officials(
             "them, and no betting claim is made from them."
         ),
     }
+
+
+def compute_team_officials(
+    conn,
+    team_abbr: str,
+    season_from: Optional[str] = None,
+    min_games: int = 10,
+    season_type: str = "Regular Season",
+) -> Dict[str, Any]:
+    """
+    One team's record and scoring, split by which official worked the game.
+
+    THE BASELINE IS THE TEAM'S OWN, season-matched. "12-3 with official X"
+    says nothing if the team won everything that year anyway, so each pair is
+    compared against the TEAM's win rate and scoring averages over the same
+    seasons, weighted by how many of the pair's games fell in each. Pairs are
+    thin by construction (a team sees a given official a handful of times a
+    year), which is why the gate is enforced here and the intervals are wide.
+    """
+    team_abbr = team_abbr.upper()
+    trow = conn.execute(
+        "SELECT team_id, full_name FROM team_metadata WHERE abbreviation = ?", (team_abbr,)
+    ).fetchone()
+    if not trow:
+        raise ValueError(f"Unknown team abbreviation: {team_abbr}")
+    team_id = trow["team_id"]
+
+    params: List[Any] = [team_id, season_type]
+    where = "t.team_id = ? AND t.season_type = ?"
+    if season_from:
+        where += " AND t.season >= ?"
+        params.append(season_from)
+
+    games = conn.execute(
+        f"""
+        SELECT t.game_id, t.season, t.pts, t.opp_pts
+        FROM team_game_advanced t
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+
+    facts: Dict[str, Dict[str, Any]] = {}
+    for g in games:
+        if g["pts"] is None or g["opp_pts"] is None:
+            continue
+        facts[g["game_id"]] = {
+            "season": g["season"],
+            "pts_for": float(g["pts"]),
+            "pts_against": float(g["opp_pts"]),
+            "win": 1 if g["pts"] > g["opp_pts"] else 0,
+        }
+
+    # The team's own per-season baselines.
+    per_season: Dict[str, Dict[str, List[float]]] = {}
+    for f in facts.values():
+        d = per_season.setdefault(f["season"], {"win": [], "pf": [], "pa": []})
+        d["win"].append(f["win"])
+        d["pf"].append(f["pts_for"])
+        d["pa"].append(f["pts_against"])
+    season_mean = {
+        s: {k: (sum(v) / len(v) if v else None) for k, v in d.items()}
+        for s, d in per_season.items()
+    }
+
+    def matched(seasons: Dict[str, int], key: str) -> Optional[float]:
+        num = den = 0.0
+        for s, n in seasons.items():
+            m = season_mean.get(s, {}).get(key)
+            if m is not None:
+                num += m * n
+                den += n
+        return num / den if den else None
+
+    links = conn.execute("SELECT game_id, official_id FROM game_officials").fetchall()
+    names = {
+        r["official_id"]: {"name": f"{r['first_name']} {r['last_name']}".strip(),
+                           "jersey": (r["jersey_num"] or "").strip() or None}
+        for r in conn.execute("SELECT * FROM officials")
+    }
+
+    by_off: Dict[int, Dict[str, Any]] = {}
+    covered_games: set = set()
+    for link in links:
+        f = facts.get(link["game_id"])
+        if not f:
+            continue
+        covered_games.add(link["game_id"])
+        o = by_off.setdefault(link["official_id"], {"wins": 0, "pf": [], "pa": [], "seasons": {}})
+        o["wins"] += f["win"]
+        o["pf"].append(f["pts_for"])
+        o["pa"].append(f["pts_against"])
+        o["seasons"][f["season"]] = o["seasons"].get(f["season"], 0) + 1
+
+    out: List[Dict[str, Any]] = []
+    for oid, o in by_off.items():
+        n = len(o["pf"])
+        if n < min_games:
+            continue
+        base_win = matched(o["seasons"], "win")
+        base_pf = matched(o["seasons"], "pf")
+        base_pa = matched(o["seasons"], "pa")
+        pf_avg = sum(o["pf"]) / n
+        pa_avg = sum(o["pa"]) / n
+        nm = names.get(oid, {})
+        out.append({
+            "official_id": oid,
+            "name": nm.get("name") or f"#{oid}",
+            "jersey": nm.get("jersey"),
+            "games": n,
+            "wins": o["wins"],
+            "losses": n - o["wins"],
+            "win_pct": round(o["wins"] / n * 100, 1),
+            "win_baseline": round(base_win * 100, 1) if base_win is not None else None,
+            "win_diff": round(o["wins"] / n * 100 - base_win * 100, 1) if base_win is not None else None,
+            "win_ci95": _wilson(o["wins"], n),
+            "pts_for": {"avg": round(pf_avg, 1),
+                        "baseline": round(base_pf, 1) if base_pf is not None else None,
+                        "diff": round(pf_avg - base_pf, 1) if base_pf is not None else None,
+                        "ci95": _mean_ci(o["pf"])},
+            "pts_against": {"avg": round(pa_avg, 1),
+                            "baseline": round(base_pa, 1) if base_pa is not None else None,
+                            "diff": round(pa_avg - base_pa, 1) if base_pa is not None else None,
+                            "ci95": _mean_ci(o["pa"])},
+        })
+    out.sort(key=lambda r: -r["games"])
+
+    return {
+        "team": team_abbr,
+        "team_name": trow["full_name"],
+        "season_from": season_from,
+        "season_type": season_type,
+        "min_games": min_games,
+        "officials": out,
+        "coverage": {
+            "team_games_scored": len(facts),
+            "team_games_with_crew": len(covered_games),
+        },
+        "method": (
+            "Each pair is this team's record and scoring in the games that official "
+            "worked, compared against the TEAM'S OWN averages over the same seasons - "
+            "not the league's - weighted by when the pair's games happened. Crews come "
+            "from nba.com's Officials feed; results from our own archive. Pairs are "
+            "small samples by nature: a team sees a given official only a few times a "
+            "season, so intervals are wide and most differences are noise. Crews are "
+            "assigned, not random; nothing here is evidence of favoritism or a "
+            "betting angle."
+        ),
+    }

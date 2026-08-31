@@ -1558,6 +1558,33 @@ def get_team_onoff(abbr: str, season: str = CURRENT_SEASON, season_type: str = "
 # 2K's internals (no badge thresholds, no tested outcomes - see its docstring).
 
 
+@app.get("/api/officials/teams/{abbr}")
+def get_team_officials(abbr: str, season_from: str = None, min_games: int = 10,
+                       season_type: str = "Regular Season"):
+    """
+    One team's record and scoring split by official, against the TEAM'S OWN
+    season-matched baselines (not the league's). Pairs are inherently thin -
+    the gate and the intervals do the honesty here.
+    """
+    key = ("team", abbr.upper(), season_from, min_games, season_type)
+    if key in _officials_cache:
+        return _officials_cache[key]
+    conn = get_db_conn()
+    try:
+        result = officials_engine.compute_team_officials(
+            conn, abbr, season_from=season_from, min_games=min_games, season_type=season_type
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error computing team officials for {abbr}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not compute team-official splits.")
+    finally:
+        conn.close()
+    _officials_cache[key] = result
+    return result
+
+
 @app.get("/api/2k/dna/{player_id}")
 def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
     """

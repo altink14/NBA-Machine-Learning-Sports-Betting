@@ -205,12 +205,13 @@ def nearest_comps(
         "pool_size": len(pool["entries"]),
         "comps": out,
         "method": (
-            "Each slider becomes a percentile target over every qualified real "
-            "player-season in our archive (1,000+ minutes, 1996-97 onward); comps "
-            "are the closest real statistical profiles by weighted z-scored "
-            "distance, height weighted hardest. This is a resemblance between "
-            "your sliders and real production - it is not a rating of the build "
-            "and knows nothing about 2K's internals."
+            "How it works: each slider is read as 'compared to everyone, how good "
+            "should this part be?' and matched against every real season with "
+            "1,000+ minutes played since 1996-97. Your comps are the real seasons "
+            "whose overall shape sits closest to yours, with height counting the "
+            "most. This is a resemblance between your sliders and real production "
+            "- it is not a rating of your build, and it knows nothing about 2K's "
+            "insides."
         ),
     }
 
@@ -258,10 +259,10 @@ def build_notes(
         if sq.get("soe_per100") is not None:
             soe = sq["soe_per100"]
             if soe >= 8:
-                notes.append({"area": "Shot-making", "fact": f"+{soe:.0f} points per 100 shots over expectation",
+                notes.append({"area": "Shot-making", "fact": f"+{soe:.0f} points per 100 shots more than an average player on the same looks",
                               "note": "He beat his own looks - tough-shot ability was real, not diet."})
             elif soe <= -8:
-                notes.append({"area": "Shot-making", "fact": f"{soe:.0f} points per 100 shots vs expectation",
+                notes.append({"area": "Shot-making", "fact": f"{soe:.0f} points per 100 shots vs an average player on the same looks",
                               "note": "Production leaned on quality looks; recreate the LOOKS, not hero shots."})
     elif fga:
         if three_share >= 0.45:
@@ -304,7 +305,7 @@ def build_notes(
             "fact": f"{clutch['pts']} clutch points on {clutch['fgm']}/{clutch['fga']} shooting",
             # Within 3pp of his own baseline counts as holding up: clutch
             # samples are ~100 shots and a rounding-level dip is not a story.
-            "note": ("His late-game shooting held up against his own season baseline."
+            "note": ("His late-game shooting held up against his own usual."
                      if diff is None or diff >= -0.03 else
                      "Late-game volume was real but efficiency dipped - clutch reps came with a cost."),
         })

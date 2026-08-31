@@ -1657,11 +1657,11 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
         "build_notes": build_lab.build_notes(totals, p36, sq_row,
                                              reb_row and {"reb": reb_row.get("reb")}, clutch_row),
         "method": (
-            "All figures are computed from our own box-score and tracking archive; "
-            "tracking sections appear only for seasons their data exists (shot "
-            "quality and rebounding 2013-14+, clutch 2022-23+). The build notes are "
-            "our editorial translation of those measured numbers into builder "
-            "priorities - they reference no 2K-internal data."
+            "Every number here was measured from real NBA games in our own archive. "
+            "The camera-tracked sections only exist from 2013-14 on (and clutch "
+            "from 2022-23) - older seasons show what the box score can tell, "
+            "honestly labeled. The build notes are our reading of those real "
+            "numbers as build priorities - nothing in-game, no badge math."
         ),
     }
 
@@ -1729,10 +1729,9 @@ def get_build_eras():
             "today": today,
             "eras": eras,
             "method": (
-                "Every figure is computed from our own box-score archive (1996-97 "
-                "onward): pace and scoring from per-game team advanced rows, shot mix "
-                "and whistle rate from season totals. The 1984 and 1991 eras predate "
-                "the archive and carry no numbers rather than invented ones."
+                "Every figure comes from real games in our own archive, 1996-97 onward. "
+                "The 1984 and 1991 eras are before our data, so they get no numbers "
+                "rather than made-up ones."
             ),
         }
     finally:

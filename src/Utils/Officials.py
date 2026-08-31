@@ -367,13 +367,12 @@ def compute_team_officials(
             "team_games_with_crew": len(covered_games),
         },
         "method": (
-            "Each pair is this team's record and scoring in the games that official "
-            "worked, compared against the TEAM'S OWN averages over the same seasons - "
-            "not the league's - weighted by when the pair's games happened. Crews come "
-            "from nba.com's Officials feed; results from our own archive. Pairs are "
-            "small samples by nature: a team sees a given official only a few times a "
-            "season, so intervals are wide and most differences are noise. Crews are "
-            "assigned, not random; nothing here is evidence of favoritism or a "
-            "betting angle."
+            "How it works: for each referee, we take this team's games he worked and "
+            "compare the results to the TEAM'S OWN usual numbers over the same "
+            "seasons - not the league's. Referee crews come from nba.com's feed; "
+            "every result is computed from our own archive. A team only sees a given "
+            "referee a few times a season, so these are small samples and most gaps "
+            "are plain luck. Referees are assigned by the league, not chosen; nothing "
+            "here is evidence of favoritism, and none of it is a betting angle."
         ),
     }

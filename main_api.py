@@ -48,6 +48,7 @@ from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
 from src.Utils import Officials as officials_engine
+from src.Utils import DailyGame as daily_game
 from src.Utils import BuildLab as build_lab
 _buildlab_era_cache: dict = {}
 from src.Utils import ClutchLedger as clutch_ledger
@@ -1770,6 +1771,62 @@ def get_build_comp(three: int = 50, inside: int = 50, playmaking: int = 50,
 # see Officials.py for why the baseline is season-matched and why this is not
 # evidence about how anyone calls a game.
 _officials_cache: Dict[tuple, Any] = {}
+
+
+
+# --- The Daily Box Score (guess-the-matchup game) ---
+
+class DailyGuessRequest(BaseModel):
+    date: Optional[str] = None       # YYYY-MM-DD puzzle key; defaults to today ET
+    guess: List[str]                 # two modern team abbreviations
+    guess_number: int                # 1-6
+
+
+def _daily_date_key(requested: Optional[str]) -> str:
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    if not requested:
+        return today.isoformat()
+    try:
+        d = datetime.strptime(requested, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
+    if d > today:
+        raise HTTPException(status_code=404, detail="That puzzle isn't out yet.")
+    if d.isoformat() < "2026-09-01":
+        raise HTTPException(status_code=404, detail="Puzzles start 2026-09-01.")
+    return d.isoformat()
+
+
+@app.get("/api/daily/puzzle")
+def get_daily_puzzle(date: Optional[str] = None):
+    """Today's redacted box score. The answer never rides with the puzzle."""
+    key = _daily_date_key(date)
+    cache_key = ("daily_puzzle", key)
+    if cache_key in _officials_cache:
+        return _officials_cache[cache_key]
+    conn = get_db_conn()
+    try:
+        result = daily_game.build_puzzle(conn, key, CURRENT_SEASON)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    finally:
+        conn.close()
+    _officials_cache[cache_key] = result
+    return result
+
+
+@app.post("/api/daily/guess")
+def post_daily_guess(payload: DailyGuessRequest):
+    """Grade a two-team guess; hints unlock per wrong guess, reveal on finish."""
+    key = _daily_date_key(payload.date)
+    conn = get_db_conn()
+    try:
+        return daily_game.grade_guess(conn, key, CURRENT_SEASON, payload.guess, payload.guess_number)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        conn.close()
 
 
 @app.get("/api/officials")

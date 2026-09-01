@@ -4384,6 +4384,14 @@ def search_players(q: str):
 
     conn = get_db_conn()
     try:
+        # Accent-insensitive matching: 'jokic' must find 'Jokić', 'doncic'
+        # must find 'Dončić'. NFD-strip combining marks on both sides.
+        def _deaccent(s):
+            return "".join(
+                ch for ch in unicodedata.normalize("NFD", s or "")
+                if unicodedata.category(ch) != "Mn"
+            ).lower()
+        conn.create_function("deaccent", 1, _deaccent)
         cursor = conn.cursor()
         # The directory covers all of league history now, so ordering decides
         # whether this is useful. Surname matches outrank forename matches: a
@@ -4399,13 +4407,13 @@ def search_players(q: str):
             SELECT player_id, full_name, first_name, last_name, is_active,
                    from_year, to_year
             FROM players
-            WHERE full_name LIKE ?
+            WHERE deaccent(full_name) LIKE deaccent(?)
             ORDER BY
                 CASE
-                    WHEN lower(full_name) = lower(?) THEN 0
-                    WHEN lower(last_name) = lower(?) THEN 1
-                    WHEN lower(last_name) LIKE lower(?) THEN 2
-                    WHEN lower(full_name) LIKE lower(?) THEN 3
+                    WHEN deaccent(full_name) = deaccent(?) THEN 0
+                    WHEN deaccent(last_name) = deaccent(?) THEN 1
+                    WHEN deaccent(last_name) LIKE deaccent(?) THEN 2
+                    WHEN deaccent(full_name) LIKE deaccent(?) THEN 3
                     ELSE 4
                 END,
                 is_active DESC,

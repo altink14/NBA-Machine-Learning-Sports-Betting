@@ -1829,6 +1829,69 @@ def post_daily_guess(payload: DailyGuessRequest):
         conn.close()
 
 
+
+# --- Sitemap enumeration (id lists only; the frontend builds the URLs) ---
+
+_sitemap_cache: Dict[str, Any] = {}
+
+
+@app.get("/api/sitemap/games")
+def sitemap_games(season: str):
+    """Every archived game id + date for one season (both season types)."""
+    key = f"games:{season}"
+    if key in _sitemap_cache:
+        return _sitemap_cache[key]
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT game_id, game_date FROM box_scores WHERE season = ? ORDER BY game_date",
+            (season,),
+        ).fetchall()
+    finally:
+        conn.close()
+    result = {"season": season, "games": [{"id": r[0], "date": r[1]} for r in rows]}
+    # Completed seasons never change; the live one refreshes with the process.
+    if season < CURRENT_SEASON:
+        _sitemap_cache[key] = result
+    return result
+
+
+@app.get("/api/sitemap/players")
+def sitemap_players():
+    """Every player with at least one archived season row (id, name, last season)."""
+    if "players" in _sitemap_cache:
+        return _sitemap_cache["players"]
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.player_id, p.full_name, MAX(t.season) AS last_season
+            FROM players p
+            JOIN player_season_totals t ON t.player_id = p.player_id
+            GROUP BY p.player_id, p.full_name
+            ORDER BY p.player_id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    result = {"players": [{"id": r[0], "name": r[1], "last_season": r[2]} for r in rows]}
+    _sitemap_cache["players"] = result
+    return result
+
+
+@app.get("/api/sitemap/seasons")
+def sitemap_seasons():
+    """Archived seasons with their game counts."""
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            "SELECT season, COUNT(*) FROM box_scores GROUP BY season ORDER BY season"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"seasons": [{"season": r[0], "games": r[1]} for r in rows]}
+
+
 @app.get("/api/officials")
 def get_officials(season_from: str = None, min_games: int = 25,
                   season_type: str = "Regular Season"):

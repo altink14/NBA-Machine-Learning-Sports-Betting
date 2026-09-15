@@ -18,13 +18,23 @@ WHAT IT WRITES
                     returned a crew. This is what makes the job resumable and
                     stops us re-asking about pre-2003 games forever.
 
+THE TRAP THIS DESIGN HAS, AND THE FLAG THAT OPENS IT. Recording "asked, got
+nothing" is right for 1996-2002, where the source genuinely has no crews.
+It is wrong for a season where the upstream was briefly flaky: on 2026-08-30
+all 1,212 remaining 2025-26 games returned empty in one run and were then
+never retried. `--retry-empty` re-asks about games recorded with zero
+officials, bypassing the disk cache so a cached empty answer cannot satisfy
+the retry. Coverage as of 2026-09-15 before the historical run: 2022-23 to
+2024-25 complete, 2025-26 at 103 of 1,315, nothing before 2022-23.
+
 MANNERS. One request per game through the shared stats client (disk cache,
 retries, rate limiting all come from there), newest season first so the most
 useful data lands earliest, and a commit every 25 games so a kill loses
 almost nothing.
 
     python src/Process-Data/backfill_officials.py --seasons 2025-26 2024-25
-    python src/Process-Data/backfill_officials.py --from-season 2018-19
+    python src/Process-Data/backfill_officials.py --from-season 2003-04
+    python src/Process-Data/backfill_officials.py --seasons 2025-26 --retry-empty
 """
 
 import argparse
@@ -88,6 +98,8 @@ def main() -> int:
     p.add_argument("--seasons", nargs="*", help="Explicit seasons, e.g. 2025-26 2024-25")
     p.add_argument("--from-season", help="Every archived season >= this one")
     p.add_argument("--limit", type=int, default=0, help="Stop after N fetches (0 = no cap)")
+    p.add_argument("--retry-empty", action="store_true",
+                   help="Also re-ask about games previously recorded with zero officials (bypasses the cache)")
     p.add_argument("--db", default=DB_PATH)
     args = p.parse_args()
 
@@ -105,12 +117,15 @@ def main() -> int:
     fetched = crews = empty = errors = 0
 
     for season in targets:
+        where_unasked = "f.game_id IS NULL"
+        if args.retry_empty:
+            where_unasked = "(f.game_id IS NULL OR f.n_officials = 0)"
         games = conn.execute(
-            """
-            SELECT b.game_id
+            f"""
+            SELECT b.game_id, f.n_officials AS prior_n
             FROM box_scores b
             LEFT JOIN officials_fetch f ON f.game_id = b.game_id
-            WHERE b.season = ? AND f.game_id IS NULL
+            WHERE b.season = ? AND {where_unasked}
             ORDER BY b.game_date DESC
             """,
             (season,),
@@ -122,8 +137,11 @@ def main() -> int:
 
         for i, row in enumerate(games, 1):
             gid = row["game_id"]
+            # A game we asked about before and got nothing: ask the source again,
+            # not the cache. A game never asked about: the cache is fine.
+            fresh = row["prior_n"] is not None and row["prior_n"] == 0
             try:
-                data = client.boxscore_summary(gid)
+                data = client.boxscore_summary(gid, fresh=fresh)
                 crew = data.get("Officials") or []
             except Exception as e:  # a single bad game must not end the run
                 errors += 1

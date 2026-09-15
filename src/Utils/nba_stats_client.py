@@ -341,9 +341,13 @@ class NBAStatsClient:
         raw = self._fetch("leaguegamelog", leaguegamelog.LeagueGameLog, params, ttl=_LIVE_TTL_SECONDS)
         return self._parse_result_set(raw, "LeagueGameLog")
 
-    def boxscore_summary(self, game_id: str) -> Dict[str, List[Dict]]:
+    def boxscore_summary(self, game_id: str, fresh: bool = False) -> Dict[str, List[Dict]]:
+        """`fresh=True` bypasses the permanent cache: used to re-ask about games
+        whose Officials result set came back empty, since an empty answer from a
+        flaky upstream is not a fact worth caching forever."""
         params = {"game_id": game_id}
-        raw = self._fetch("boxscoresummaryv2", boxscoresummaryv2.BoxScoreSummaryV2, params, ttl=_COMPLETED_GAME_TTL)
+        raw = self._fetch("boxscoresummaryv2", boxscoresummaryv2.BoxScoreSummaryV2, params,
+                          ttl=0 if fresh else _COMPLETED_GAME_TTL)
         return self._parse_all_result_sets(raw)
 
     def player_career_stats(

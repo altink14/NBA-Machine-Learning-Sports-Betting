@@ -34,6 +34,13 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+# Load the repo's .env explicitly, by path. Task Scheduler and a bare terminal
+# both start this with an environment that has no ODDS_API_KEY in it; without
+# this line the odds step only worked when main_api happened to be imported
+# first (it calls load_dotenv), which is an accident, not a design.
+from dotenv import load_dotenv  # noqa: E402
+load_dotenv(os.path.join(REPO_ROOT, ".env"))
+
 from src.Utils.odds_api_client import OddsApiError, snapshot_nba_board  # noqa: E402
 
 logging.basicConfig(

@@ -1,6 +1,7 @@
 # main_api.py
 # FINAL STABLE VERSION - Corrected endpoint routing and data handling.
 import collections
+import threading
 import glob
 import re
 import os
@@ -252,7 +253,7 @@ if SLOWAPI_AVAILABLE:
     logger.info(
         f"Rate limiting enabled (per IP): {RATE_LIMIT_DEFAULT} per endpoint, "
         f"{RATE_LIMIT_GLOBAL} overall, {RATE_LIMIT_EXPENSIVE} on /predictions and /api/parlay/evaluate, "
-        f"{RATE_LIMIT_UPSTREAM} on the 5 routes that call stats.nba.com live; /health exempt"
+        f"{RATE_LIMIT_UPSTREAM} on the routes that call stats.nba.com live; /health exempt"
     )
 else:
     logger.warning("slowapi is not installed - rate limiting is DISABLED. Run: pip install slowapi")
@@ -1447,7 +1448,8 @@ def _normalize_matchup_row(r: Dict[str, Any], opponent_side: str) -> Dict[str, A
 
 
 @app.get("/api/players/{player_id}/matchups")
-def get_player_matchups(player_id: int, season: str = CURRENT_SEASON,
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_player_matchups(request: Request, player_id: int, season: str = CURRENT_SEASON,
                         season_type: str = "Regular Season"):
     """
     Who guarded this player, and who he guarded - partial possessions, points,
@@ -1934,7 +1936,8 @@ _PLAY_TYPES = [
 
 
 @app.get("/api/playtypes/teams")
-def get_team_play_types(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_team_play_types(request: Request, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Every team's play-type fingerprint: for each of the 11 Synergy play
     types, offensive frequency / PPP / percentile and the same on defense
@@ -2058,7 +2061,8 @@ _rebounding_cache: Dict[tuple, Any] = {}
 
 
 @app.get("/api/rebounding")
-def get_rebounding_chances(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_rebounding_chances(request: Request, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Per-player rebounding tracking: for each of OREB/DREB/overall - total,
     contested, contested share, chances, chance conversion, deferred chances,
@@ -2498,7 +2502,8 @@ def get_rookies(season: str = CURRENT_SEASON, season_type: str = "Regular Season
 
 # --- Career highs from the game-log archive ---
 @app.get("/api/players/{id}/highs")
-def get_player_highs(id: int):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_player_highs(request: Request, id: int):
     """
     Career-high performances across every game log we have, per stat:
     the value, the date, and the opponent. Depth grows as more seasons
@@ -3482,7 +3487,8 @@ def get_historical_team_stats(team: str, season: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/historical/matchup")
-def get_historical_matchup(team1: str, team2: str, season: int):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_historical_matchup(request: Request, team1: str, team2: str, season: int):
     try:
         season_str = f"{season-1}-{str(season)[2:]}"
         
@@ -4504,6 +4510,22 @@ def search_players(q: str):
     finally:
         conn.close()
 
+
+# One lock per player id for the live CommonPlayerInfo fetch. Without it, a
+# hundred concurrent uncached hits on one player page became a hundred parallel
+# upstream calls queued behind the rate limiter. With it, the first request
+# fetches and the rest wait, then read the row it wrote.
+_BIO_FETCH_LOCKS: Dict[int, threading.Lock] = {}
+_BIO_FETCH_LOCKS_GUARD = threading.Lock()
+
+
+def _bio_lock(player_id: int) -> threading.Lock:
+    with _BIO_FETCH_LOCKS_GUARD:
+        lock = _BIO_FETCH_LOCKS.get(player_id)
+        if lock is None:
+            lock = _BIO_FETCH_LOCKS[player_id] = threading.Lock()
+        return lock
+
 @app.get("/api/players/{id}")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
@@ -4530,107 +4552,113 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
             
         # Check if cache miss or fetched_at is NULL
         if not bio_data or not bio_data.get("fetched_at"):
-            # TODO: Potential thundering herd at scale — 100 concurrent uncached profile hits = 100 parallel CommonPlayerInfo calls queueing under the rate limiter. Acceptable for launch; add a per-player in-flight lock before scaling.
-            if not commonplayerinfo:
-                logger.warning("nba_api commonplayerinfo not imported, skipping live bio fetch")
-            else:
-                try:
-                    logger.info(f"Cache miss: Fetching player bio from NBA stats API for player ID {id}")
-                    # Fetch from CommonPlayerInfo
-                    info = commonplayerinfo.CommonPlayerInfo(player_id=id)
-                    df = info.get_data_frames()[0]
-                    if not df.empty:
-                        row_data = df.iloc[0].to_dict()
+            # Per-player in-flight lock: the first concurrent request fetches, the rest
+            # wait and then read the row it wrote instead of hitting the NBA themselves.
+            with _bio_lock(id):
+                cursor.execute("SELECT * FROM player_bio WHERE player_id = ?", (id,))
+                _again = cursor.fetchone()
+                if _again and dict(_again).get("fetched_at"):
+                    bio_data = dict(_again)
+                elif not commonplayerinfo:
+                    logger.warning("nba_api commonplayerinfo not imported, skipping live bio fetch")
+                else:
+                    try:
+                        logger.info(f"Cache miss: Fetching player bio from NBA stats API for player ID {id}")
+                        # Fetch from CommonPlayerInfo
+                        info = commonplayerinfo.CommonPlayerInfo(player_id=id)
+                        df = info.get_data_frames()[0]
+                        if not df.empty:
+                            row_data = df.iloc[0].to_dict()
                         
-                        # Prepare fields
-                        jersey = row_data.get("JERSEY")
-                        position = row_data.get("POSITION")
-                        height = row_data.get("HEIGHT")
-                        weight = row_data.get("WEIGHT")
-                        birth_date = row_data.get("BIRTHDATE")
-                        if birth_date and "T" in birth_date:
-                            birth_date = birth_date.split("T")[0]
-                        country = row_data.get("COUNTRY")
-                        school = row_data.get("SCHOOL")
+                            # Prepare fields
+                            jersey = row_data.get("JERSEY")
+                            position = row_data.get("POSITION")
+                            height = row_data.get("HEIGHT")
+                            weight = row_data.get("WEIGHT")
+                            birth_date = row_data.get("BIRTHDATE")
+                            if birth_date and "T" in birth_date:
+                                birth_date = birth_date.split("T")[0]
+                            country = row_data.get("COUNTRY")
+                            school = row_data.get("SCHOOL")
                         
-                        draft_year = row_data.get("DRAFT_YEAR")
-                        try:
-                            draft_year = int(draft_year) if str(draft_year).isdigit() else None
-                        except:
-                            draft_year = None
+                            draft_year = row_data.get("DRAFT_YEAR")
+                            try:
+                                draft_year = int(draft_year) if str(draft_year).isdigit() else None
+                            except:
+                                draft_year = None
                             
-                        draft_round = row_data.get("DRAFT_ROUND")
-                        try:
-                            draft_round = int(draft_round) if str(draft_round).isdigit() else None
-                        except:
-                            draft_round = None
+                            draft_round = row_data.get("DRAFT_ROUND")
+                            try:
+                                draft_round = int(draft_round) if str(draft_round).isdigit() else None
+                            except:
+                                draft_round = None
                             
-                        draft_number = row_data.get("DRAFT_NUMBER")
-                        try:
-                            draft_number = int(draft_number) if str(draft_number).isdigit() else None
-                        except:
-                            draft_number = None
+                            draft_number = row_data.get("DRAFT_NUMBER")
+                            try:
+                                draft_number = int(draft_number) if str(draft_number).isdigit() else None
+                            except:
+                                draft_number = None
                             
-                        exp = row_data.get("SEASON_EXP")
-                        try:
-                            years_experience = int(exp) if str(exp).isdigit() else 0
-                        except:
-                            years_experience = 0
+                            exp = row_data.get("SEASON_EXP")
+                            try:
+                                years_experience = int(exp) if str(exp).isdigit() else 0
+                            except:
+                                years_experience = 0
                             
-                        team_id = row_data.get("TEAM_ID")
-                        try:
-                            team_id = int(team_id) if str(team_id).isdigit() else None
-                        except:
-                            team_id = None
+                            team_id = row_data.get("TEAM_ID")
+                            try:
+                                team_id = int(team_id) if str(team_id).isdigit() else None
+                            except:
+                                team_id = None
                             
-                        team_abbr = row_data.get("TEAM_ABBREVIATION")
-                        team_name = row_data.get("TEAM_NAME")
-                        is_active = 1 if row_data.get("ROSTERSTATUS") == "Active" else 0
-                        fetched_at = datetime.utcnow().isoformat()
+                            team_abbr = row_data.get("TEAM_ABBREVIATION")
+                            team_name = row_data.get("TEAM_NAME")
+                            is_active = 1 if row_data.get("ROSTERSTATUS") == "Active" else 0
+                            fetched_at = datetime.utcnow().isoformat()
                         
-                        # Insert/Update player_bio table (upsert)
-                        cursor.execute(
-                            """
-                            INSERT INTO player_bio (
-                                player_id, full_name, first_name, last_name, team_id, team_abbr,
-                                jersey, position, height, weight, birth_date, country, school,
-                                draft_year, draft_round, draft_number, years_experience, is_active, fetched_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(player_id) DO UPDATE SET
-                                full_name=excluded.full_name,
-                                first_name=excluded.first_name,
-                                last_name=excluded.last_name,
-                                team_id=excluded.team_id,
-                                team_abbr=excluded.team_abbr,
-                                jersey=excluded.jersey,
-                                position=excluded.position,
-                                height=excluded.height,
-                                weight=excluded.weight,
-                                birth_date=excluded.birth_date,
-                                country=excluded.country,
-                                school=excluded.school,
-                                draft_year=excluded.draft_year,
-                                draft_round=excluded.draft_round,
-                                draft_number=excluded.draft_number,
-                                years_experience=excluded.years_experience,
-                                is_active=excluded.is_active,
-                                fetched_at=excluded.fetched_at
-                            """,
-                            (
-                                id, player_info["full_name"], player_info["first_name"], player_info["last_name"],
-                                team_id, team_abbr, jersey, position, height, weight, birth_date, country, school,
-                                draft_year, draft_round, draft_number, years_experience, is_active, fetched_at
+                            # Insert/Update player_bio table (upsert)
+                            cursor.execute(
+                                """
+                                INSERT INTO player_bio (
+                                    player_id, full_name, first_name, last_name, team_id, team_abbr,
+                                    jersey, position, height, weight, birth_date, country, school,
+                                    draft_year, draft_round, draft_number, years_experience, is_active, fetched_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(player_id) DO UPDATE SET
+                                    full_name=excluded.full_name,
+                                    first_name=excluded.first_name,
+                                    last_name=excluded.last_name,
+                                    team_id=excluded.team_id,
+                                    team_abbr=excluded.team_abbr,
+                                    jersey=excluded.jersey,
+                                    position=excluded.position,
+                                    height=excluded.height,
+                                    weight=excluded.weight,
+                                    birth_date=excluded.birth_date,
+                                    country=excluded.country,
+                                    school=excluded.school,
+                                    draft_year=excluded.draft_year,
+                                    draft_round=excluded.draft_round,
+                                    draft_number=excluded.draft_number,
+                                    years_experience=excluded.years_experience,
+                                    is_active=excluded.is_active,
+                                    fetched_at=excluded.fetched_at
+                                """,
+                                (
+                                    id, player_info["full_name"], player_info["first_name"], player_info["last_name"],
+                                    team_id, team_abbr, jersey, position, height, weight, birth_date, country, school,
+                                    draft_year, draft_round, draft_number, years_experience, is_active, fetched_at
+                                )
                             )
-                        )
-                        conn.commit()
+                            conn.commit()
                         
-                        # Re-read from db
-                        cursor.execute("SELECT * FROM player_bio WHERE player_id = ?", (id,))
-                        updated_row = cursor.fetchone()
-                        if updated_row:
-                            bio_data = dict(updated_row)
-                except Exception as e:
-                    logger.error(f"Error fetching CommonPlayerInfo for player ID {id}: {e}", exc_info=True)
+                            # Re-read from db
+                            cursor.execute("SELECT * FROM player_bio WHERE player_id = ?", (id,))
+                            updated_row = cursor.fetchone()
+                            if updated_row:
+                                bio_data = dict(updated_row)
+                    except Exception as e:
+                        logger.error(f"Error fetching CommonPlayerInfo for player ID {id}: {e}", exc_info=True)
         
         # 2. Fetch current season totals
         cursor.execute(
@@ -6078,7 +6106,8 @@ def _load_rest_rows(conn, season: str, season_type: str) -> List[Dict[str, Any]]
 
 
 @app.get("/api/stats/rest")
-def get_rest_splits(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_rest_splits(request: Request, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     How teams perform by how rested they are, and by how rested they are
     relative to the opponent.
@@ -6611,7 +6640,8 @@ def get_game_details(game_id: str):
         conn.close()
 
 @app.get("/api/games/{game_id}/play-by-play")
-def get_game_play_by_play(game_id: str):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_game_play_by_play(request: Request, game_id: str):
     """
     Retrieve play-by-play timeline events for a game.
     
@@ -7095,7 +7125,8 @@ def get_scoring_runs(
 # and minutes and nothing derived: the page computes per-36 and the 0-100 scaling
 # itself, the same shape as Build-a-Metric, so a slider move never round-trips.
 @app.get("/api/stats/hustle")
-def get_hustle_stats(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_hustle_stats(request: Request, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Season hustle totals for every player: the effort plays the box score skips.
 
@@ -7757,7 +7788,9 @@ def _broadcaster_names(game: Dict[str, Any], scope: str, media: str) -> List[str
 
 
 @app.get("/api/schedule")
+@limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_league_schedule(
+    request: Request,
     season: str = "2026-27",
     season_type: Optional[str] = None,
     month: Optional[int] = None,
@@ -8080,7 +8113,8 @@ def get_hof_careers(sort: str = "pts"):
 
 
 @app.get("/api/cup")
-def get_nba_cup(season: str = "2026-27"):
+@limiter.limit(RATE_LIMIT_UPSTREAM)
+def get_nba_cup(request: Request, season: str = "2026-27"):
     """
     The Emirates NBA Cup: six groups, the knockout round, and who plays whom.
 
@@ -8176,7 +8210,9 @@ LINEUP_SORTS = {
 
 
 @app.get("/api/lineups")
+@limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_lineups(
+    request: Request,
     season: str = CURRENT_SEASON,
     season_type: str = "Regular Season",
     group_quantity: int = 5,

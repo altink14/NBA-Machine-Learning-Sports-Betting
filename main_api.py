@@ -1927,6 +1927,34 @@ def get_game_market(game_id: str):
     return result
 
 
+@app.get("/api/games/{game_id}/officials")
+def get_game_officials(game_id: str):
+    """The crew that worked one game (nba.com Officials feed via backfill_officials.py). Names only."""
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT o.official_id, o.first_name, o.last_name, o.jersey_num
+            FROM game_officials g JOIN officials o ON o.official_id = g.official_id
+            WHERE g.game_id = ?
+            ORDER BY o.last_name, o.first_name
+            """,
+            (game_id,),
+        ).fetchall()
+        asked = conn.execute("SELECT n_officials FROM officials_fetch WHERE game_id = ?", (game_id,)).fetchone()
+    finally:
+        conn.close()
+    return {
+        "game_id": game_id,
+        "on_file": asked is not None,
+        "officials": [
+            {"official_id": r["official_id"], "name": f"{r['first_name']} {r['last_name']}".strip(),
+             "jersey_num": r["jersey_num"]}
+            for r in rows
+        ],
+    }
+
+
 @app.get("/api/market/season/{season}")
 def get_season_market(season: str, season_type: str = "Regular Season"):
     """Every team's straight-up, against-the-spread, over/under and favourite/underdog record for a season."""
@@ -1959,15 +1987,18 @@ def get_officials(season_from: str = None, min_games: int = 25,
     if key in _officials_cache:
         return _officials_cache[key]
     conn = get_db_conn()
+    odds_conn = _odds_read_conn()
     try:
         result = officials_engine.compute_officials(
-            conn, season_from=season_from, min_games=min_games, season_type=season_type
+            conn, season_from=season_from, min_games=min_games, season_type=season_type,
+            odds_conn=odds_conn,
         )
     except Exception as e:
         logger.error(f"Error computing officials: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not compute officiating profiles.")
     finally:
         conn.close()
+        odds_conn.close()
     if not result.get("officials"):
         # Not an error: the crew archive may simply not be deep enough yet.
         result["note"] = "No official has reached the minimum game count yet."

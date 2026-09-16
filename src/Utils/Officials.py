@@ -56,7 +56,18 @@ def compute_officials(
     season_from: Optional[str] = None,
     min_games: int = 25,
     season_type: str = "Regular Season",
+    odds_conn=None,
 ) -> Dict[str, Any]:
+    """Per-official profiles. When odds_conn is given, two market facts join
+    the box-score facts for games that have a closing line on file (2007-08 to
+    2022-23, see Market.py): whether the game went OVER the closing total and
+    whether the HOME side covered the closing spread. Both are counts against
+    a season-matched baseline, exactly like home win rate; pushes are skipped.
+    They describe the games an official was assigned, not how he called them."""
+    lines = None
+    if odds_conn is not None:
+        from src.Utils import Market as _market
+        lines = _market._load(odds_conn)
     # ---- per-game facts, for every game that has a crew on file ----
     params: List[Any] = [season_type]
     where = "b.season_type = ?"
@@ -68,10 +79,12 @@ def compute_officials(
         f"""
         SELECT b.game_id, b.season, b.game_date,
                t.pts AS home_pts, t.opp_pts AS away_pts,
-               t.pace, t.ft_rate
+               t.pace, t.ft_rate,
+               m.full_name AS home_name
         FROM box_scores b
         JOIN team_game_advanced t
           ON t.game_id = b.game_id AND t.team_id = b.home_team_id
+        LEFT JOIN team_metadata m ON m.team_id = b.home_team_id
         WHERE {where}
         """,
         params,
@@ -97,15 +110,27 @@ def compute_officials(
             "ft_rate": float(g["ft_rate"]) if g["ft_rate"] is not None else None,
             "fouls": float(fouls[g["game_id"]]) if g["game_id"] in fouls else None,
             "home_win": 1 if (g["home_pts"] or 0) > (g["away_pts"] or 0) else 0,
+            "over": None,
+            "home_cover": None,
         }
+        if lines is not None and g["home_name"]:
+            from src.Utils import Market as _market
+            line = _market._lookup(lines, g["game_date"], g["home_name"])
+            if line is not None:
+                hp, ap = g["home_pts"] or 0, g["away_pts"] or 0
+                if line["total"] is not None and (hp + ap) != line["total"]:
+                    facts[g["game_id"]]["over"] = 1 if (hp + ap) > line["total"] else 0
+                if line["spread_home"] is not None and (hp - ap) != line["spread_home"]:
+                    facts[g["game_id"]]["home_cover"] = 1 if (hp - ap) > line["spread_home"] else 0
 
     # ---- league means per season, the yardstick each official is held to ----
     per_season: Dict[str, Dict[str, List[float]]] = {}
     for f in facts.values():
-        s = per_season.setdefault(f["season"], {"total_pts": [], "pace": [], "ft_rate": [], "fouls": [], "home_win": []})
+        s = per_season.setdefault(f["season"], {"total_pts": [], "pace": [], "ft_rate": [], "fouls": [], "home_win": [],
+                                                "over": [], "home_cover": []})
         s["total_pts"].append(f["total_pts"])
         s["home_win"].append(f["home_win"])
-        for k in ("pace", "ft_rate", "fouls"):
+        for k in ("pace", "ft_rate", "fouls", "over", "home_cover"):
             if f[k] is not None:
                 s[k].append(f[k])
     season_mean = {
@@ -133,14 +158,16 @@ def compute_officials(
             continue
         o = by_off.setdefault(link["official_id"], {
             "total_pts": [], "pace": [], "ft_rate": [], "fouls": [],
-            "home_win": [], "seasons": {},
+            "home_win": [], "over": [], "home_cover": [], "seasons": {}, "market_seasons": {},
         })
         o["total_pts"].append(f["total_pts"])
         o["home_win"].append(f["home_win"])
-        for k in ("pace", "ft_rate", "fouls"):
+        for k in ("pace", "ft_rate", "fouls", "over", "home_cover"):
             if f[k] is not None:
                 o[k].append(f[k])
         o["seasons"][f["season"]] = o["seasons"].get(f["season"], 0) + 1
+        if f["over"] is not None or f["home_cover"] is not None:
+            o["market_seasons"][f["season"]] = o["market_seasons"].get(f["season"], 0) + 1
 
     def matched_baseline(seasons: Dict[str, int], key: str) -> Optional[float]:
         """League mean over the same seasons, weighted by games worked there."""
@@ -189,6 +216,23 @@ def compute_officials(
             "ci95": _wilson(wins, n),
             "n": n,
         }
+        # Market facts: only the games with a closing line, baseline matched to
+        # those same seasons. None when the official has no such games.
+        for key in ("over", "home_cover"):
+            vals = o[key]
+            if not vals or lines is None:
+                row[key] = None
+                continue
+            k = sum(vals)
+            m = len(vals)
+            base = matched_baseline(o["market_seasons"], key)
+            row[key] = {
+                "pct": round(k / m * 100, 1),
+                "baseline": round(base * 100, 1) if base is not None else None,
+                "diff": round(k / m * 100 - base * 100, 1) if base is not None else None,
+                "ci95": _wilson(k, m),
+                "n": m,
+            }
         out.append(row)
 
     out.sort(key=lambda r: -r["games"])
@@ -215,7 +259,16 @@ def compute_officials(
             "first_game": covered[0],
             "last_game": covered[1],
             "games_scored": len(facts),
+            "games_with_line": sum(1 for f in facts.values() if f["over"] is not None or f["home_cover"] is not None),
         },
+        "market_note": (
+            "Over % and Home ATS % use closing lines from the historical odds dataset "
+            "(2007-08 to 2022-23) for the games that have one; pushes are skipped and "
+            "the baseline is the league rate over the same seasons. A crew is not "
+            "assigned at random, so these describe the games an official was given, "
+            "not how he called them, and they are not a betting edge. With eighty-odd "
+            "officials on the table, a few will clear their interval by chance alone."
+        ) if lines is not None else None,
         "method": (
             "Crews come from nba.com's Officials feed; every game statistic is "
             "computed from our own box-score archive. Each official's average is "

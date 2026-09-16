@@ -49,6 +49,7 @@ from src.Utils import ParlayCorrelation as parlay_corr
 from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
 from src.Utils import Officials as officials_engine
+from src.Utils import Market as market_engine
 from src.Utils import DailyGame as daily_game
 from src.Utils import BuildLab as build_lab
 _buildlab_era_cache: dict = {}
@@ -1892,6 +1893,57 @@ def sitemap_seasons():
     finally:
         conn.close()
     return {"seasons": [{"season": r[0], "games": r[1]} for r in rows]}
+
+
+# --- The closing market (historical odds dataset joined to our archive) ---
+# Closing spread / total / moneylines for 2007-08 .. 2022-23, graded against
+# what OUR box scores say happened. Descriptive: the market's final word next
+# to the result. Nothing here is a model pick and nothing measures ROI - see
+# Market.py. Both endpoints only read SQLite, so no upstream rate limit.
+_market_cache: Dict[tuple, Any] = {}
+
+
+def _odds_read_conn():
+    conn = sqlite3.connect(f"file:{ODDS_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = None
+    return conn
+
+
+@app.get("/api/games/{game_id}/market")
+def get_game_market(game_id: str):
+    """Closing line and graded result for one archived game (available=False outside 2007-08..2022-23)."""
+    key = ("game", game_id)
+    if key in _market_cache:
+        return _market_cache[key]
+    team_conn = get_db_conn()
+    odds_conn = _odds_read_conn()
+    try:
+        result = market_engine.game_market(team_conn, odds_conn, game_id)
+    finally:
+        team_conn.close()
+        odds_conn.close()
+    if result.get("available") or result.get("reason") == "season_not_covered":
+        _market_cache[key] = result
+    return result
+
+
+@app.get("/api/market/season/{season}")
+def get_season_market(season: str, season_type: str = "Regular Season"):
+    """Every team's straight-up, against-the-spread, over/under and favourite/underdog record for a season."""
+    if season_type not in ("Regular Season", "Playoffs"):
+        raise HTTPException(status_code=422, detail="season_type must be 'Regular Season' or 'Playoffs'")
+    key = ("season", season, season_type)
+    if key in _market_cache:
+        return _market_cache[key]
+    team_conn = get_db_conn()
+    odds_conn = _odds_read_conn()
+    try:
+        result = market_engine.season_market(team_conn, odds_conn, season, season_type)
+    finally:
+        team_conn.close()
+        odds_conn.close()
+    _market_cache[key] = result
+    return result
 
 
 @app.get("/api/officials")

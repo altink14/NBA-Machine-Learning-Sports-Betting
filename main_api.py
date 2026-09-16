@@ -1955,6 +1955,46 @@ def get_game_officials(game_id: str):
     }
 
 
+@app.get("/api/games/{game_id}/line-score")
+def get_game_line_score(game_id: str):
+    """Points by period, derived from the play-by-play period-end events
+    (2022-23 onward, where pbp_events exists). Overtime periods are labelled
+    OT1, OT2... available=false when the game has no play-by-play on file."""
+    key = ("line", game_id)
+    if key in _market_cache:
+        return _market_cache[key]
+    conn = get_db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT period, MAX(score_home) AS home, MAX(score_away) AS away
+            FROM pbp_events WHERE game_id = ? AND score_home IS NOT NULL
+            GROUP BY period ORDER BY period
+            """,
+            (game_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return {"game_id": game_id, "available": False}
+    periods = []
+    prev_h = prev_a = 0
+    for r in rows:
+        p = int(r["period"])
+        h, a = int(r["home"] or 0), int(r["away"] or 0)
+        periods.append({
+            "period": p,
+            "label": f"Q{p}" if p <= 4 else f"OT{p - 4}",
+            "home": h - prev_h,
+            "away": a - prev_a,
+        })
+        prev_h, prev_a = h, a
+    result = {"game_id": game_id, "available": True, "periods": periods,
+              "final": {"home": prev_h, "away": prev_a}, "source": "play-by-play period-end scores"}
+    _market_cache[key] = result
+    return result
+
+
 @app.get("/api/market/season/{season}")
 def get_season_market(season: str, season_type: str = "Regular Season"):
     """Every team's straight-up, against-the-spread, over/under and favourite/underdog record for a season."""

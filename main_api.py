@@ -126,7 +126,7 @@ def find_db_team_stats(team_name: str, season: str = CURRENT_SEASON):
 # --- Security / networking configuration (env-driven) ---
 # CORS_ORIGINS: comma-separated list of allowed browser origins. Defaults to the
 # local Next.js dev server so a fresh checkout works with no configuration.
-DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000"
+DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001"  # 3001: dev fallback when 3000 is taken
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
@@ -2703,6 +2703,99 @@ def get_rookies(season: str = CURRENT_SEASON, season_type: str = "Regular Season
 
 
 # --- Career highs from the game-log archive ---
+@app.get("/api/players/{id}/availability")
+def get_player_availability(id: int, seasons: int = 6):
+    """
+    Games played vs games listed inactive, season by season, from our game
+    log and nba.com's pregame inactive lists (ingest_game_summaries.py;
+    reliable from 2005-06). "Listed inactive" is exactly that: named on the
+    inactive list before tip-off. A healthy player who did not play (coach's
+    decision, rest without a listing) is neither played nor inactive here,
+    which is why team_games is reported alongside when the player was with
+    one team all season and left null when he changed teams.
+    """
+    conn = get_db_conn()
+    try:
+        played = {r["season"]: r["n"] for r in conn.execute(
+            """
+            SELECT b.season, COUNT(DISTINCT g.game_id) AS n
+            FROM player_game_log g JOIN box_scores b ON b.game_id = g.game_id
+            WHERE g.player_id = ? AND b.season_type = 'Regular Season'
+            GROUP BY b.season
+            """, (id,))}
+        try:
+            inactive = {r["season"]: r["n"] for r in conn.execute(
+                """
+                SELECT b.season, COUNT(DISTINCT i.game_id) AS n
+                FROM game_inactives i JOIN box_scores b ON b.game_id = i.game_id
+                WHERE i.player_id = ? AND b.season_type = 'Regular Season'
+                GROUP BY b.season
+                """, (id,))}
+            teams_by_season = {}
+            for r in conn.execute(
+                """
+                SELECT b.season, g.team_id FROM player_game_log g JOIN box_scores b ON b.game_id = g.game_id
+                WHERE g.player_id = ? AND b.season_type = 'Regular Season'
+                UNION
+                SELECT b.season, i.team_id FROM game_inactives i JOIN box_scores b ON b.game_id = i.game_id
+                WHERE i.player_id = ? AND b.season_type = 'Regular Season' AND i.team_id IS NOT NULL
+                """, (id, id)):
+                teams_by_season.setdefault(r["season"], set()).add(r["team_id"])
+            recent = [dict(r) for r in conn.execute(
+                """
+                SELECT i.game_id, b.game_date, b.season,
+                       CASE WHEN i.team_id = b.home_team_id THEN am.abbreviation ELSE hm.abbreviation END AS opponent,
+                       CASE WHEN i.team_id = b.home_team_id THEN 'vs' ELSE '@' END AS venue
+                FROM game_inactives i JOIN box_scores b ON b.game_id = i.game_id
+                LEFT JOIN team_metadata hm ON hm.team_id = b.home_team_id
+                LEFT JOIN team_metadata am ON am.team_id = b.away_team_id
+                WHERE i.player_id = ?
+                ORDER BY b.game_date DESC LIMIT 12
+                """, (id,))]
+        except sqlite3.OperationalError:
+            inactive, teams_by_season, recent = {}, {}, []
+
+        rows = []
+        all_seasons = sorted(set(played) | set(inactive), reverse=True)[:max(1, seasons)]
+        for season in all_seasons:
+            teams = teams_by_season.get(season, set())
+            team_games = None
+            if len(teams) == 1:
+                (tid,) = tuple(teams)
+                team_games = conn.execute(
+                    "SELECT COUNT(*) FROM box_scores WHERE season = ? AND season_type = 'Regular Season' "
+                    "AND (home_team_id = ? OR away_team_id = ?)", (season, tid, tid)).fetchone()[0]
+            # Share of the season's games with at least one inactive listed,
+            # league-wide. A normal season is 97-100%; 2025-26 is 2% because
+            # the feed stopped carrying the list, and 2004-05 is 5%.
+            cov = conn.execute(
+                """
+                SELECT COUNT(DISTINCT b.game_id) AS total, COUNT(DISTINCT i.game_id) AS with_list
+                FROM box_scores b LEFT JOIN game_inactives i ON i.game_id = b.game_id
+                WHERE b.season = ? AND b.season_type = 'Regular Season'
+                """, (season,)).fetchone()
+            coverage = round((cov["with_list"] or 0) / cov["total"], 3) if cov and cov["total"] else None
+            rows.append({
+                "season": season,
+                "played": played.get(season, 0),
+                "listed_inactive": inactive.get(season, 0),
+                "team_games": team_games,
+                "teams": len(teams),
+                "inactives_known": season >= "2005-06",
+                "summary_coverage": coverage,
+            })
+    finally:
+        conn.close()
+    return {
+        "player_id": id,
+        "seasons": rows,
+        "recent_inactive": recent,
+        "note": ("Listed inactive means named on nba.com's pregame inactive list. Games neither played nor "
+                 "listed (coach's decision, an unlisted rest day) are not counted either way. Inactive lists "
+                 "exist from 2005-06."),
+    }
+
+
 @app.get("/api/players/{id}/highs")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_player_highs(request: Request, id: int):

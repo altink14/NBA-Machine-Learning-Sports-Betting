@@ -1965,6 +1965,36 @@ def get_game_line_score(game_id: str):
         return _market_cache[key]
     conn = get_db_conn()
     try:
+        # nba.com's own line score (ingest_game_summaries.py), 2003-04 onward.
+        official = None
+        try:
+            official = conn.execute(
+                """
+                SELECT l.team_id, l.q1, l.q2, l.q3, l.q4, l.ot1, l.ot2, l.ot3, l.ot4, l.ot5,
+                       l.ot6, l.ot7, l.ot8, l.ot9, l.ot10, l.pts,
+                       CASE WHEN l.team_id = b.home_team_id THEN 'home' ELSE 'away' END AS side
+                FROM game_line_scores l JOIN box_scores b ON b.game_id = l.game_id
+                WHERE l.game_id = ?
+                """,
+                (game_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            official = None  # table not created yet on this machine
+        if official and len(official) == 2:
+            by_side = {r["side"]: r for r in official}
+            if "home" in by_side and "away" in by_side:
+                h, a = by_side["home"], by_side["away"]
+                periods = []
+                for i, col in enumerate(["q1", "q2", "q3", "q4"], start=1):
+                    periods.append({"period": i, "label": f"Q{i}", "home": h[col] or 0, "away": a[col] or 0})
+                for i in range(1, 11):
+                    col = f"ot{i}"
+                    if (h[col] or 0) > 0 or (a[col] or 0) > 0:
+                        periods.append({"period": 4 + i, "label": f"OT{i}", "home": h[col] or 0, "away": a[col] or 0})
+                result = {"game_id": game_id, "available": True, "periods": periods,
+                          "final": {"home": h["pts"], "away": a["pts"]}, "source": "nba.com line score"}
+                _market_cache[key] = result
+                return result
         rows = conn.execute(
             """
             SELECT period, MAX(score_home) AS home, MAX(score_away) AS away
@@ -1991,6 +2021,55 @@ def get_game_line_score(game_id: str):
         prev_h, prev_a = h, a
     result = {"game_id": game_id, "available": True, "periods": periods,
               "final": {"home": prev_h, "away": prev_a}, "source": "play-by-play period-end scores"}
+    _market_cache[key] = result
+    return result
+
+
+@app.get("/api/games/{game_id}/game-info")
+def get_game_info(game_id: str):
+    """Attendance, game duration, national TV and the inactive list, from
+    nba.com's game summary (ingest_game_summaries.py; 2003-04 onward). The
+    inactive list is empty for most games before ~2008 because the feed did
+    not carry it: `inactives_known` says whether the feed had the field at
+    all, so "nobody listed" is never shown as "everyone played"."""
+    key = ("info", game_id)
+    if key in _market_cache:
+        return _market_cache[key]
+    conn = get_db_conn()
+    try:
+        try:
+            info = conn.execute("SELECT * FROM game_info WHERE game_id = ?", (game_id,)).fetchone()
+            inact = conn.execute(
+                """
+                SELECT i.team_id, i.team_abbr, i.player_id, i.first_name, i.last_name, i.jersey_num
+                FROM game_inactives i WHERE i.game_id = ?
+                ORDER BY i.team_abbr, i.last_name, i.first_name
+                """,
+                (game_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            info, inact = None, []
+    finally:
+        conn.close()
+    if info is None:
+        return {"game_id": game_id, "available": False}
+    by_team: Dict[str, Any] = {}
+    for r in inact:
+        t = by_team.setdefault(r["team_abbr"] or str(r["team_id"]), {"team_id": r["team_id"], "abbr": r["team_abbr"], "players": []})
+        t["players"].append({"player_id": r["player_id"], "name": f"{r['first_name'] or ''} {r['last_name'] or ''}".strip(),
+                             "jersey_num": r["jersey_num"]})
+    result = {
+        "game_id": game_id, "available": True,
+        "attendance": info["attendance"],
+        "game_time": info["game_time"],
+        "natl_tv": info["natl_tv"],
+        "inactives": list(by_team.values()),
+        # The feed lists inactives from 2005-06 (1,215 of 1,230 games that
+        # season); 2003-04 and 2004-05 have a few dozen games each, so an
+        # empty list there is "unknown", not "everyone played".
+        "inactives_known": game_id[3:5] >= "05" if len(game_id) >= 5 and game_id[3:5].isdigit() else True,
+        "source": "nba.com game summary",
+    }
     _market_cache[key] = result
     return result
 

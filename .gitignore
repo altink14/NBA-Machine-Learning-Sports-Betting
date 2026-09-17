@@ -113,3 +113,8 @@ Data/nba_cache/
 
 # Databases are data artifacts, not source - bootstrapped from release snapshots
 Data/*.sqlite
+
+# NFL archive + its source cache (rebuilt by src/Sports/nfl/ingest_games.py)
+Data/NflData.sqlite
+Data/NflData.sqlite-*
+Data/nfl_cache/

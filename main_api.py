@@ -76,6 +76,9 @@ logger = logging.getLogger(__name__)
 # Latest season with complete data in the stats database.
 # Bump each fall once the new season's games start flowing in.
 CURRENT_SEASON = "2025-26"
+# First season with play-by-play in pbp_events (backfill_pbp.py --season, one at a time).
+# Move this when another season lands; the frontend floor lives in archive-seasons.ts callers.
+PBP_FIRST_SEASON = "2021-22"
 
 def find_db_team_stats(team_name: str, season: str = CURRENT_SEASON):
     """
@@ -1630,7 +1633,7 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
             reb_row = next((p for p in rb.get("players", []) if p.get("player_id") == player_id), None)
         except Exception:
             reb_row = None
-    if season >= "2022-23":
+    if season >= PBP_FIRST_SEASON:
         try:
             cl = _clutch_for(season, "Regular Season")
             clutch_row = next((p for p in cl.get("players", []) if p.get("player_id") == player_id), None)
@@ -1656,7 +1659,7 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
         "eras": {
             "shot_quality": season >= "2013-14",
             "rebounding": season >= "2013-14",
-            "clutch": season >= "2022-23",
+            "clutch": season >= PBP_FIRST_SEASON,
         },
         "build_notes": build_lab.build_notes(totals, p36, sq_row,
                                              reb_row and {"reb": reb_row.get("reb")}, clutch_row),

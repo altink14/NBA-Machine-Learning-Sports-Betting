@@ -174,6 +174,26 @@ CREATE TABLE IF NOT EXISTS officials (
 );
 CREATE INDEX IF NOT EXISTS idx_officials_person ON officials(person_id);
 
+-- Event-level play data: one row per play, pitch, shot or possession. Kept
+-- deliberately thin and sport-agnostic; each sport adds a wide extension
+-- table (nfl_plays, nba_pbp_events) keyed on the same (game_id, sequence)
+-- so cross-sport surfaces read `events` and sport pages join the extension.
+CREATE TABLE IF NOT EXISTS events (
+    game_id         TEXT NOT NULL,
+    sequence        INTEGER NOT NULL,   -- play_id / action_number, ordered within the game
+    period          INTEGER,
+    clock_seconds   REAL,               -- seconds REMAINING in the game, sport-normalised
+    event_type      TEXT,               -- pass | run | kickoff | shot | pitch | ...
+    team_id         TEXT,               -- the team in possession / acting
+    actor_id        TEXT,               -- primary actor, source's person id
+    description     TEXT,
+    home_score      INTEGER,
+    away_score      INTEGER,
+    PRIMARY KEY (game_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_events_type  ON events(event_type);
+CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor_id);
+
 -- One row per game per book per market. `is_closing` marks the last price
 -- before the event started; `captured_at` is when WE saw it, which is null
 -- for a historical archive that did not record it. A line whose book and

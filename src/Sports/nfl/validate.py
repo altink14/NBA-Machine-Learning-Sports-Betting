@@ -50,6 +50,36 @@ EXPECTED_REG = {**{y: 248 for y in range(1999, 2002)},
 EXPECTED_POST = {**{y: 11 for y in range(1999, 2020)},
                  **{y: 13 for y in range(2020, 2027)}}
 
+#: Games the nflverse play-by-play release simply does not contain. Verified
+#: 2026-09-19 by counting distinct game_ids in the source files themselves:
+#: play_by_play_1999.csv holds 258 games and play_by_play_2000.csv holds 257,
+#: which is exactly what we ingested, so nothing was dropped on our side.
+PBP_MISSING_UPSTREAM = {
+    "1999_01_BAL_STL",
+    "2000_03_SD_KC",
+    "2000_06_BUF_MIA",
+}
+
+#: Games whose play-by-play running score does not reconcile with the final
+#: score. Sixteen of the seventeen are Jacksonville HOME games in 2001 and
+#: 2002, where the combined total is right but the home/away attribution
+#: inside the drive-level scoring is wrong: 2001_01_PIT_JAX finished 21-3 and
+#: the play-by-play ends 3-21. This is an upstream defect in nflfastR's
+#: retro-applied early-season data, not a parsing error here. The seventeenth,
+#: 2011_13_DET_NO, is a different fault: both sides run exactly six points
+#: high (37-23 against a 31-17 final).
+#:
+#: These ids are pinned rather than the count being relaxed, so a NEW
+#: reconciliation failure anywhere still fails the suite. Any page computing
+#: a score-dependent figure from play-by-play must exclude them.
+PBP_SCORE_MISMATCH_UPSTREAM = {
+    "2001_01_PIT_JAX", "2001_02_TEN_JAX", "2001_03_CLE_JAX", "2001_06_BUF_JAX",
+    "2001_09_CIN_JAX", "2001_11_BAL_JAX", "2001_12_GB_JAX", "2001_16_KC_JAX",
+    "2002_01_IND_JAX", "2002_04_NYJ_JAX", "2002_05_PHI_JAX", "2002_08_HOU_JAX",
+    "2002_10_WAS_JAX", "2002_13_PIT_JAX", "2002_14_CLE_JAX", "2002_16_TEN_JAX",
+    "2011_13_DET_NO",
+}
+
 FAILS: list[str] = []
 WARNS: list[str] = []
 
@@ -210,6 +240,85 @@ def main() -> int:
     pct_disagree = 100.0 * disagree / max(1, total_both)
     check("spread and moneyline agree on the favourite", pct_disagree < 2.0,
           f"{pct_disagree:.2f}% disagree ({disagree}/{total_both})")
+
+    print("\n=== PLAY-BY-PLAY ===")
+    have_pbp = one("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nfl_plays'") > 0
+    if not have_pbp:
+        print("  SKIP  nfl_plays not ingested yet")
+    else:
+        plays = one("SELECT COUNT(*) FROM nfl_plays")
+        pbp_games = one("SELECT COUNT(DISTINCT game_id) FROM nfl_plays")
+        check("play-by-play present", plays > 0, f"{plays:,} plays across {pbp_games:,} games")
+
+        orphan_pbp = one("SELECT COUNT(DISTINCT p.game_id) FROM nfl_plays p "
+                         "WHERE NOT EXISTS (SELECT 1 FROM games g WHERE g.game_id = p.game_id)")
+        check("every play's game is in the games table", orphan_pbp == 0, f"{orphan_pbp} orphan games")
+
+        seasons_done = {r[0] for r in q("SELECT DISTINCT season FROM nfl_plays")}
+        missing = [r["game_id"] for r in q(
+            "SELECT g.game_id FROM games g LEFT JOIN nfl_plays p ON p.game_id = g.game_id "
+            "WHERE g.status = 'final' AND p.game_id IS NULL GROUP BY g.game_id")
+            if r["game_id"].split("_")[0] in seasons_done]
+        unexpected = sorted(set(missing) - PBP_MISSING_UPSTREAM)
+        check("every ingested season covers all its games, bar the known upstream gaps",
+              not unexpected,
+              f"{len(unexpected)} unexpected: {', '.join(unexpected[:5])}")
+        stale = sorted(PBP_MISSING_UPSTREAM - set(missing))
+        check("the pinned upstream gaps are still gaps", not stale,
+              f"{', '.join(stale)} now has play-by-play; remove it from PBP_MISSING_UPSTREAM",
+              warn_only=True)
+
+        ev = one("SELECT COUNT(*) FROM events")
+        check("events mirrors nfl_plays row for row", ev == plays, f"events={ev:,} plays={plays:,}")
+
+        # SEMANTIC: expected points added must behave like expected points. A
+        # touchdown is worth a lot, a turnover costs a lot. If these signs were
+        # flipped or a column were misaligned, nothing structural would notice
+        # and every model feature downstream would be quietly poisoned.
+        epa_td = one("SELECT AVG(epa) FROM nfl_plays WHERE touchdown = 1 AND epa IS NOT NULL")
+        epa_int = one("SELECT AVG(epa) FROM nfl_plays WHERE interception = 1 AND epa IS NOT NULL")
+        epa_sack = one("SELECT AVG(epa) FROM nfl_plays WHERE sack = 1 AND epa IS NOT NULL")
+        check("touchdowns carry large positive EPA", 1.0 <= (epa_td or 0) <= 4.0, f"{epa_td:.2f}")
+        check("interceptions carry large negative EPA", -6.0 <= (epa_int or 0) <= -2.0, f"{epa_int:.2f}")
+        check("sacks carry negative EPA", -3.0 <= (epa_sack or 0) <= -0.5, f"{epa_sack:.2f}")
+
+        bad_wp = one("SELECT COUNT(*) FROM nfl_plays WHERE (wp IS NOT NULL AND (wp < 0 OR wp > 1)) "
+                     "OR (vegas_wp IS NOT NULL AND (vegas_wp < 0 OR vegas_wp > 1))")
+        check("win probabilities lie between 0 and 1", bad_wp == 0, f"{bad_wp} rows")
+
+        bad_down = one("SELECT COUNT(*) FROM nfl_plays WHERE down IS NOT NULL AND down NOT BETWEEN 1 AND 4")
+        check("downs are 1 to 4", bad_down == 0, f"{bad_down} rows")
+        bad_qtr = one("SELECT COUNT(*) FROM nfl_plays WHERE qtr IS NOT NULL AND qtr NOT BETWEEN 1 AND 6")
+        check("quarters are 1 to 6 (four plus overtime)", bad_qtr == 0, f"{bad_qtr} rows")
+
+        # Third-down conversion is one of the most stable rates in the sport;
+        # a figure far from 38-42% means our down or conversion columns are
+        # misaligned.
+        third = conn.execute("SELECT SUM(third_down_converted) c, SUM(third_down_failed) f "
+                             "FROM nfl_plays WHERE down = 3").fetchone()
+        rate = 100.0 * (third["c"] or 0) / max(1, (third["c"] or 0) + (third["f"] or 0))
+        check("third downs convert between 36% and 44%", 36.0 <= rate <= 44.0, f"{rate:.1f}%")
+
+        pass_no_passer = one("SELECT COUNT(*) FROM nfl_plays WHERE play_type = 'pass' "
+                             "AND passer_player_id IS NULL")
+        pass_total = one("SELECT COUNT(*) FROM nfl_plays WHERE play_type = 'pass'")
+        pct = 100.0 * pass_no_passer / max(1, pass_total)
+        check("pass plays name their passer", pct < 3.0, f"{pct:.2f}% missing ({pass_no_passer:,})")
+
+        # The running score on the last play of a game must equal the final
+        # score in the games table: two independent files agreeing.
+        bad = [r["game_id"] for r in q(
+            "SELECT p.game_id, MAX(p.total_home_score) mh, MAX(p.total_away_score) ma "
+            "FROM nfl_plays p JOIN games g ON g.game_id = p.game_id "
+            "WHERE g.status = 'final' GROUP BY p.game_id "
+            "HAVING mh != g.home_score OR ma != g.away_score")]
+        new_bad = sorted(set(bad) - PBP_SCORE_MISMATCH_UPSTREAM)
+        check("play-by-play scores reconcile with the final score, bar the known upstream defects",
+              not new_bad, f"{len(new_bad)} new mismatch(es): {', '.join(new_bad[:5])}")
+        fixed = sorted(PBP_SCORE_MISMATCH_UPSTREAM - set(bad))
+        check("the pinned upstream mismatches are still wrong", not fixed,
+              f"{len(fixed)} fixed upstream ({', '.join(fixed[:3])}); remove from PBP_SCORE_MISMATCH_UPSTREAM",
+              warn_only=True)
 
     print("\n=== TIME ===")
     bad_utc = one("""SELECT COUNT(*) FROM games WHERE date_utc IS NOT NULL

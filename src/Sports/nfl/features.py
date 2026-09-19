@@ -218,13 +218,20 @@ def build_frame(db_path: str = DB_PATH,
                 seasons: Optional[Sequence[str]] = None,
                 sealed_evaluation: bool = False,
                 include_live: bool = False,
-                max_kickoff: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+                max_kickoff: Optional[str] = None,
+                for_prediction: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Walk every game in kickoff order, emitting features from prior state.
 
     State is always built from the FULL history in order, because a team's
     week 1 2019 rating depends on 2018. Only the RETURNED rows are filtered.
     That is the correct separation: using earlier seasons to compute a feature
     is not leakage; using later ones is.
+
+    `for_prediction=True` returns rows for games that have NOT been played, and
+    only those. It is how the live predictor gets its features. It needs no
+    sealed-window permission and cannot leak, because a game without a result
+    has no outcome to leak: the guard exists to stop us learning from what
+    happened, and nothing has happened yet.
 
     `max_kickoff` exists for the leakage tests: it truncates the input to games
     starting strictly before that timestamp, so a test can rebuild a row as if
@@ -236,6 +243,9 @@ def build_frame(db_path: str = DB_PATH,
         allowed |= set(SEALED_SEASONS)
     if include_live:
         allowed |= set(LIVE_SEASONS)
+    if for_prediction:
+        # Unplayed games carry no outcome, so every season is permitted here.
+        allowed |= set(SEALED_SEASONS) | set(LIVE_SEASONS)
     if seasons is not None:
         requested = set(seasons)
         forbidden = requested - allowed
@@ -262,7 +272,6 @@ def build_frame(db_path: str = DB_PATH,
         LEFT JOIN rest_travel r2 ON r2.game_id = g.game_id AND r2.team_id = g.away_team_id
         LEFT JOIN weather w      ON w.game_id = g.game_id
         LEFT JOIN venues v       ON v.venue_id = g.venue_id
-        WHERE g.status = 'final'
         ORDER BY COALESCE(g.date_utc, g.local_date || 'T17:00:00+00:00'), g.game_id
         """
     ).fetchall()
@@ -292,7 +301,9 @@ def build_frame(db_path: str = DB_PATH,
         hs_, as_ = state[home], state[away]
 
         # ---------- EMIT: everything below reads state, nothing writes it ----
-        if season in allowed and g["home_score"] is not None and g["away_score"] is not None:
+        played = g["home_score"] is not None and g["away_score"] is not None
+        emit = (season in allowed) and (not played if for_prediction else played)
+        if emit:
             roof = (g["roof_state"] or "").lower()
             surface = (g["surface"] or "").strip().lower()
             gp_h, gp_a = hs_.wins + hs_.losses, as_.wins + as_.losses
@@ -300,7 +311,7 @@ def build_frame(db_path: str = DB_PATH,
                 "game_id": g["game_id"], "season": season, "week": g["week"],
                 "season_type": g["season_type"], "kickoff_utc": kickoff,
                 "home_team": home, "away_team": away,
-                "home_win": 1 if g["home_score"] > g["away_score"] else 0,
+                "home_win": (1 if g["home_score"] > g["away_score"] else 0) if played else None,
 
                 "elo_home": hs_.elo, "elo_away": as_.elo, "elo_diff": hs_.elo - as_.elo,
                 "home_edge_pts": home_edge.points,

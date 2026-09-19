@@ -126,6 +126,8 @@ def baselines(rows: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fit the NFL model on train, report on the validation window.")
     ap.add_argument("--no-calibration", action="store_true")
+    ap.add_argument("--calibrate-on", choices=["train", "validation"], default="validation",
+                    help="Where to fit the isotonic calibrator. v2 s3 assigns calibration to validation.")
     ap.add_argument("--save", action="store_true", help="Write the fitted model to Models/nfl_v1.")
     args = ap.parse_args()
 
@@ -172,14 +174,42 @@ def main() -> int:
     clf = XGBClassifier(**PARAMS)
     clf.fit(Xtr, ytr, verbose=False)
 
+    # THE ERA PROBLEM, and why the calibrator is fitted where it is.
+    #
+    # Trained on 1999-2018, the model picks the home team about 66% of the
+    # time and carries a mean probability of 0.582. Home teams won 56.4% of
+    # games across that training era and only 53.5% across the validation one.
+    # A calibrator fitted on training data therefore inherits the old base
+    # rate and leaves every probability bucket overconfident in the same
+    # direction, which is what we saw.
+    #
+    # Pre-registration v2 section 3 assigns calibration to the validation
+    # window explicitly, so fitting it there is permitted rather than a
+    # liberty. The cost, stated wherever these numbers appear: validation
+    # metrics below are now IN-SAMPLE for the calibrator and are optimistic.
+    # The 2026 sealed evaluation is untouched by this and remains the only
+    # number that counts.
     raw_tune = clf.predict_proba(Xtu)[:, 1]
     if args.no_calibration:
         p_tune = raw_tune
         iso = None
     else:
         iso = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
-        iso.fit(oof, ytr)
-        p_tune = iso.predict(raw_tune)
+        if args.calibrate_on == "train":
+            iso.fit(oof, ytr)
+        else:
+            from sklearn.model_selection import KFold as _KF
+            oof_val = np.zeros(len(ytu), dtype=float)
+            for a, b in _KF(n_splits=5, shuffle=True, random_state=20260919).split(Xtu):
+                cal = IsotonicRegression(out_of_bounds="clip", y_min=0.02, y_max=0.98)
+                cal.fit(clf.predict_proba(Xtu[a])[:, 1], ytu[a])
+                oof_val[b] = cal.predict(clf.predict_proba(Xtu[b])[:, 1])
+            iso.fit(clf.predict_proba(Xtu)[:, 1], ytu)
+            p_tune = oof_val
+            print("calibrator fitted on the VALIDATION window (permitted by v2 s3);"
+                  " reported metrics use out-of-fold calibration to stay honest")
+        if args.calibrate_on == "train":
+            p_tune = iso.predict(raw_tune)
 
     pred = (p_tune >= 0.5).astype(int)
     correct = pred == ytu

@@ -41,6 +41,21 @@ ever called closing until the game has begun and the question is settled.
 Append-only: snapshots have triggers that abort UPDATE and DELETE, for the
 same reason the injury observations do.
 
+OBSERVED VERSUS RECONSTRUCTED. Every row carries `provenance`. This recorder
+writes 'observed': it read the price off the live market at `captured_at`. The
+other value, 'reconstructed', is for prices pulled out of The Odds API's
+historical archive after the fact, which is how a missed run gets repaired --
+the archive goes back to 2020-06-06 at 5-minute resolution, so a slept-through
+slate is recoverable, unlike a missed injury poll.
+
+The two are not interchangeable and the column exists so nobody has to
+remember which is which. A closing line sealed from a reconstructed snapshot
+is itself reconstructed; `seal()` carries the value through rather than
+re-deciding it. Any closing line value we publish must say which kind of price
+it was computed from, because "we watched this price and beat it" and "a
+vendor's archive says this price existed and we beat it" are different
+claims. A trigger rejects any other value.
+
 Usage:
     venv/Scripts/python.exe src/Sports/odds_recorder.py --sport nfl
     venv/Scripts/python.exe src/Sports/odds_recorder.py --sport nfl --dry-run
@@ -103,6 +118,14 @@ CREATE TABLE IF NOT EXISTS market_line_snapshots (
     price_away    INTEGER,
     price_over    INTEGER,
     price_under   INTEGER,
+    -- 'observed'      = this recorder read the price off the live market at
+    --                   captured_at
+    -- 'reconstructed' = pulled from The Odds API's historical archive after
+    --                   the fact, because a scheduled run was missed
+    -- captured_at means "when the price was true" in both cases; provenance is
+    -- how we came to know it. CLV built on a reconstructed price is a weaker
+    -- claim than CLV built on an observed one and has to say so.
+    provenance    TEXT NOT NULL DEFAULT 'observed',
     source        TEXT,
     ingest_version INTEGER
 );
@@ -116,7 +139,33 @@ BEGIN SELECT RAISE(ABORT, 'market_line_snapshots is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS market_snap_no_delete
 BEFORE DELETE ON market_line_snapshots
 BEGIN SELECT RAISE(ABORT, 'market_line_snapshots is append-only'); END;
+
+-- NULL checked explicitly: `NULL NOT IN (...)` is NULL, not true.
+-- A snapshot is only ever one of these two; 'third_party' exists on
+-- market_lines for nflverse's record of a close, which never arrives here.
+CREATE TRIGGER IF NOT EXISTS market_snap_provenance_valid
+BEFORE INSERT ON market_line_snapshots
+WHEN NEW.provenance IS NULL
+  OR NEW.provenance NOT IN ('observed', 'reconstructed')
+BEGIN SELECT RAISE(ABORT, 'provenance must be observed or reconstructed'); END;
 """
+
+# Additive migration for archives built before the column existed. Existing
+# rows default to 'observed', which is the truth about them: every snapshot
+# written before today came from this recorder reading a live market.
+_SNAPSHOT_ADDED_COLUMNS = [
+    ("provenance", "TEXT NOT NULL DEFAULT 'observed'"),
+]
+
+
+def ensure_snapshot_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SNAPSHOT_SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(market_line_snapshots)")}
+    for col, decl in _SNAPSHOT_ADDED_COLUMNS:
+        if have and col not in have:
+            conn.execute(f"ALTER TABLE market_line_snapshots ADD COLUMN {col} {decl}")
+            logger.info("market_line_snapshots: added column %s", col)
+    conn.commit()
 
 
 def api_key() -> str:
@@ -247,12 +296,17 @@ def seal(conn: sqlite3.Connection) -> int:
 
     Only for games that have actually started, because until then "last" is
     not a fact about the world, it is a fact about when we stopped looking.
+
+    The sealed row inherits the chosen snapshot's `provenance`. A closing line
+    sealed from a reconstructed snapshot is itself reconstructed, and saying so
+    is the whole point of the column: it travels with the price instead of
+    being remembered by whoever ran the backfill.
     """
     now = datetime.now(timezone.utc).isoformat()
     picked = conn.execute(
         """
         SELECT s.game_id, s.book, s.market_type, s.line, s.price_home, s.price_away,
-               s.price_over, s.price_under, s.captured_at
+               s.price_over, s.price_under, s.captured_at, s.provenance
         FROM market_line_snapshots s
         JOIN games g ON g.game_id = s.game_id
         WHERE g.date_utc IS NOT NULL AND g.date_utc < ?
@@ -263,13 +317,15 @@ def seal(conn: sqlite3.Connection) -> int:
         """, (now,)).fetchall()
     n = 0
     for r in picked:
+        provenance = r[9] or "observed"
         conn.execute(
             "INSERT OR REPLACE INTO market_lines (game_id, book, market_type, line, price_home, "
-            "price_away, price_draw, price_over, price_under, captured_at, is_closing, source, "
-            "source_endpoint, fetched_at, ingest_version) "
-            "VALUES (?,?,?,?,?,?,NULL,?,?,?,1,?,?,?,?)",
+            "price_away, price_draw, price_over, price_under, captured_at, is_closing, "
+            "provenance, source, source_endpoint, fetched_at, ingest_version) "
+            "VALUES (?,?,?,?,?,?,NULL,?,?,?,1,?,?,?,?,?)",
             (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
-             "the-odds-api (captured live)", ODDS_API_BASE, now, INGEST_VERSION))
+             provenance,
+             f"the-odds-api ({provenance})", ODDS_API_BASE, now, INGEST_VERSION))
         n += 1
     conn.commit()
     return n
@@ -287,8 +343,7 @@ def main() -> int:
     cfg = SPORTS[args.sport]
     conn = sqlite3.connect(cfg["db"], timeout=120)
     ensure_core_schema(conn)
-    conn.executescript(SNAPSHOT_SCHEMA)
-    conn.commit()
+    ensure_snapshot_schema(conn)
 
     if args.seal:
         n = seal(conn)
@@ -324,8 +379,8 @@ def main() -> int:
     rows = rows_from(events, match, captured_at, "the-odds-api")
     conn.executemany(
         "INSERT INTO market_line_snapshots (game_id, captured_at, commence_time, book, market_type, "
-        "line, price_home, price_away, price_over, price_under, source, ingest_version) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        "line, price_home, price_away, price_over, price_under, source, ingest_version, provenance) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'observed')", rows)
     conn.commit()
 
     sealed = seal(conn)

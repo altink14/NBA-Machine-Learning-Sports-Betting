@@ -542,9 +542,25 @@ def main() -> int:
           one("SELECT COUNT(*) FROM games WHERE source IS NULL OR fetched_at IS NULL") == 0)
     check("every market line names its source",
           one("SELECT COUNT(*) FROM market_lines WHERE source IS NULL") == 0)
-    check("no market line claims a capture time we do not have",
-          one("SELECT COUNT(*) FROM market_lines WHERE captured_at IS NOT NULL") == 0,
-          "historical lines are book-unspecified and time-unknown by design")
+    check("every market line states how we came to know it",
+          one("SELECT COUNT(*) FROM market_lines WHERE provenance IS NULL OR provenance "
+              "NOT IN ('observed','reconstructed','third_party')") == 0,
+          "observed | reconstructed | third_party")
+    # This check used to assert that NO market line had a capture time, which was
+    # true only while nflverse was the sole writer. The odds recorder seals real
+    # closing lines with a real captured_at, so the rule is now scoped by
+    # provenance: third-party lines still may not claim a time we never had,
+    # and lines we did capture must say when.
+    check("third-party lines claim no capture time",
+          one("SELECT COUNT(*) FROM market_lines WHERE provenance = 'third_party' "
+              "AND captured_at IS NOT NULL") == 0,
+          "nflverse lines are book-unspecified and time-unknown by design")
+    captured = one("SELECT COUNT(*) FROM market_lines WHERE provenance IN "
+                   "('observed','reconstructed')")
+    check("lines we captured ourselves carry the moment we captured them",
+          one("SELECT COUNT(*) FROM market_lines WHERE provenance IN "
+              "('observed','reconstructed') AND captured_at IS NULL") == 0,
+          f"{captured} captured line(s)")
     runs = one("SELECT COUNT(*) FROM ingest_runs")
     check("ingest runs are recorded", runs > 0, f"{runs} runs")
 

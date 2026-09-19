@@ -36,10 +36,14 @@ application logic: re-running any ingest must produce zero duplicates.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 #: Bump when an ingest's parsing logic changes, so rows written by a buggy
 #: version can be found and reprocessed: SELECT ... WHERE ingest_version < N.
+
+logger = logging.getLogger(__name__)
+
 INGEST_VERSION = 1
 
 CORE_SCHEMA = """
@@ -211,12 +215,37 @@ CREATE TABLE IF NOT EXISTS market_lines (
     price_under     INTEGER,
     captured_at     TEXT,
     is_closing      INTEGER,
+    -- How we came to know this price, strongest claim first. No default: a
+    -- writer has to say, and the trigger below refuses anything else.
+    --   'observed'      our recorder read it off the live market at captured_at
+    --   'reconstructed' we pulled a timestamped snapshot out of a vendor's
+    --                   historical archive after the fact and applied our own
+    --                   last-before-kickoff rule to it
+    --   'third_party'   someone else's record of the close, where we chose
+    --                   neither the moment nor the book -- nflverse games.csv
+    --                   is this, and its own docs do not say which book or
+    --                   when, which is why it is the weakest of the three
+    -- These are not interchangeable. "We watched this price and beat it" and
+    -- "an archive says this price existed and we beat it" are different
+    -- claims, and closing line value has to state which one it rests on.
+    provenance      TEXT,
     source          TEXT,
     source_endpoint TEXT,
     fetched_at      TEXT,
     ingest_version  INTEGER,
     PRIMARY KEY (game_id, book, market_type)
 );
+
+-- NULL is checked explicitly: `NULL NOT IN (...)` is NULL, not true, so a
+-- bare NOT IN would let an unstated provenance through.
+CREATE TRIGGER IF NOT EXISTS market_lines_provenance_valid
+BEFORE INSERT ON market_lines
+WHEN NEW.provenance IS NULL
+  OR NEW.provenance NOT IN ('observed', 'reconstructed', 'third_party')
+BEGIN
+    SELECT RAISE(ABORT,
+      'market_lines.provenance must be observed, reconstructed or third_party');
+END;
 CREATE INDEX IF NOT EXISTS idx_market_game ON market_lines(game_id);
 
 CREATE TABLE IF NOT EXISTS rest_travel (
@@ -259,9 +288,52 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
 """
 
 
+# Columns added after the first databases were built. Additive only: a column
+# is appended if missing, never renamed or dropped, so an existing archive
+# migrates in place instead of being rebuilt.
+_ADDED_COLUMNS = [
+    ("market_lines", "provenance", "TEXT"),
+]
+
+# Backfilling provenance for rows written before the column existed. This is
+# deliberately not a blanket default. The 19,991 closing lines already in
+# market_lines came from nflverse's games.csv, which we never watched, so
+# stamping them 'observed' would invent exactly the provenance the column was
+# added to protect. Unknown sources fall to 'third_party', the weakest of the
+# three, because the safe direction to be wrong in is to understate what we
+# know rather than overstate it.
+_PROVENANCE_BACKFILL = """
+UPDATE market_lines SET provenance = CASE
+    WHEN source LIKE 'the-odds-api%%observed%%'      THEN 'observed'
+    WHEN source LIKE 'the-odds-api%%reconstructed%%' THEN 'reconstructed'
+    WHEN source LIKE 'the-odds-api%%'                THEN 'observed'
+    ELSE 'third_party'
+END
+WHERE provenance IS NULL
+"""
+
+
 def ensure_core_schema(conn: sqlite3.Connection) -> None:
-    """Create every core table if absent. Safe to call on every run."""
+    """Create every core table if absent, and apply additive migrations.
+
+    Safe to call on every run. Where a new column needs a value for rows that
+    predate it, it is derived from what those rows actually say about
+    themselves -- see _PROVENANCE_BACKFILL -- rather than given a flattering
+    default.
+    """
     conn.executescript(CORE_SCHEMA)
+    migrated = False
+    for table, col, decl in _ADDED_COLUMNS:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if have and col not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            logger.info("%s: added column %s", table, col)
+            migrated = True
+    if migrated or conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM market_lines WHERE provenance IS NULL)").fetchone()[0]:
+        n = conn.execute(_PROVENANCE_BACKFILL.replace("%%", "%")).rowcount
+        if n:
+            logger.info("market_lines: backfilled provenance for %d row(s) from source", n)
     conn.commit()
 
 

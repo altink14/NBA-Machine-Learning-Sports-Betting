@@ -239,8 +239,16 @@ def main() -> int:
          for ab, v in sorted(teams.items())])
     conn.executemany(
         "INSERT OR REPLACE INTO games VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", games)
+    # Columns named explicitly, and provenance stated: these are nflverse's
+    # record of the close, not prices we watched. games.csv does not say which
+    # book or what time, so 'third_party' is the honest label and the reason
+    # the column exists. A positional VALUES here would silently mis-seat every
+    # field the next time a column is added.
     conn.executemany(
-        "INSERT OR REPLACE INTO market_lines VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lines)
+        "INSERT OR REPLACE INTO market_lines (game_id, book, market_type, line, price_home, "
+        "price_away, price_draw, price_over, price_under, captured_at, is_closing, source, "
+        "source_endpoint, fetched_at, ingest_version, provenance) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'third_party')", lines)
     conn.executemany("INSERT OR REPLACE INTO weather VALUES (?,?,?,?,?,?,?,?,?,?,?)", wx)
     conn.executemany("INSERT OR REPLACE INTO rest_travel VALUES (?,?,?,?,?,?,?)", rest)
     conn.commit()

@@ -20,10 +20,24 @@ THE THREE JOBS AND WHY THEIR CADENCES DIFFER
 
   daily      grading. Yesterday's games are final by the morning.
 
-ALL THREE ARE UNRECOVERABLE IF MISSED. A line we did not capture, an injury
-status we did not observe, and a prediction we did not write before kickoff are
-gone for good. That is the whole reason they are scheduled rather than run by
-hand.
+WHAT A MISSED RUN ACTUALLY COSTS, WHICH DIFFERS BY JOB.
+
+  hourly and daily are UNRECOVERABLE. An injury status we did not observe is
+  gone: the sources overwrite the current state and keep no history, so there
+  is nowhere to buy it back from. A prediction we did not write before kickoff
+  can never be written at all -- the ledger's CHECK constraint refuses it, and
+  that refusal is the product's main argument, not an inconvenience.
+
+  frequent is REPAIRABLE, at a price. The Odds API serves historical snapshots
+  back to 2020-06-06 (5-minute resolution from September 2022) at 10 credits
+  per market per region, so a slate we slept through can be reconstructed
+  rather than mourned. A missed NFL Sunday is roughly 900 credits to repair.
+  See docs/sources/odds-providers.md in the frontend repo.
+
+  But repaired is not the same as observed. A backfilled price is one we read
+  out of a vendor's archive afterwards, not one we recorded while it was live,
+  and anything built on it -- closing line value above all -- must say so. Keep
+  the recorder running; the repair path is for accidents, not a substitute.
 
 Nothing here raises on failure of a single job: one dead source must not stop
 the other two. Failures are logged loudly and the exit code reflects them, so

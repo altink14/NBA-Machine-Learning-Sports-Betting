@@ -286,6 +286,19 @@ def main() -> int:
                      "OR (vegas_wp IS NOT NULL AND (vegas_wp < 0 OR vegas_wp > 1))")
         check("win probabilities lie between 0 and 1", bad_wp == 0, f"{bad_wp} rows")
 
+        # A play that swings win probability by a full 100 percentage points is
+        # almost always an artifact. 27 of 1.28 M plays do (0.002%), clustered
+        # in 1999-2001 and mostly extra points after a walk-off score, which is
+        # tolerable; a jump in this rate means the column has come loose.
+        extreme = one("SELECT COUNT(*) FROM nfl_plays WHERE ABS(wpa) >= 0.99")
+        tot_wpa = one("SELECT COUNT(*) FROM nfl_plays WHERE wpa IS NOT NULL")
+        ex_pct = 100.0 * extreme / max(1, tot_wpa)
+        check("implausible full-swing win-probability plays stay under 0.05%",
+              ex_pct < 0.05, f"{ex_pct:.4f}% ({extreme} of {tot_wpa:,})")
+        mid_pinned = one("SELECT COUNT(*) FROM nfl_plays WHERE qtr <= 3 AND (wp = 0 OR wp = 1)")
+        check("no win probability is pinned at 0 or 1 before the fourth quarter",
+              mid_pinned == 0, f"{mid_pinned} rows")
+
         bad_down = one("SELECT COUNT(*) FROM nfl_plays WHERE down IS NOT NULL AND down NOT BETWEEN 1 AND 4")
         check("downs are 1 to 4", bad_down == 0, f"{bad_down} rows")
         bad_qtr = one("SELECT COUNT(*) FROM nfl_plays WHERE qtr IS NOT NULL AND qtr NOT BETWEEN 1 AND 6")

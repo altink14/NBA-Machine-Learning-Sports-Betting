@@ -80,6 +80,19 @@ PBP_SCORE_MISMATCH_UPSTREAM = {
     "2011_13_DET_NO",
 }
 
+#: Seasons whose injury reports are usable as MODEL FEATURES, meaning the
+#: source dated them so we can prove the report predates kickoff. Measured
+#: 2026-09-19: 2009 dates only 17 of 4,821 rows; 2010 through 2024 are dated;
+#: 2025 and 2026 carry no date_modified column at all because nflverse dropped
+#: it. Anything outside this window is descriptive only.
+INJURY_MODELLABLE_FIRST = "2010"
+INJURY_MODELLABLE_LAST = "2024"
+
+#: The designations the NFL has used. "Probable" was retired after the 2015
+#: season; an empty status means the player appeared on the practice report
+#: without a game-status designation.
+INJURY_STATUSES = {"", "Out", "Doubtful", "Questionable", "Probable", "Note"}
+
 FAILS: list[str] = []
 WARNS: list[str] = []
 
@@ -331,6 +344,62 @@ def main() -> int:
         fixed = sorted(PBP_SCORE_MISMATCH_UPSTREAM - set(bad))
         check("the pinned upstream mismatches are still wrong", not fixed,
               f"{len(fixed)} fixed upstream ({', '.join(fixed[:3])}); remove from PBP_SCORE_MISMATCH_UPSTREAM",
+              warn_only=True)
+
+    print("\n=== INJURIES ===")
+    have_inj = one("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                   "AND name='nfl_injury_reports'") > 0
+    if not have_inj:
+        print("  SKIP  nfl_injury_reports not ingested yet")
+    else:
+        n_inj = one("SELECT COUNT(*) FROM nfl_injury_reports")
+        check("injury reports present", n_inj > 50000, f"{n_inj:,} reports")
+
+        unknown_status = [r["report_status"] for r in q(
+            "SELECT DISTINCT report_status FROM nfl_injury_reports")
+            if (r["report_status"] or "") not in INJURY_STATUSES]
+        check("report statuses are all known designations", not unknown_status,
+              f"unexpected: {unknown_status[:5]}")
+
+        unmatched = one("SELECT COUNT(*) FROM nfl_injury_reports WHERE game_id IS NULL")
+        pct_un = 100.0 * unmatched / max(1, n_inj)
+        check("injury reports resolve to a game", pct_un < 0.1,
+              f"{pct_un:.3f}% unmatched ({unmatched})")
+
+        orphan = one("SELECT COUNT(*) FROM nfl_injury_reports i WHERE i.game_id IS NOT NULL "
+                     "AND NOT EXISTS (SELECT 1 FROM games g WHERE g.game_id = i.game_id)")
+        check("every resolved injury game exists", orphan == 0, f"{orphan} orphans")
+
+        # THE LEAKAGE GATE. A row flagged as known before kickoff must actually
+        # be dated before kickoff. If this ever fails, a model feature built on
+        # the flag is reading the future.
+        contradiction = one(
+            "SELECT COUNT(*) FROM nfl_injury_reports i JOIN games g ON g.game_id = i.game_id "
+            "WHERE i.known_before_kickoff = 1 AND (i.date_modified = '' "
+            "OR g.date_utc IS NULL OR i.date_modified >= g.date_utc)")
+        check("every report flagged known-before-kickoff really predates kickoff",
+              contradiction == 0, f"{contradiction} contradictions")
+
+        undated_flagged = one("SELECT COUNT(*) FROM nfl_injury_reports "
+                              "WHERE has_timestamp = 0 AND known_before_kickoff IS NOT NULL")
+        check("undated reports never claim to predate kickoff", undated_flagged == 0,
+              f"{undated_flagged} rows")
+
+        # The modellable window must be fully dated, and the seasons outside it
+        # must stay excluded. Both directions are asserted so a silent upstream
+        # change in either direction is caught.
+        gaps = [f"{r['season']} {r['d']}/{r['n']}" for r in q(
+            "SELECT season, COUNT(*) n, SUM(has_timestamp) d FROM nfl_injury_reports "
+            "WHERE season BETWEEN ? AND ? GROUP BY season",
+            INJURY_MODELLABLE_FIRST, INJURY_MODELLABLE_LAST) if r["d"] < r["n"] * 0.98]
+        check(f"the modellable window {INJURY_MODELLABLE_FIRST}-{INJURY_MODELLABLE_LAST} "
+              "is fully dated", not gaps, "; ".join(gaps[:5]))
+
+        newly_dated = [r["season"] for r in q(
+            "SELECT season, SUM(has_timestamp) d FROM nfl_injury_reports "
+            "WHERE season > ? GROUP BY season", INJURY_MODELLABLE_LAST) if r["d"] > 0]
+        check("seasons after the window are still undated upstream", not newly_dated,
+              f"{newly_dated} now carry timestamps; widen INJURY_MODELLABLE_LAST",
               warn_only=True)
 
     print("\n=== TIME ===")

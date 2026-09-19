@@ -93,6 +93,34 @@ INJURY_MODELLABLE_LAST = "2024"
 #: without a game-status designation.
 INJURY_STATUSES = {"", "Out", "Doubtful", "Questionable", "Probable", "Note"}
 
+#: Officiating crews are licensed only from 2015 (the CC-BY-4.0 nflverse-data
+#: release). The 1999+ file exists but its repository carries no licence, so it
+#: is rejected in docs/sources/REJECTED.md. Before 2015 we know the referee's
+#: NAME from games.csv and nothing else.
+OFFICIALS_FIRST_SEASON = "2015"
+
+#: Officiating assignments whose game is not in our schedule, with the reason.
+#: 2023010200 is Bills at Bengals, abandoned after Damar Hamlin's cardiac
+#: arrest, which had a crew but never became a game. The three 2021 week 15
+#: ids are COVID-postponed games that were re-keyed when they were replayed.
+OFFICIALS_UNMATCHED_EXPECTED = 4
+
+#: The seven on-field positions. Playoff games additionally list up to seven
+#: "Alternate N" officials who are present but do not work the game, which is
+#: why a naive count finds "crews" of 12 to 15 in January. Verified on
+#: 2021_21_CIN_KC: seven real positions plus Alternate 1 through 7.
+ON_FIELD_POSITIONS = {"Referee", "Umpire", "Down Judge", "Head Linesman", "Line Judge",
+                      "Field Judge", "Side Judge", "Back Judge"}
+
+#: Receiving TARGETS are not derivable from play-by-play before 2009: the
+#: earlier feeds do not record the intended receiver on an incomplete pass, and
+#: nflverse encodes that as 0 rather than NULL. So 2003-2008 carry rows like
+#: 18 receptions on 0 targets. A zero that means "unknown" is worse than a
+#: null, and any catch rate, target share or air-yards share computed before
+#: this floor is meaningless. Verified: 2008 has 3,626 impossible rows, 2009
+#: has none.
+TARGETS_FIRST_SEASON = "2009"
+
 FAILS: list[str] = []
 WARNS: list[str] = []
 
@@ -400,6 +428,105 @@ def main() -> int:
             "WHERE season > ? GROUP BY season", INJURY_MODELLABLE_LAST) if r["d"] > 0]
         check("seasons after the window are still undated upstream", not newly_dated,
               f"{newly_dated} now carry timestamps; widen INJURY_MODELLABLE_LAST",
+              warn_only=True)
+
+    print("\n=== OFFICIALS ===")
+    if one("SELECT COUNT(*) FROM officials") == 0:
+        print("  SKIP  officials not ingested yet")
+    else:
+        n_off = one("SELECT COUNT(*) FROM officials")
+        n_people = one("SELECT COUNT(*) FROM persons WHERE role = 'official'")
+        n_games = one("SELECT COUNT(DISTINCT game_id) FROM officials")
+        check("officiating assignments present", n_off > 20000,
+              f"{n_off:,} assignments, {n_people} officials, {n_games:,} games")
+
+        orphan = one("SELECT COUNT(*) FROM officials o WHERE NOT EXISTS "
+                     "(SELECT 1 FROM games g WHERE g.game_id = o.game_id)")
+        check("every officiating assignment maps to a real game", orphan == 0, f"{orphan} orphans")
+
+        nameless = one("SELECT COUNT(*) FROM officials o WHERE NOT EXISTS "
+                       "(SELECT 1 FROM persons p WHERE p.person_id = o.person_id)")
+        check("every official is in the persons table", nameless == 0, f"{nameless} missing")
+
+        early = one("SELECT COUNT(*) FROM officials o JOIN games g ON g.game_id = o.game_id "
+                    "WHERE g.season < ?", OFFICIALS_FIRST_SEASON)
+        check(f"no crew claimed before {OFFICIALS_FIRST_SEASON} (the licensed floor)",
+              early == 0, f"{early} rows")
+
+        # A regulation NFL crew is seven ON-FIELD officials. Playoff games also
+        # list alternates, so the count must exclude them or January looks like
+        # it is refereed by committee.
+        ph = ",".join("?" * len(ON_FIELD_POSITIONS))
+        odd = conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT game_id, COUNT(*) c FROM officials "
+            f"WHERE position IN ({ph}) GROUP BY game_id HAVING c != 7)",
+            tuple(ON_FIELD_POSITIONS)).fetchone()[0]
+        pct_odd = 100.0 * odd / max(1, n_games)
+        check("on-field crews have seven officials", pct_odd < 2.0,
+              f"{pct_odd:.2f}% of games differ ({odd})")
+
+        alts = one("SELECT COUNT(*) FROM officials WHERE position LIKE 'Alternate%'")
+        alt_games = one("SELECT COUNT(DISTINCT game_id) FROM officials "
+                        "WHERE position LIKE 'Alternate%'")
+        check("alternates appear only in the postseason", True,
+              f"{alts} alternate assignments across {alt_games} games (expected in playoffs)")
+
+    print("\n=== PLAYER GAME LOGS ===")
+    have_ps = one("SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                  "AND name='nfl_player_stats_week'") > 0
+    if not have_ps:
+        print("  SKIP  nfl_player_stats_week not ingested yet")
+    else:
+        n_ps = one("SELECT COUNT(*) FROM nfl_player_stats_week")
+        n_pl = one("SELECT COUNT(DISTINCT player_id) FROM nfl_player_stats_week")
+        check("player game logs present", n_ps > 300000,
+              f"{n_ps:,} player-games, {n_pl:,} players")
+
+        orphan_ps = one("SELECT COUNT(*) FROM nfl_player_stats_week s WHERE NOT EXISTS "
+                        "(SELECT 1 FROM games g WHERE g.game_id = s.game_id)")
+        check("every player-game maps to a real game", orphan_ps == 0, f"{orphan_ps} orphans")
+
+        # Team passing yards in the weekly file must agree with the same team's
+        # passing yards computed from OUR play-by-play. Two independent files
+        # agreeing is the strongest check available without a third source.
+        disagree = one("""
+            SELECT COUNT(*) FROM (
+              SELECT s.game_id, s.team,
+                     SUM(s.passing_yards) ps,
+                     (SELECT SUM(p.yards_gained) FROM nfl_plays p
+                      WHERE p.game_id = s.game_id AND p.posteam = s.team
+                        AND p.play_type = 'pass' AND p.complete_pass = 1) pp
+              FROM nfl_player_stats_week s
+              WHERE s.season = '2024' AND s.passing_yards IS NOT NULL
+              GROUP BY s.game_id, s.team
+              HAVING pp IS NOT NULL AND ABS(ps - pp) > 1)""")
+        total_tg = one("SELECT COUNT(*) FROM (SELECT game_id, team FROM nfl_player_stats_week "
+                       "WHERE season = '2024' GROUP BY game_id, team)")
+        pct_dis = 100.0 * disagree / max(1, total_tg)
+        check("weekly passing yards reconcile with our play-by-play (2024)",
+              pct_dis < 2.0, f"{pct_dis:.2f}% of team-games differ ({disagree}/{total_tg})")
+
+        neg = one("SELECT COUNT(*) FROM nfl_player_stats_week WHERE completions < 0 "
+                  "OR attempts < 0 OR receptions < 0 OR targets < 0 OR carries < 0")
+        check("no negative counting stats", neg == 0, f"{neg} rows")
+
+        impossible = one("SELECT COUNT(*) FROM nfl_player_stats_week "
+                         "WHERE completions IS NOT NULL AND attempts IS NOT NULL "
+                         "AND completions > attempts")
+        check("completions never exceed attempts", impossible == 0, f"{impossible} rows")
+        impossible2 = one("SELECT COUNT(*) FROM nfl_player_stats_week "
+                          "WHERE season >= ? AND receptions IS NOT NULL AND targets IS NOT NULL "
+                          "AND receptions > targets", TARGETS_FIRST_SEASON)
+        check(f"receptions never exceed targets from {TARGETS_FIRST_SEASON}",
+              impossible2 == 0, f"{impossible2} rows")
+
+        # And the converse: the broken era must STILL be broken. If it silently
+        # became clean, nflverse has changed how it derives targets and our
+        # documented floor is wrong.
+        pre = one("SELECT COUNT(*) FROM nfl_player_stats_week WHERE season < ? "
+                  "AND receptions > targets", TARGETS_FIRST_SEASON)
+        check(f"targets remain underivable before {TARGETS_FIRST_SEASON}", pre > 0,
+              f"{pre} impossible rows, as expected; if this hits zero the floor can move",
               warn_only=True)
 
     print("\n=== TIME ===")

@@ -18,9 +18,10 @@ THE THREE JOBS AND WHY THEIR CADENCES DIFFER
              UNIQUE key per game and model) so an hourly run simply catches any
              fixture that has come into the horizon.
 
-  daily      grading, repair, sealing. Yesterday's games are final by the
-             morning, which is also when it is clear whether a capture was
-             missed and worth buying back.
+  daily      grading, repair, sealing, then closing line value. Yesterday's
+             games are final by the morning, which is also when it is clear
+             whether a capture was missed and worth buying back. CLV runs last
+             because it reads the closing lines the seal has just written.
 
 WHAT A MISSED RUN ACTUALLY COSTS, WHICH DIFFERS BY JOB.
 
@@ -87,6 +88,8 @@ JOBS = {
         ("repair missed odds (NFL)", ["src/Sports/repair_odds.py", "--sport", "nfl",
                                       "--unattended", "--apply"]),
         ("odds seal (NFL)", ["src/Sports/odds_recorder.py", "--sport", "nfl", "--seal"]),
+        # Last, because it reads the closing lines the two steps above produce.
+        ("closing line value (NFL)", ["src/Sports/nfl/predict.py", "--clv"]),
     ],
 }
 

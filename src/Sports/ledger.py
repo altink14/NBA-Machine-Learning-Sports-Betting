@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LEDGER_DB = os.path.join(REPO_ROOT, "Data", "OddsData.sqlite")
@@ -151,9 +151,125 @@ END;
 """
 
 
+# Added after the first rows were written. Additive only.
+_LEDGER_ADDED_COLUMNS = [
+    ("closing_book", "TEXT"),
+    ("closing_provenance", "TEXT"),
+]
+
+
 def ensure_ledger(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(ledger)")}
+    for col, decl in _LEDGER_ADDED_COLUMNS:
+        if have and col not in have:
+            conn.execute(f"ALTER TABLE ledger ADD COLUMN {col} {decl}")
     conn.commit()
+
+
+def american_to_decimal(price: Optional[int]) -> Optional[float]:
+    if price is None:
+        return None
+    return 1.0 + (price / 100.0 if price > 0 else 100.0 / -price)
+
+
+#: Which closing price settles which side of which market.
+_SIDE_COLUMN = {
+    ("moneyline", "home"): "price_home", ("moneyline", "away"): "price_away",
+    ("spread", "home"): "price_home", ("spread", "away"): "price_away",
+    ("total", "over"): "price_over", ("total", "under"): "price_under",
+}
+
+
+def apply_clv(conn: sqlite3.Connection,
+              closes: Dict[Tuple[str, str], List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Attach closing line value to every prediction that can carry one.
+
+    WHAT CLV IS, AND WHY IT IS HERE RATHER THAN ROI. Return on investment needs
+    hundreds of settled bets before it says anything; closing line value says
+    something after a few dozen, because it asks a question that does not
+    depend on who won: did we take a better price than the market's last one?
+    A model that consistently beats the close is finding something. A model
+    that does not is, at best, agreeing with the market slowly.
+
+    THE ARITHMETIC. Both prices become decimal odds and
+
+        clv = (decimal we took / decimal at the close) - 1
+
+    so +0.02 means the price we got was 2% better than the close on the same
+    side of the same market. It is deliberately NOT a profit figure and must
+    never be presented as one: beating the close is evidence about price, not
+    money, and this project does not claim ROI.
+
+    PROVENANCE TRAVELS WITH IT. Each row records which book closed it and
+    whether that closing price was `observed`, `reconstructed` or
+    `third_party`. CLV computed against a price we watched and CLV computed
+    against one we bought back from an archive are different claims, and the
+    row now says which it is instead of leaving it to whoever reads the
+    average.
+
+    ONLY AFTER KICKOFF. A prediction whose game has not started is skipped.
+    `is_closing` alone is not proof of a close: the nflverse schedule file
+    carries lines for scheduled games and our ingest marks them closing, so
+    the flag can be true days before there is anything to close. Time is the
+    check that cannot be wrong.
+
+    WHICH BOOK CLOSES IT. `closes` maps (game_id, market_type) to every book
+    that closed that market. We settle against the BEST close for the side we
+    backed -- the longest price still available at the bell. That is the
+    conservative choice, not a generous one: a better closing price makes our
+    CLV smaller, so picking a worse book would flatter the number for free.
+
+    Rows already carrying a clv are left alone: like grading, this settles
+    once.
+    """
+    counts = {"priced": 0, "no_close": 0, "no_price_taken": 0,
+              "not_started": 0, "already": 0}
+    now = datetime.now(timezone.utc).isoformat()
+    rows = conn.execute(
+        "SELECT id, game_id, market_type, side, price_taken, clv, event_start_utc FROM ledger"
+    ).fetchall()
+
+    for rid, gid, market, side, taken, existing, starts in rows:
+        # A game that has not started has no close, whatever a table says. The
+        # upstream schedule file publishes lines for scheduled games and our
+        # ingest flags them is_closing=1, so a row that looks like a close is
+        # sitting there days early. Settling against it would invent closing
+        # line value out of a price the market has not finished moving.
+        if starts and starts > now:
+            counts["not_started"] += 1
+            continue
+        if existing is not None:
+            counts["already"] += 1
+            continue
+        if taken is None:
+            # No price when we predicted means no CLV, ever. We will not
+            # substitute a later price and call it the one we could have had.
+            counts["no_price_taken"] += 1
+            continue
+        candidates = closes.get((gid, market)) or []
+        col = _SIDE_COLUMN.get((market, side))
+        dec_taken = american_to_decimal(taken)
+        best = None
+        if col and dec_taken is not None:
+            for cand in candidates:
+                dec = american_to_decimal(cand.get(col))
+                if dec is not None and dec > 1.0 and (best is None or dec > best[0]):
+                    best = (dec, cand)
+        if best is None:
+            counts["no_close"] += 1
+            continue
+        dec_close, close = best
+        closing_price = close.get(col)
+        conn.execute(
+            "UPDATE ledger SET closing_line = ?, closing_price = ?, clv = ?, "
+            "closing_book = ?, closing_provenance = ? WHERE id = ?",
+            (close.get("line"), closing_price, (dec_taken / dec_close) - 1.0,
+             close.get("book"), close.get("provenance"), rid))
+        counts["priced"] += 1
+
+    conn.commit()
+    return counts
 
 
 def write_prediction(conn: sqlite3.Connection, *, sport: str, league: str, game_id: str,

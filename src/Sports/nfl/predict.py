@@ -49,14 +49,15 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 import numpy as np  # noqa: E402
 
-from src.Sports.ledger import ensure_ledger, write_prediction, grade_pending, health, LEDGER_DB  # noqa: E402
+from src.Sports.ledger import (ensure_ledger, write_prediction, grade_pending, health,  # noqa: E402
+                              apply_clv, LEDGER_DB)
 from src.Sports.nfl.features import build_frame, MODEL_COLUMNS  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -149,6 +150,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Write NFL predictions to the ledger before kickoff.")
     ap.add_argument("--dry-run", action="store_true", help="Show what would be written.")
     ap.add_argument("--grade", action="store_true", help="Grade finished games and exit.")
+    ap.add_argument("--clv", action="store_true",
+                    help="Attach closing line value to predictions whose game has closed.")
     ap.add_argument("--horizon", type=int, default=HORIZON_HOURS)
     args = ap.parse_args()
 
@@ -166,6 +169,30 @@ def main() -> int:
         logger.info("ledger health: %s", health(led, sport="football"))
         logger.info("2026 is sealed: results are in the ledger, but reported "
                     "only as 'settled' until the single evaluation")
+        return 0
+
+    if args.clv:
+        # One sealed closing line per (game, market). Where several books
+        # closed a market we take the one whose price is best for the side we
+        # backed, because that is the price we could actually have shopped to,
+        # and preferring a worse close would flatter our CLV for free.
+        closes: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for r in nfl.execute(
+                "SELECT game_id, book, market_type, line, price_home, price_away, "
+                "price_over, price_under, provenance FROM market_lines WHERE is_closing = 1"):
+            closes.setdefault((r["game_id"], r["market_type"]), []).append({
+                "line": r["line"], "price_home": r["price_home"], "price_away": r["price_away"],
+                "price_over": r["price_over"], "price_under": r["price_under"],
+                "book": r["book"], "provenance": r["provenance"]})
+        counts = apply_clv(led, closes)
+        logger.info("clv: %s", counts)
+        by_prov = dict(led.execute(
+            "SELECT closing_provenance, COUNT(*) FROM ledger WHERE clv IS NOT NULL "
+            "GROUP BY closing_provenance").fetchall())
+        if by_prov:
+            logger.info("clv rows by closing provenance: %s", by_prov)
+            logger.info("CLV against a reconstructed close is a weaker claim than CLV "
+                        "against one we watched; report them apart, never pooled")
         return 0
 
     rows, _ = build_frame(for_prediction=True)

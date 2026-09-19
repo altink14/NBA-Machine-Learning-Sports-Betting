@@ -108,6 +108,33 @@ HISTORICAL_MULTIPLIER = 10
 #: so it has to be asked for by date.
 DEFAULT_WINDOW_DAYS = 14
 
+#: Unattended defaults, used by the daily job. Deliberately much tighter than
+#: the manual ones. A script that spends money on a timer should repair the
+#: slate that just happened and nothing else: three days covers a weekend the
+#: machine slept through plus the Thursday and Monday games, and 90 credits is
+#: three kickoff times. A backlog bigger than that is worked down a little each
+#: night rather than bought in one unsupervised gulp, and anything older than
+#: the window stays a decision a person makes.
+UNATTENDED_WINDOW_DAYS = 3
+UNATTENDED_MAX_CREDITS = 90
+
+#: Headroom left for the live recorder on top of its own floor. Repair is the
+#: lower priority of the two: a price we can still watch beats one we would
+#: have to buy back later.
+UNATTENDED_RESERVE = 120
+
+
+class RepairUnavailable(RuntimeError):
+    """We cannot repair right now. Not a bug, and not worth a red daily job."""
+
+
+class HistoricalUnavailable(RepairUnavailable):
+    """The plan cannot read historical odds. Expected on the free tier."""
+
+
+class QuotaExhausted(RepairUnavailable):
+    """No credits left this month."""
+
 
 def credits_per_call(markets: str, regions: str) -> int:
     return HISTORICAL_MULTIPLIER * len(markets.split(",")) * len(regions.split(","))
@@ -168,7 +195,7 @@ def fetch_historical(sport_key: str, when: str, markets: str, regions: str,
              "used": r.headers.get("x-requests-used"),
              "last": r.headers.get("x-requests-last")}
     if r.status_code in (401, 403):
-        raise SystemExit(
+        raise HistoricalUnavailable(
             "The Odds API refused the historical endpoint (HTTP %d). Historical odds are a "
             "paid feature; a free-tier key cannot read them. This is the repair path's one "
             "hard dependency -- see docs/sources/odds-providers.md. Nothing was written."
@@ -177,11 +204,21 @@ def fetch_historical(sport_key: str, when: str, markets: str, regions: str,
         raise SystemExit(f"The API rejected the timestamp {when} (HTTP 422). The archive starts "
                          f"{ARCHIVE_START}. Nothing was written.")
     if r.status_code == 429:
-        raise SystemExit(f"Quota exhausted. Remaining={quota['remaining']}. Nothing further "
-                         f"was written; re-run after the quota resets or raise the tier.")
+        raise QuotaExhausted(f"Quota exhausted. Remaining={quota['remaining']}. Nothing further "
+                             f"was written; re-run after the quota resets or raise the tier.")
     r.raise_for_status()
     body = r.json()
     return body.get("timestamp"), (body.get("data") or []), quota
+
+
+def remaining_quota() -> Optional[int]:
+    """Credits left, read from a call that costs none. None if it cannot be read."""
+    try:
+        r = requests.get(f"{ODDS_API_BASE}/sports", params={"apiKey": api_key()}, timeout=30)
+        v = r.headers.get("x-requests-remaining")
+        return int(v) if v is not None else None
+    except Exception:
+        return None
 
 
 def already_have(conn: sqlite3.Connection, game_id: str, captured_at: str) -> bool:
@@ -204,6 +241,10 @@ def main() -> int:
                     help="Refuse to start if the estimate exceeds this. Default 300.")
     ap.add_argument("--apply", action="store_true",
                     help="Actually spend credits and write rows. Without it, nothing is called.")
+    ap.add_argument("--unattended", action="store_true",
+                    help="Scheduled-job mode: a 3-day window, a 90-credit cap, extra quota "
+                         "reserved for the live recorder, a backlog worked down a slice at a "
+                         "time, and exit 0 for anything that is merely 'cannot right now'.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -212,12 +253,16 @@ def main() -> int:
     ensure_core_schema(conn)
     ensure_snapshot_schema(conn)
 
+    window_days = UNATTENDED_WINDOW_DAYS if args.unattended else DEFAULT_WINDOW_DAYS
+    if args.unattended and ap.get_default("max_credits") == args.max_credits:
+        args.max_credits = UNATTENDED_MAX_CREDITS
+
     since = args.since
     if since is None and args.game is None:
-        since = (datetime.now(timezone.utc) - timedelta(days=DEFAULT_WINDOW_DAYS)).isoformat()
+        since = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
         older = len(gaps(conn, None, since, None))
         logger.info("no --since given, so looking back %d days (from %s).",
-                    DEFAULT_WINDOW_DAYS, since[:10])
+                    window_days, since[:10])
         if older:
             logger.info("%d older game(s) also lack a snapshot, mostly from before the recorder "
                         "existed. Those are a purchase, not a repair: name a date with --since "
@@ -248,11 +293,28 @@ def main() -> int:
                 HISTORICAL_MULTIPLIER)
 
     if estimate > args.max_credits:
-        logger.error("estimate %d exceeds --max-credits %d. Narrow the range with --since/--until "
-                     "or raise the budget deliberately. Nothing was called.",
-                     estimate, args.max_credits)
-        conn.close()
-        return 1
+        if not args.unattended:
+            logger.error("estimate %d exceeds --max-credits %d. Narrow the range with "
+                         "--since/--until or raise the budget deliberately. Nothing was called.",
+                         estimate, args.max_credits)
+            conn.close()
+            return 1
+        # Unattended: do not stall forever on a backlog. Take the most recent
+        # kickoffs that fit tonight's budget and leave the rest for tomorrow,
+        # newest first because a fresh gap is the one most likely to matter.
+        affordable = max(0, args.max_credits // per_call)
+        if affordable == 0:
+            logger.warning("budget %d cannot afford even one call at %d credits; nothing done.",
+                           args.max_credits, per_call)
+            conn.close()
+            return 0
+        keep = sorted(by_kickoff, reverse=True)[:affordable]
+        deferred = len(by_kickoff) - len(keep)
+        by_kickoff = {k: by_kickoff[k] for k in keep}
+        estimate = per_call * len(by_kickoff)
+        logger.info("budget %d credits: repairing the %d most recent kickoff time(s) tonight "
+                    "(%d credits), leaving %d for a later run.",
+                    args.max_credits, len(by_kickoff), estimate, deferred)
 
     if not args.apply:
         logger.info("dry run: nothing called, nothing written, no credits spent. "
@@ -260,58 +322,84 @@ def main() -> int:
         conn.close()
         return 0
 
+    if args.unattended:
+        # The live recorder has first claim on the month's credits. Repair only
+        # proceeds if the whole bill fits above the recorder's floor plus a
+        # reserve, because a price we can still watch beats one we would have
+        # to buy back.
+        have = remaining_quota()
+        need = estimate + QUOTA_FLOOR + UNATTENDED_RESERVE
+        if have is not None and have < need:
+            logger.warning("skipping repair: %d credits remain, and spending %d would leave "
+                           "less than the recorder's floor (%d) plus its reserve (%d). The "
+                           "live capture matters more than the backfill.",
+                           have, estimate, QUOTA_FLOOR, UNATTENDED_RESERVE)
+            conn.close()
+            return 0
+
     started_at = datetime.now(timezone.utc).isoformat()
     written = skipped_dupe = skipped_late = 0
     calls = 0
     remaining: Optional[str] = None
 
-    for kickoff in sorted(by_kickoff):
-        ko = datetime.fromisoformat(kickoff)
-        when = (ko - timedelta(minutes=LOOKBACK_MINUTES)).isoformat().replace("+00:00", "Z")
+    interrupted = None
+    try:
+        for kickoff in sorted(by_kickoff):
+            ko = datetime.fromisoformat(kickoff)
+            when = (ko - timedelta(minutes=LOOKBACK_MINUTES)).isoformat().replace("+00:00", "Z")
 
-        snap_ts, events, quota = fetch_historical(
-            cfg["odds_api_key"], when, args.markets, args.regions, args.bookmakers)
-        calls += 1
-        remaining = quota.get("remaining")
-        logger.info("kickoff %s: asked for %s, archive returned %s (%d event(s), "
-                    "cost %s, remaining %s)",
-                    kickoff, when, snap_ts, len(events), quota.get("last"), remaining)
+            snap_ts, events, quota = fetch_historical(
+                cfg["odds_api_key"], when, args.markets, args.regions, args.bookmakers)
+            calls += 1
+            remaining = quota.get("remaining")
+            logger.info("kickoff %s: asked for %s, archive returned %s (%d event(s), "
+                        "cost %s, remaining %s)",
+                        kickoff, when, snap_ts, len(events), quota.get("last"), remaining)
 
-        if not snap_ts:
-            logger.warning("   no snapshot timestamp returned; skipping")
-            continue
-        # The archive gives the closest snapshot at or before what we asked
-        # for. If that still lands after kickoff, it is not a pre-kickoff
-        # price and must not become a closing line.
-        if snap_ts >= kickoff:
-            logger.warning("   snapshot %s is not before kickoff %s; refusing to write it",
-                           snap_ts, kickoff)
-            skipped_late += 1
-            continue
+            if not snap_ts:
+                logger.warning("   no snapshot timestamp returned; skipping")
+                continue
+            # The archive gives the closest snapshot at or before what we asked
+            # for. If that still lands after kickoff, it is not a pre-kickoff
+            # price and must not become a closing line.
+            if snap_ts >= kickoff:
+                logger.warning("   snapshot %s is not before kickoff %s; refusing to write it",
+                               snap_ts, kickoff)
+                skipped_late += 1
+                continue
 
-        match = match_games(conn, events, cfg)
-        wanted = set(by_kickoff[kickoff])
-        rows = [r for r in rows_from(events, match, snap_ts, "the-odds-api (historical)")
-                if r[0] in wanted]
-        rows = [r for r in rows if not already_have(conn, r[0], snap_ts)]
-        if not rows:
-            logger.info("   nothing new to write for this kickoff")
-            skipped_dupe += 1
-            continue
+            match = match_games(conn, events, cfg)
+            wanted = set(by_kickoff[kickoff])
+            rows = [r for r in rows_from(events, match, snap_ts, "the-odds-api (historical)")
+                    if r[0] in wanted]
+            rows = [r for r in rows if not already_have(conn, r[0], snap_ts)]
+            if not rows:
+                logger.info("   nothing new to write for this kickoff")
+                skipped_dupe += 1
+                continue
 
-        conn.executemany(
-            "INSERT INTO market_line_snapshots (game_id, captured_at, commence_time, book, "
-            "market_type, line, price_home, price_away, price_over, price_under, source, "
-            "ingest_version, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'reconstructed')", rows)
-        conn.commit()
-        written += len(rows)
-        logger.info("   wrote %d reconstructed snapshot row(s)", len(rows))
+            conn.executemany(
+                "INSERT INTO market_line_snapshots (game_id, captured_at, commence_time, book, "
+                "market_type, line, price_home, price_away, price_over, price_under, source, "
+                "ingest_version, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'reconstructed')", rows)
+            conn.commit()
+            written += len(rows)
+            logger.info("   wrote %d reconstructed snapshot row(s)", len(rows))
 
-        if remaining is not None and int(remaining) < QUOTA_FLOOR:
-            logger.warning("quota remaining %s is below the floor of %d; stopping here so the "
-                           "live recorder is not starved. Re-run to continue.",
-                           remaining, QUOTA_FLOOR)
-            break
+            if remaining is not None and int(remaining) < QUOTA_FLOOR:
+                logger.warning("quota remaining %s is below the floor of %d; stopping here so the "
+                               "live recorder is not starved. Re-run to continue.",
+                               remaining, QUOTA_FLOOR)
+                break
+
+    except RepairUnavailable as exc:
+        # Not a bug: the plan cannot read history, or the month's credits
+        # are gone. Whatever was written before this point stays written and
+        # still gets sealed below. A scheduled run says so and exits clean,
+        # because a daily job that reports failure every night for a reason
+        # nobody can act on tonight is a job people stop reading.
+        interrupted = str(exc)
+        (logger.warning if args.unattended else logger.error)('%s', interrupted)
 
     sealed = seal(conn)
     record_run(conn, "market_line_snapshots", "the-odds-api (historical)",
@@ -321,12 +409,17 @@ def main() -> int:
                      f"dupe={skipped_dupe} late={skipped_late} sealed={sealed} "
                      f"quota_remaining={remaining}")
 
-    logger.info("SUMMARY calls=%d written=%d (reconstructed) sealed=%d quota_remaining=%s",
-                calls, written, sealed, remaining)
+    logger.info("SUMMARY calls=%d written=%d (reconstructed) sealed=%d quota_remaining=%s%s",
+                calls, written, sealed, remaining,
+                "  [stopped early: see above]" if interrupted else "")
     if written:
         logger.info("These prices were read from an archive, not watched. Any closing line "
                     "value computed from them must say so; the provenance column carries it.")
     conn.close()
+    # Unattended runs only fail on something a person could actually fix
+    # tonight. A missing paid tier is not that.
+    if interrupted and not args.unattended:
+        return 1
     return 0
 
 

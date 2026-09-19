@@ -18,7 +18,9 @@ THE THREE JOBS AND WHY THEIR CADENCES DIFFER
              UNIQUE key per game and model) so an hourly run simply catches any
              fixture that has come into the horizon.
 
-  daily      grading. Yesterday's games are final by the morning.
+  daily      grading, repair, sealing. Yesterday's games are final by the
+             morning, which is also when it is clear whether a capture was
+             missed and worth buying back.
 
 WHAT A MISSED RUN ACTUALLY COSTS, WHICH DIFFERS BY JOB.
 
@@ -38,6 +40,15 @@ WHAT A MISSED RUN ACTUALLY COSTS, WHICH DIFFERS BY JOB.
   out of a vendor's archive afterwards, not one we recorded while it was live,
   and anything built on it -- closing line value above all -- must say so. Keep
   the recorder running; the repair path is for accidents, not a substitute.
+
+THE DAILY JOB SPENDS MONEY, CAREFULLY. `repair_odds.py --unattended` runs here
+every night. Unattended spending earns its guardrails: a three-day window, a
+90-credit cap (three kickoff times), a backlog worked down a slice a night
+rather than bought in one gulp, and a hard refusal to spend if it would leave
+the live recorder short -- a price we can still watch beats one we would have
+to buy back. It writes nothing on the current free tier, where the historical
+endpoint returns 401, and reports that as a warning rather than a failure so
+this job does not go red every night for a reason nobody can act on tonight.
 
 Nothing here raises on failure of a single job: one dead source must not stop
 the other two. Failures are logged loudly and the exit code reflects them, so
@@ -71,6 +82,10 @@ JOBS = {
     ],
     "daily": [
         ("grade ledger (NFL)", ["src/Sports/nfl/predict.py", "--grade"]),
+        # Repair before the seal, so anything rebuilt tonight is sealed by the
+        # step after it as well as by the repair's own seal.
+        ("repair missed odds (NFL)", ["src/Sports/repair_odds.py", "--sport", "nfl",
+                                      "--unattended", "--apply"]),
         ("odds seal (NFL)", ["src/Sports/odds_recorder.py", "--sport", "nfl", "--seal"]),
     ],
 }

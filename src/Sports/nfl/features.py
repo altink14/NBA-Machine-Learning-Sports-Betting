@@ -2,8 +2,9 @@
 features.py (NFL)
 =================
 Builds the model feature frame specified in
-`docs/sports/nfl/MODEL_PREREGISTRATION_v1.md` section 6, sealed at commit
-df7f55696c8b606cfd35435279f0db4d1f703224.
+`docs/sports/nfl/MODEL_PREREGISTRATION_v2.md` section 6, sealed at commit
+a88f762a065b21831e863e5a3a9935c5a1af4639. (v1 was voided for reading its own
+sealed window; see MODEL_V1_VOIDED.md.)
 
 THE DESIGN IS THE LEAKAGE CONTROL. Games are walked in kickoff order while a
 per-team state object is carried forward. For each game we EMIT features from
@@ -13,10 +14,11 @@ rows have not been folded in yet. This is structural: it does not depend on a
 WHERE clause being right, and `leakage_tests.py` proves it by rebuilding
 features from truncated inputs and demanding identical output.
 
-THE SEALED WINDOW IS PHYSICALLY GUARDED. `build_frame()` refuses to return
-2022 through 2025 unless `sealed_evaluation=True` is passed explicitly. That
-flag is used exactly once, ever, by the evaluation script. Everything else,
-fitting, feature selection, threshold choice, sees train and tune only.
+THE SEALED WINDOW IS THE FUTURE. `build_frame()` refuses to return the 2026
+season unless `sealed_evaluation=True`, but that guard is now the belt rather
+than the braces: the real protection is that 2026 has not been played, so there
+is nothing to peek at. v1 relied on discipline alone and the discipline failed
+within hours.
 
 NO ODDS. Not as a feature, not as a prior, not as a sanity check. The point of
 the market comparison in the pre-registration is that the model never saw a
@@ -45,16 +47,32 @@ from src.Sports.nfl.teams import NFL_TEAMS, CURRENT_OF  # noqa: E402
 
 DB_PATH = os.path.join(REPO_ROOT, "Data", "NflData.sqlite")
 
-# --- windows, from the pre-registration -----------------------------------
+# --- windows, from pre-registration v2 (a88f762) ---------------------------
+# v1 sealed 2022-2025 and was VOIDED when that window was read; see
+# docs/sports/nfl/MODEL_V1_VOIDED.md. v2's seal is the 2026 season, which
+# cannot be peeked at because it has not been played. Those four seasons are
+# therefore now open validation data.
 TRAIN_SEASONS = tuple(str(y) for y in range(1999, 2019))
-TUNE_SEASONS = ("2019", "2020", "2021")
-SEALED_SEASONS = ("2022", "2023", "2024", "2025")
-LIVE_SEASONS = ("2026",)
+TUNE_SEASONS = tuple(str(y) for y in range(2019, 2026))      # 2019-2025, open
+SEALED_SEASONS = ("2026",)                                    # the future
+LIVE_SEASONS = ("2027",)
 
 # --- Elo constants. Standard values; not tuned on the sealed window. -------
 ELO_START = 1500.0
 ELO_K = 20.0
-ELO_HOME_EDGE = 65.0        # in rating points, applied to the home side
+# The home-field term. A FIXED value was the single biggest error in the first
+# fit: 65 rating points asserts that home teams win 59.2% of even matchups, in
+# an era where they win about 53.5%. The result was a model that was
+# overconfident in every probability bucket at once.
+#
+# It is now estimated from a trailing window of completed games, which
+# pre-registration v2 section 6 authorised in advance as the one permitted
+# change. The estimate uses only games that had already kicked off, so it is
+# subject to leakage control 1 like every other feature.
+ELO_HOME_EDGE_PRIOR = 45.0   # whole-archive value, used until the window fills
+ELO_HOME_WINDOW = 512        # completed games, roughly two seasons
+ELO_HOME_EDGE_MIN = 0.0      # a home DISadvantage is not a thing we will assert
+ELO_HOME_EDGE_MAX = 90.0
 ELO_SEASON_REGRESSION = 1.0 / 3.0   # toward the mean, between seasons
 
 ROLL_SHORT = 8
@@ -96,6 +114,32 @@ class TeamState:
         self.elo = ELO_START + (self.elo - ELO_START) * (1.0 - ELO_SEASON_REGRESSION)
         self.wins = 0
         self.losses = 0
+
+
+class HomeEdgeEstimator:
+    """Turns the recent rate of home wins into Elo rating points.
+
+    If home teams beat evenly matched opponents a fraction p of the time, the
+    Elo edge that implies is -400 * log10(1/p - 1). Fed only completed games,
+    oldest first, so the value used for any game reflects only earlier ones.
+    """
+
+    __slots__ = ("_wins", "_n", "_recent")
+
+    def __init__(self) -> None:
+        self._recent: deque = deque(maxlen=ELO_HOME_WINDOW)
+
+    @property
+    def points(self) -> float:
+        if len(self._recent) < 64:
+            return ELO_HOME_EDGE_PRIOR
+        p = sum(self._recent) / len(self._recent)
+        p = min(max(p, 0.5001), 0.95)      # log10 needs p strictly inside (0, 1)
+        edge = -400.0 * math.log10(1.0 / p - 1.0)
+        return min(max(edge, ELO_HOME_EDGE_MIN), ELO_HOME_EDGE_MAX)
+
+    def observe(self, home_result: float) -> None:
+        self._recent.append(home_result)
 
 
 def _mean(d: Sequence[float], n: Optional[int] = None) -> Optional[float]:
@@ -151,7 +195,7 @@ FEATURE_COLUMNS = [
     # target
     "home_win",
     # strength
-    "elo_home", "elo_away", "elo_diff",
+    "elo_home", "elo_away", "elo_diff", "home_edge_pts",
     "epa_off_home_8", "epa_off_away_8", "epa_def_home_8", "epa_def_away_8",
     "epa_off_home_16", "epa_off_away_16", "epa_def_home_16", "epa_def_away_16",
     "sr_off_home_8", "sr_off_away_8", "sr_def_home_8", "sr_def_away_8",
@@ -229,6 +273,7 @@ def build_frame(db_path: str = DB_PATH,
 
     state: Dict[str, TeamState] = {}
     season_seen: Dict[str, str] = {}
+    home_edge = HomeEdgeEstimator()
     rows: List[Dict[str, Any]] = []
 
     for g in games:
@@ -258,6 +303,7 @@ def build_frame(db_path: str = DB_PATH,
                 "home_win": 1 if g["home_score"] > g["away_score"] else 0,
 
                 "elo_home": hs_.elo, "elo_away": as_.elo, "elo_diff": hs_.elo - as_.elo,
+                "home_edge_pts": home_edge.points,
                 "epa_off_home_8": _mean(hs_.epa_off, ROLL_SHORT),
                 "epa_off_away_8": _mean(as_.epa_off, ROLL_SHORT),
                 "epa_def_home_8": _mean(hs_.epa_def, ROLL_SHORT),
@@ -298,11 +344,14 @@ def build_frame(db_path: str = DB_PATH,
             continue
         home_won = g["home_score"] > g["away_score"]
 
-        exp_home = 1.0 / (1.0 + 10 ** (-((hs_.elo + ELO_HOME_EDGE) - as_.elo) / 400.0))
+        edge = 0.0 if g["neutral_site"] else home_edge.points
+        exp_home = 1.0 / (1.0 + 10 ** (-((hs_.elo + edge) - as_.elo) / 400.0))
         actual = 1.0 if home_won else (0.5 if g["home_score"] == g["away_score"] else 0.0)
         delta = ELO_K * (actual - exp_home)
         hs_.elo += delta
         as_.elo -= delta
+        if not g["neutral_site"]:
+            home_edge.observe(actual)
 
         ha = agg.get((g["game_id"], home))
         aa = agg.get((g["game_id"], away))

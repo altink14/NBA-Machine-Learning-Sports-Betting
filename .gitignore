@@ -118,3 +118,6 @@ Data/*.sqlite
 Data/NflData.sqlite
 Data/NflData.sqlite-*
 Data/nfl_cache/
+
+# Fitted NFL models (rebuildable from src/Sports/nfl/train.py)
+Models/nfl_v2/

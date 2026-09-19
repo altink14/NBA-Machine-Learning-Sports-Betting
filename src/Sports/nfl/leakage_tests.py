@@ -2,7 +2,7 @@
 leakage_tests.py (NFL)
 ======================
 The five controls from section 7 of
-`docs/sports/nfl/MODEL_PREREGISTRATION_v1.md`. These must pass before any
+`docs/sports/nfl/MODEL_PREREGISTRATION_v2.md`. These must pass before any
 model is fitted, and they run again before the single sealed evaluation.
 
 Leakage is the failure mode that does not look like one. A model that has seen
@@ -213,7 +213,7 @@ def control_5_no_odds() -> None:
 
 def main() -> int:
     print("Leakage controls for NFL model v1")
-    print("Pre-registration sealed at df7f55696c8b606cfd35435279f0db4d1f703224")
+    print("Pre-registration sealed at a88f762a065b21831e863e5a3a9935c5a1af4639")
     rows, _ = build_frame()
     print(f"\nframe: {len(rows)} rows, {len(MODEL_COLUMNS)} model features")
 

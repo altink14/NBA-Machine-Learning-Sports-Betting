@@ -555,6 +555,21 @@ def main() -> int:
           one("SELECT COUNT(*) FROM market_lines WHERE provenance = 'third_party' "
               "AND captured_at IS NOT NULL") == 0,
           "nflverse lines are book-unspecified and time-unknown by design")
+    # A close is a fact about a game that has happened. The schedule file
+    # carries lines for unplayed games, so this flag has to be earned by the
+    # clock, not inherited from the source. 96 rows failed this when the check
+    # was written, and the CLV step had already settled 28 predictions against
+    # them.
+    unplayed_closes = one(
+        "SELECT COUNT(*) FROM market_lines m JOIN games g ON g.game_id = m.game_id "
+        "WHERE m.is_closing = 1 AND g.date_utc > strftime('%Y-%m-%dT%H:%M:%S+00:00','now')")
+    check("no closing line on a game that has not kicked off", unplayed_closes == 0,
+          f"{unplayed_closes} rows")
+    third_party_early = one(
+        "SELECT COUNT(*) FROM market_lines m JOIN games g ON g.game_id = m.game_id "
+        "WHERE m.is_closing = 1 AND m.provenance = 'third_party' AND g.status != 'final'")
+    check("third-party closes belong only to finished games", third_party_early == 0,
+          f"{third_party_early} rows")
     captured = one("SELECT COUNT(*) FROM market_lines WHERE provenance IN "
                    "('observed','reconstructed')")
     check("lines we captured ourselves carry the moment we captured them",

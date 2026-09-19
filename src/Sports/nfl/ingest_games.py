@@ -200,22 +200,31 @@ def main() -> int:
             SOURCE, ENDPOINT, fetched_at, INGEST_VERSION,
         ))
 
-        # --- market lines: closing, consensus, book and capture time unknown ---
+        # --- market lines: consensus, book and capture time unknown ---
+        # is_closing is NOT automatic. This file carries lines for games that
+        # have not been played: they are posted as the week is priced and move
+        # until kickoff. Flagging those as closing put a "closing line" in the
+        # table days before there was anything to close, and the first run of
+        # the CLV step duly settled 28 predictions against prices the market
+        # had not finished moving. A line here is a close only once the game
+        # is over and the number has stopped being a forecast.
+        is_closing = 1 if (hs is not None and as_ is not None) else 0
         spread, total = _f(r.get("spread_line")), _f(r.get("total_line"))
         ml_h, ml_a = _i(r.get("home_moneyline")), _i(r.get("away_moneyline"))
         if spread is not None:
             lines.append((gid, "consensus", "spread", spread,
                           _i(r.get("home_spread_odds")), _i(r.get("away_spread_odds")),
-                          None, None, None, None, 1, SOURCE, ENDPOINT, fetched_at, INGEST_VERSION))
+                          None, None, None, None, is_closing, SOURCE, ENDPOINT,
+                          fetched_at, INGEST_VERSION))
             n_lines += 1
         if total is not None:
             lines.append((gid, "consensus", "total", total, None, None, None,
                           _i(r.get("over_odds")), _i(r.get("under_odds")),
-                          None, 1, SOURCE, ENDPOINT, fetched_at, INGEST_VERSION))
+                          None, is_closing, SOURCE, ENDPOINT, fetched_at, INGEST_VERSION))
             n_lines += 1
         if ml_h is not None or ml_a is not None:
             lines.append((gid, "consensus", "moneyline", None, ml_h, ml_a, None, None, None,
-                          None, 1, SOURCE, ENDPOINT, fetched_at, INGEST_VERSION))
+                          None, is_closing, SOURCE, ENDPOINT, fetched_at, INGEST_VERSION))
             n_lines += 1
 
         # --- weather: a stadium reading where the file has one, never invented ---

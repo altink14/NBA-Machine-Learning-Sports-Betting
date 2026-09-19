@@ -303,6 +303,16 @@ def seal(conn: sqlite3.Connection) -> int:
     being remembered by whoever ran the backfill.
     """
     now = datetime.now(timezone.utc).isoformat()
+    # "Last before kickoff" is ordered by captured_at, NOT by id. Those agreed
+    # while the live recorder was the only writer, because rows arrived in
+    # time order. A repair run breaks that: reconstructed snapshots are
+    # inserted today carrying last week's captured_at, so they hold the
+    # highest ids and the lowest timestamps. Ordering by id would let a
+    # backfill silently outrank a price we actually watched.
+    #
+    # Ties break toward 'observed' for the same reason: if we hold both a
+    # watched and a reconstructed price for the same moment, the watched one
+    # is the better claim. id is the final tiebreak so the choice is total.
     picked = conn.execute(
         """
         SELECT s.game_id, s.book, s.market_type, s.line, s.price_home, s.price_away,
@@ -311,9 +321,14 @@ def seal(conn: sqlite3.Connection) -> int:
         JOIN games g ON g.game_id = s.game_id
         WHERE g.date_utc IS NOT NULL AND g.date_utc < ?
           AND s.captured_at < g.date_utc
-          AND s.id = (SELECT MAX(s2.id) FROM market_line_snapshots s2
-                      WHERE s2.game_id = s.game_id AND s2.book = s.book
-                        AND s2.market_type = s.market_type AND s2.captured_at < g.date_utc)
+          AND s.id = (
+                SELECT s2.id FROM market_line_snapshots s2
+                WHERE s2.game_id = s.game_id AND s2.book = s.book
+                  AND s2.market_type = s.market_type AND s2.captured_at < g.date_utc
+                ORDER BY s2.captured_at DESC,
+                         CASE s2.provenance WHEN 'observed' THEN 0 ELSE 1 END,
+                         s2.id DESC
+                LIMIT 1)
         """, (now,)).fetchall()
     n = 0
     for r in picked:

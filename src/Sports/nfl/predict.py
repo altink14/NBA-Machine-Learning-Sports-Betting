@@ -9,6 +9,14 @@ cannot be peeked at because it has not been played. The only way that seal
 turns into a result is if predictions are written down, one at a time, before
 each game, all season. A season we forget to log is a season we cannot claim.
 
+THE GRADING IS SILENT ON PURPOSE. Games get graded into the ledger as they
+finish, because the record has to exist when the evaluation runs. But 2026 is
+the sealed window, so this script never prints how those picks did: the ledger
+reports a sealed competition's wins and losses as one `settled` count. A daily
+win-loss tally in a log file is a running read of the sealed window, which is
+the same kind of aggregate that voided v1. The number appears once, after the
+season, or it is not a seal.
+
 EVERYTHING IS SHADOW. `is_shadow = 1` on every row this writes. The model has
 not passed its gates and will not have until the 2026 season ends. Shadow rows
 may be shown publicly LABELLED AS SHADOW and must never be presented as a track
@@ -156,6 +164,8 @@ def main() -> int:
         counts = grade_pending(led, results, grading_source="nflverse archive")
         logger.info("graded: %s", counts)
         logger.info("ledger health: %s", health(led, sport="football"))
+        logger.info("2026 is sealed: results are in the ledger, but reported "
+                    "only as 'settled' until the single evaluation")
         return 0
 
     rows, _ = build_frame(for_prediction=True)

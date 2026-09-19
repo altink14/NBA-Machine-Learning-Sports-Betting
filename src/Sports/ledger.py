@@ -43,6 +43,38 @@ from typing import Any, Dict, List, Optional
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LEDGER_DB = os.path.join(REPO_ROOT, "Data", "OddsData.sqlite")
 
+# --------------------------------------------------------------------------
+# SEALED COMPETITIONS
+#
+# A sealed competition is one whose outcomes a pre-registration forbids us to
+# look at until its single evaluation. Right now that is the 2026 NFL season
+# (MODEL_PREREGISTRATION_v2.md, sealed at commit a88f762).
+#
+# Predictions for a sealed competition are still written and still graded --
+# that is the whole forward test, and the results must be in the database when
+# the evaluation finally runs. What must not happen is any RUNNING TOTAL of
+# those outcomes reaching a human before that day, because a win-loss tally is
+# exactly the kind of aggregate that voided v1. MODEL_V1_VOIDED.md rejects the
+# "it was only an aggregate" defence in as many words.
+#
+# So the reporting functions below collapse win/loss/push into a single
+# `settled` count for sealed competitions. The count of finished games carries
+# no information the schedule does not already give away; the split does.
+#
+# `reveal_sealed_outcomes=True` exists for exactly one caller that does not
+# exist yet: the single evaluation, after the season ends. Passing it before
+# then is the breach, and it has to be typed on purpose.
+# --------------------------------------------------------------------------
+SEALED_COMPETITION_PREFIXES = ("nfl-2026-",)
+
+
+def is_sealed(competition_id: Optional[str]) -> bool:
+    """True if this competition's outcomes are under seal today."""
+    if not competition_id:
+        return False
+    return competition_id.startswith(SEALED_COMPETITION_PREFIXES)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ledger (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,20 +199,28 @@ def write_prediction(conn: sqlite3.Connection, *, sport: str, league: str, game_
 
 
 def grade_pending(conn: sqlite3.Connection, results: Dict[str, Dict[str, Any]],
-                  grading_source: str = "archive") -> Dict[str, int]:
+                  grading_source: str = "archive",
+                  reveal_sealed_outcomes: bool = False) -> Dict[str, int]:
     """Settle pending rows whose games have finished.
 
     `results` maps game_id to {'home_score', 'away_score', 'status'}. A game
     that was abandoned or never played is voided rather than guessed at: the
     2022 Bills-Bengals game is the reason that branch exists.
+
+    The rows are graded either way. What `reveal_sealed_outcomes` controls is
+    only what this function TELLS YOU: with it false, which is always outside
+    the single evaluation, a sealed competition's wins, losses and pushes come
+    back as one `settled` number. See the note beside SEALED_COMPETITION_PREFIXES.
     """
     now = datetime.now(timezone.utc).isoformat()
-    counts = {"win": 0, "loss": 0, "push": 0, "void": 0, "still_pending": 0}
+    counts = {"win": 0, "loss": 0, "push": 0, "settled": 0,
+              "void": 0, "still_pending": 0}
     rows = conn.execute(
-        "SELECT id, game_id, market_type, side, line FROM ledger WHERE result = 'pending'"
+        "SELECT id, game_id, market_type, side, line, competition_id "
+        "FROM ledger WHERE result = 'pending'"
     ).fetchall()
 
-    for rid, gid, market, side, line in rows:
+    for rid, gid, market, side, line, comp in rows:
         r = results.get(gid)
         if not r or r.get("status") != "final" or r.get("home_score") is None:
             if r and r.get("status") in ("cancelled", "abandoned"):
@@ -215,14 +255,23 @@ def grade_pending(conn: sqlite3.Connection, results: Dict[str, Dict[str, Any]],
             continue
         conn.execute("UPDATE ledger SET result=?, graded_at=?, grading_source=? WHERE id=?",
                      (outcome, now, grading_source, rid))
-        counts[outcome] += 1
+        if is_sealed(comp) and not reveal_sealed_outcomes:
+            counts["settled"] += 1
+        else:
+            counts[outcome] += 1
 
     conn.commit()
     return counts
 
 
-def health(conn: sqlite3.Connection, sport: Optional[str] = None) -> Dict[str, Any]:
-    """The monitoring view: silence here means the pipeline has stopped."""
+def health(conn: sqlite3.Connection, sport: Optional[str] = None,
+           reveal_sealed_outcomes: bool = False) -> Dict[str, Any]:
+    """The monitoring view: silence here means the pipeline has stopped.
+
+    Monitoring needs to know that rows are being written and graded, not how
+    they turned out, so a sealed competition's outcomes arrive here collapsed
+    into `settled` unless the caller explicitly asks otherwise.
+    """
     where = "WHERE sport = ?" if sport else ""
     args = (sport,) if sport else ()
     total = conn.execute(f"SELECT COUNT(*) FROM ledger {where}", args).fetchone()[0]
@@ -237,7 +286,14 @@ def health(conn: sqlite3.Connection, sport: Optional[str] = None) -> Dict[str, A
         f"SELECT COUNT(*) FROM ledger {where or 'WHERE 1=1'} AND result = 'pending' "
         f"AND event_start_utc < ?",
         args + (datetime.now(timezone.utc).isoformat(),)).fetchone()[0]
-    by_result = dict(conn.execute(
-        f"SELECT result, COUNT(*) FROM ledger {where} GROUP BY result", args).fetchall())
+    by_result: Dict[str, int] = {}
+    for result, comp, n in conn.execute(
+            f"SELECT result, competition_id, COUNT(*) FROM ledger {where} "
+            f"GROUP BY result, competition_id", args).fetchall():
+        key = result
+        if (result in ("win", "loss", "push")
+                and is_sealed(comp) and not reveal_sealed_outcomes):
+            key = "settled"
+        by_result[key] = by_result.get(key, 0) + n
     return {"total": total, "written_today": written, "graded_today": graded,
             "pending_past_kickoff": stale, "by_result": by_result}

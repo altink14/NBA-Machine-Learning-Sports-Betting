@@ -349,35 +349,115 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
 SIMULATED_MODEL_TAG = "implied_probability_sim"
 
 
+#: The NBA prediction log, with the guarantees the NFL ledger has had from the
+#: start. Until 2026-09-19 this table enforced nothing: a prediction could be
+#: written after tip-off, rewritten afterwards, or deleted, and the tip-off
+#: time could be NULL. The public track record rests on none of that being
+#: possible, so it is now the schema's job rather than the caller's good
+#: manners. See src/Sports/ledger.py, which says the same thing at more length.
+_PREDICTION_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS predictions_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at TEXT NOT NULL,
+    log_date TEXT NOT NULL,
+    sport TEXT NOT NULL,
+    sportsbook TEXT NOT NULL,
+    game_key TEXT NOT NULL,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    game_start_time_utc TEXT NOT NULL,
+    home_ml REAL,
+    away_ml REAL,
+    ou_line REAL,
+    predicted_winner TEXT,
+    winner_confidence REAL,
+    ou_prediction TEXT,
+    ou_confidence REAL,
+    ev_home REAL,
+    ev_away REAL,
+    model TEXT,
+    actual_winner TEXT,
+    actual_total REAL,
+
+    -- The rule the track record is an argument about. Both sides are written
+    -- in the same canonical UTC form by _utc_iso(), so the comparison is
+    -- between like and like rather than between a naive string and a 'Z'.
+    CHECK (logged_at < game_start_time_utc),
+    UNIQUE (log_date, sportsbook, game_key)
+);
+
+-- A prediction is what we said before the game. Changing it afterwards is the
+-- single thing that would make every number on the site worthless, so it is
+-- refused rather than discouraged. Grading columns stay writable.
+CREATE TRIGGER IF NOT EXISTS predictions_log_immutable
+BEFORE UPDATE ON predictions_log
+WHEN OLD.predicted_winner IS NOT NEW.predicted_winner
+  OR OLD.winner_confidence IS NOT NEW.winner_confidence
+  OR OLD.ou_prediction IS NOT NEW.ou_prediction
+  OR OLD.ou_confidence IS NOT NEW.ou_confidence
+  OR OLD.logged_at != NEW.logged_at
+  OR OLD.game_start_time_utc != NEW.game_start_time_utc
+  OR OLD.game_key != NEW.game_key
+  OR OLD.model IS NOT NEW.model
+BEGIN
+    SELECT RAISE(ABORT, 'a logged prediction is immutable; only grading may be written');
+END;
+
+CREATE TRIGGER IF NOT EXISTS predictions_log_no_regrade
+BEFORE UPDATE ON predictions_log
+WHEN OLD.actual_winner IS NOT NULL AND NEW.actual_winner IS NOT OLD.actual_winner
+BEGIN
+    SELECT RAISE(ABORT, 'a graded prediction cannot be regraded');
+END;
+
+CREATE TRIGGER IF NOT EXISTS predictions_log_no_delete
+BEFORE DELETE ON predictions_log
+BEGIN
+    SELECT RAISE(ABORT, 'the prediction log is append-only');
+END;
+"""
+
+
+def _utc_iso(value) -> Optional[str]:
+    """Canonical 'YYYY-MM-DDTHH:MM:SS+00:00', or None if it cannot be read.
+
+    The odds feed sends 'Z', the old logger wrote a naive utcnow(), and the
+    CHECK constraint compares them as strings. One canonical form removes the
+    whole class of bug.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def _ensure_prediction_log_schema(conn) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS predictions_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            logged_at TEXT NOT NULL,
-            log_date TEXT NOT NULL,
-            sport TEXT NOT NULL,
-            sportsbook TEXT NOT NULL,
-            game_key TEXT NOT NULL,
-            home_team TEXT NOT NULL,
-            away_team TEXT NOT NULL,
-            game_start_time_utc TEXT,
-            home_ml REAL,
-            away_ml REAL,
-            ou_line REAL,
-            predicted_winner TEXT,
-            winner_confidence REAL,
-            ou_prediction TEXT,
-            ou_confidence REAL,
-            ev_home REAL,
-            ev_away REAL,
-            model TEXT,
-            actual_winner TEXT,
-            actual_total REAL,
-            UNIQUE (log_date, sportsbook, game_key)
-        )
-        """
-    )
+    # The constraints above cannot be added to an existing table by ALTER, so
+    # an old-shape table is rebuilt -- but only while it is empty, which it has
+    # been for its whole life. If rows ever exist we leave them alone and say
+    # so, because silently rewriting a prediction log is exactly the thing the
+    # triggers are here to prevent.
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='predictions_log'"
+    ).fetchone()
+    if row and "CHECK (logged_at < game_start_time_utc)" not in (row[0] or ""):
+        n = conn.execute("SELECT COUNT(*) FROM predictions_log").fetchone()[0]
+        if n == 0:
+            conn.execute("DROP TABLE predictions_log")
+            logger.info("predictions_log: rebuilt with pre-tipoff and immutability constraints")
+        else:
+            logger.warning(
+                "predictions_log holds %d row(s) under the old unconstrained schema. "
+                "Leaving it as-is; migrate deliberately rather than from a request handler.", n)
+    conn.executescript(_PREDICTION_LOG_SCHEMA)
 
 def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None:
     """
@@ -392,8 +472,11 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
     conn = _odds_snapshot_conn()
     try:
         _ensure_prediction_log_schema(conn)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        now_iso = now.isoformat()
         skipped_sim = 0
+        skipped_no_tipoff = 0
+        skipped_late = 0
         for p in predictions:
             home = p.get("home_team")
             away = p.get("away_team")
@@ -401,6 +484,23 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                 continue
             if p.get("model") == SIMULATED_MODEL_TAG:
                 skipped_sim += 1
+                continue
+            # A prediction we cannot prove predates the game does not belong in
+            # a public track record. Since 2026-08-20 every NBA row from the
+            # odds feed has carried a tip-off time, so this should be rare and
+            # is worth shouting about when it is not.
+            tipoff = _utc_iso(p.get("game_start_time_utc"))
+            if not tipoff:
+                skipped_no_tipoff += 1
+                logger.error(
+                    "NOT LOGGING %s vs %s: the odds feed gave no tip-off time, so we cannot "
+                    "show this prediction was made before the game. Fix the feed.", away, home)
+                continue
+            if now_iso >= tipoff:
+                skipped_late += 1
+                logger.error(
+                    "NOT LOGGING %s vs %s: tip-off was %s and it is now %s. A prediction made "
+                    "after the game started is not a prediction.", away, home, tipoff, now_iso)
                 continue
             ev = p.get("expected_value") or {}
             conn.execute(
@@ -412,28 +512,24 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                     predicted_winner, winner_confidence, ou_prediction, ou_confidence,
                     ev_home, ev_away, model
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(log_date, sportsbook, game_key) DO UPDATE SET
-                    logged_at=excluded.logged_at,
-                    home_ml=excluded.home_ml,
-                    away_ml=excluded.away_ml,
-                    ou_line=excluded.ou_line,
-                    predicted_winner=excluded.predicted_winner,
-                    winner_confidence=excluded.winner_confidence,
-                    ou_prediction=excluded.ou_prediction,
-                    ou_confidence=excluded.ou_confidence,
-                    ev_home=excluded.ev_home,
-                    ev_away=excluded.ev_away,
-                    model=excluded.model
+                -- The FIRST prediction of the day stands. This used to be a
+                -- DO UPDATE that overwrote the pick, the confidence and the
+                -- timestamp on every later run, so a 9am call could be quietly
+                -- replaced by a lunchtime one and still look like a morning
+                -- prediction. "Latest wins" is how a track record improves
+                -- itself. A genuinely revised view is a new row, the way the
+                -- NFL ledger does it with supersedes_id.
+                ON CONFLICT(log_date, sportsbook, game_key) DO NOTHING
                 """,
                 (
-                    now.isoformat(),
+                    now_iso,
                     now.strftime("%Y-%m-%d"),
                     sport,
                     sportsbook,
                     f"{home}:{away}",
                     home,
                     away,
-                    p.get("game_start_time_utc"),
+                    tipoff,
                     p.get("home_odds"),
                     p.get("away_odds"),
                     p.get("under_over_line") if isinstance(p.get("under_over_line"), (int, float)) else None,
@@ -451,6 +547,12 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                 "Prediction log: skipped %d market-implied row(s) - '%s' output is not a "
                 "model prediction and is never graded as one.",
                 skipped_sim, SIMULATED_MODEL_TAG
+            )
+        if skipped_no_tipoff or skipped_late:
+            logger.error(
+                "Prediction log: %d row(s) had no tip-off time and %d were already under way. "
+                "Those games have no entry in the track record and cannot get one later.",
+                skipped_no_tipoff, skipped_late
             )
         conn.commit()
     finally:

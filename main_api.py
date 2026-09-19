@@ -2671,18 +2671,25 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
 
         predictions = [dict(r) for r in rows]
 
+        # The over/under pick was withdrawn on 2026-09-19 from every surface,
+        # and a public endpoint is a surface. These columns are still WRITTEN
+        # -- shadow data, in case a totals model is ever pre-registered and
+        # earns a record the way the moneyline did -- but they are not served.
+        #
+        # This is not hypothetical tidiness. Until now the response carried
+        # `ou_prediction` and `ou_confidence` on every row and an `ou_pct` in
+        # the summary. Nothing rendered them, so the withdrawal looked complete
+        # from the page; it was one JSX block away from being published again,
+        # and anyone calling the endpoint directly already had it. The table is
+        # empty today, so this ships before opening night makes it real rather
+        # than after.
+        for p in predictions:
+            p.pop("ou_prediction", None)
+            p.pop("ou_confidence", None)
+
         # Honest topline: only graded predictions count toward the record
         graded = [p for p in predictions if p.get("actual_winner")]
         ml_correct = sum(1 for p in graded if p.get("predicted_winner") == p.get("actual_winner"))
-        ou_graded = [
-            p for p in graded
-            if p.get("actual_total") is not None and p.get("ou_line") is not None and p.get("ou_prediction")
-        ]
-        ou_correct = sum(
-            1 for p in ou_graded
-            if (p["actual_total"] > p["ou_line"] and p["ou_prediction"].upper() == "OVER")
-            or (p["actual_total"] < p["ou_line"] and p["ou_prediction"].upper() == "UNDER")
-        )
 
         return {
             "days": days,
@@ -2691,9 +2698,8 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
                 "graded": len(graded),
                 "moneyline_correct": ml_correct,
                 "moneyline_pct": round(100 * ml_correct / len(graded), 1) if graded else None,
-                "ou_graded": len(ou_graded),
-                "ou_correct": ou_correct,
-                "ou_pct": round(100 * ou_correct / len(ou_graded), 1) if ou_graded else None,
+                # No totals record is served. See the note above; restoring one
+                # requires a pre-registered evaluation, not an edit here.
             },
             "predictions": predictions,
         }

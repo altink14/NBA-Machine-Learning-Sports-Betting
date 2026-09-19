@@ -58,14 +58,23 @@ def _find_result(team_conn, home_id: int, away_id: int, around_date: str):
     return row[0], row[1]
 
 
-def grade() -> int:
-    if not os.path.exists(ODDS_DB) or not os.path.exists(TEAM_DB):
+def grade(odds_db: str = None, team_db: str = None) -> int:
+    """Grade ungraded predictions. Defaults to the real databases.
+
+    The two paths are arguments rather than constants so rehearse_ledger.py can
+    run this exact function against a scratch ledger and the real archive. The
+    thing that has to work on opening night should be the thing that gets
+    rehearsed, not a copy of it that can drift.
+    """
+    odds_db = odds_db or ODDS_DB
+    team_db = team_db or TEAM_DB
+    if not os.path.exists(odds_db) or not os.path.exists(team_db):
         logger.warning("Databases not found; nothing to grade.")
         return 0
 
-    odds_conn = sqlite3.connect(ODDS_DB)
+    odds_conn = sqlite3.connect(odds_db)
     odds_conn.row_factory = sqlite3.Row
-    team_conn = sqlite3.connect(TEAM_DB)
+    team_conn = sqlite3.connect(f"file:{team_db}?mode=ro", uri=True)
     graded = 0
     try:
         try:

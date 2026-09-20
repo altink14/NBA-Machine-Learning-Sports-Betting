@@ -169,12 +169,24 @@ def _nba_games_expected(today: Optional[date] = None) -> bool:
 
 
 def grade_logged_predictions() -> None:
-    """Fill in final scores for yesterday's logged predictions."""
+    """Fill in final scores for yesterday's logged predictions, then price them.
+
+    Grading says whether the pick was right. CLV says whether the price was
+    good, which is a different question and answerable much sooner -- return
+    on investment needs hundreds of settled bets, closing line value says
+    something after a few dozen. Both are post-hoc enrichment of a row that was
+    frozen before tip-off, so they run together.
+    """
     try:
         from grade_predictions import grade
         grade()
     except Exception as exc:
         logger.warning("Prediction grading failed (non-fatal): %s", exc)
+    try:
+        from grade_predictions import price_clv
+        price_clv()
+    except Exception as exc:
+        logger.warning("Closing line value failed (non-fatal): %s", exc)
 
 
 def snapshot_odds_board() -> str:

@@ -16,7 +16,7 @@ import logging
 import os
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("grade_predictions")
@@ -56,6 +56,113 @@ def _find_result(team_conn, home_id: int, away_id: int, around_date: str):
     if row is None:
         return None
     return row[0], row[1]
+
+
+#: Columns added 2026-09-19 for closing line value. Additive only.
+_CLV_COLUMNS = [
+    ("closing_home_ml", "REAL"),
+    ("closing_away_ml", "REAL"),
+    ("closing_captured_at", "TEXT"),
+    ("closing_minutes_before_tip", "REAL"),
+    ("clv", "REAL"),
+]
+
+
+def _ensure_clv_columns(conn: sqlite3.Connection) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info(predictions_log)")}
+    for col, decl in _CLV_COLUMNS:
+        if have and col not in have:
+            conn.execute(f"ALTER TABLE predictions_log ADD COLUMN {col} {decl}")
+            logger.info("predictions_log: added column %s", col)
+
+
+def _american_to_decimal(price):
+    if price is None:
+        return None
+    p = float(price)
+    if -1.0 < p < 1.0:
+        return None
+    return 1.0 + (p / 100.0 if p > 0 else 100.0 / -p)
+
+
+def price_clv(odds_db: str = None) -> dict:
+    """Attach closing line value to logged predictions, from our own snapshots.
+
+    WHAT THIS ASKS, AND WHY IT IS NOT ROI. Did we take a better price than the
+    market's last one before tip? Return on investment needs hundreds of
+    settled bets to say anything; closing line value says something after a few
+    dozen, and it does not depend on who won. The NFL ledger has had this since
+    it was built; the NBA, which is the actual product, has not.
+
+        clv = (decimal price we logged / decimal price at the close) - 1
+
+    so +0.02 means the price we had was 2% better on the same side.
+
+    HOW CLOSE IS "CLOSING". This is the honest part and the NBA-specific
+    problem. The recorder is schedule-aware as of today, but the archive still
+    contains snapshots taken hours before tip from when it was not, and a price
+    from eight hours out is not a closing price. So every row records
+    `closing_minutes_before_tip` next to the number. Nothing here decides what
+    is close enough -- that is a judgement for whoever reports it -- but the
+    distance travels with the figure instead of being lost, and a CLV computed
+    against a snapshot from the morning must be described that way.
+
+    Only predictions whose game has actually started are priced: before tip
+    there is no close, whatever the newest snapshot says.
+    """
+    odds_db = odds_db or ODDS_DB
+    if not os.path.exists(odds_db):
+        return {"priced": 0, "no_close": 0, "not_started": 0}
+    conn = sqlite3.connect(odds_db)
+    conn.row_factory = sqlite3.Row
+    counts = {"priced": 0, "no_close": 0, "not_started": 0, "no_price": 0}
+    try:
+        _ensure_clv_columns(conn)
+        now = datetime.now(timezone.utc).isoformat()
+        rows = conn.execute(
+            "SELECT id, sportsbook, game_key, game_start_time_utc, home_team, "
+            "predicted_winner, home_ml, away_ml FROM predictions_log WHERE clv IS NULL"
+        ).fetchall()
+        for r in rows:
+            tip = r["game_start_time_utc"]
+            if not tip or tip > now:
+                counts["not_started"] += 1
+                continue
+            close = conn.execute(
+                "SELECT captured_at, home_ml, away_ml FROM odds_snapshots "
+                "WHERE game_key = ? AND sportsbook = ? AND captured_at < ? "
+                "AND home_ml IS NOT NULL AND away_ml IS NOT NULL "
+                "ORDER BY captured_at DESC LIMIT 1",
+                (r["game_key"], r["sportsbook"], tip),
+            ).fetchone()
+            if not close:
+                counts["no_close"] += 1
+                continue
+            on_home = (r["predicted_winner"] or "") == (r["home_team"] or "")
+            ours = r["home_ml"] if on_home else r["away_ml"]
+            theirs = close["home_ml"] if on_home else close["away_ml"]
+            d_ours, d_theirs = _american_to_decimal(ours), _american_to_decimal(theirs)
+            if d_ours is None or d_theirs is None or d_theirs <= 1.0:
+                counts["no_price"] += 1
+                continue
+            try:
+                gap = (datetime.fromisoformat(tip.replace("Z", "+00:00"))
+                       - datetime.fromisoformat(str(close["captured_at"]).replace("Z", "+00:00")
+                                                )).total_seconds() / 60.0
+            except ValueError:
+                gap = None
+            conn.execute(
+                "UPDATE predictions_log SET closing_home_ml=?, closing_away_ml=?, "
+                "closing_captured_at=?, closing_minutes_before_tip=?, clv=? WHERE id=?",
+                (close["home_ml"], close["away_ml"], close["captured_at"], gap,
+                 (d_ours / d_theirs) - 1.0, r["id"]),
+            )
+            counts["priced"] += 1
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("closing line value: %s", counts)
+    return counts
 
 
 def grade(odds_db: str = None, team_db: str = None) -> int:

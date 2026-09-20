@@ -78,7 +78,20 @@ logger = logging.getLogger(__name__)
 CURRENT_SEASON = "2025-26"
 # First season with play-by-play in pbp_events (backfill_pbp.py --season, one at a time).
 # Move this when another season lands; the frontend floor lives in archive-seasons.ts callers.
-PBP_FIRST_SEASON = "2021-22"
+#
+# Lowered from 2021-22 to 2019-20 on 2026-09-19. It was not that a season had
+# just landed -- 2019-20 and 2020-21 were already in pbp_events at 100% game
+# coverage and had been sitting behind this constant unused. Checked before
+# moving it: both seasons carry SUB events at the same rate as the exposed
+# ones (48.9 and 46.3 per game against 46.7 for 2021-22) in the identical
+# "SUB: X FOR Y" form the lineup regex expects, and the on/off engine returns
+# sane output for both -- LeBron 2,028 minutes at +10.9 per 100 in 2019-20,
+# Schroder leading 2020-21 at +0.9.
+#
+# Both are short COVID seasons (1,142 and 1,165 games, the bubble and the
+# 72-game year), which is a caveat for anyone comparing season totals, not a
+# reason to hide them.
+PBP_FIRST_SEASON = "2019-20"
 
 def find_db_team_stats(team_name: str, season: str = CURRENT_SEASON):
     """

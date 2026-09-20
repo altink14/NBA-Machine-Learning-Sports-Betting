@@ -94,6 +94,18 @@ QUOTA_FLOOR = 60
 
 #: (minutes until the nearest tip, minimum minutes between captures).
 #: Checked in order; the first window the nearest tip falls into wins.
+#:
+#: DO NOT NARROW THE 30-MINUTE WINDOW TO SAVE CREDITS. It is the obvious
+#: optimisation and it has been measured: `forecast_odds_credits.py --compare`
+#: replays a real season through both. At 15 minutes the ladder makes 36%
+#: fewer calls and, if every scheduled run fires, produces closing lines
+#: indistinguishable from these -- 1.0 minutes before tip either way. The
+#: saving is entirely insurance. Allow 5% of runs to miss, which is ordinary
+#: for a scheduled task on a machine that sleeps, and the narrow ladder leaves
+#: 5.2% of tips with a stale close against 0.2%, its worst close sliding from
+#: 26 minutes early to 89. A price from 89 minutes out is not a close, and CLV
+#: measured against one is not CLV. The second capture inside this window is
+#: the retry; it is doing its job on exactly the nights nothing looks wrong.
 CAPTURE_LADDER = ((30, 10), (180, 90), (1800, 720))
 
 

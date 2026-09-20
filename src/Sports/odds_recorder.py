@@ -188,7 +188,15 @@ def upcoming(conn: sqlite3.Connection, hours: int = 30) -> List[Tuple[str, str]]
 
 
 def should_capture(conn: sqlite3.Connection) -> Tuple[bool, str]:
-    """The whole point of the schedule-aware design lives here."""
+    """The whole point of the schedule-aware design lives here.
+
+    The 30-minute closing window is deliberately wide enough that two runs
+    fall inside it, and that redundancy must not be traded away for credits.
+    `forecast_odds_credits.py --compare` measures the trade: halving the
+    window saves a third of the calls and changes nothing at all while every
+    scheduled run fires, then loses 5% of closing lines the moment one in
+    twenty does not. The second capture is the retry.
+    """
     games = upcoming(conn, hours=30)
     if not games:
         return False, "no game kicks off in the next 30 hours"

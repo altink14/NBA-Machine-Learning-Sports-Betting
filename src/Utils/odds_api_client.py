@@ -63,6 +63,40 @@ def get_api_key() -> str:
     return key
 
 
+def fetch_nba_events(
+    api_key: Optional[str] = None,
+    timeout: int = 30,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
+    """The schedule, for free.
+
+    /events returns every upcoming event with its commence_time and costs
+    NOTHING -- the API's own docs say it "does not count against the usage
+    quota", and a live check on 2026-09-19 confirmed it: x-requests-last was 0
+    and remaining did not move.
+
+    That is what makes a schedule-aware recorder possible. We can ask "is a
+    game about to tip?" as often as we like, and spend credits only when the
+    answer is yes. The alternative, and what this module did before, is a blind
+    loop that pays full price to discover there is nothing to watch.
+    """
+    resp = requests.get(
+        f"{ODDS_API_BASE}/sports/{SPORT_KEY}/events",
+        params={"apiKey": api_key or get_api_key()},
+        timeout=timeout,
+    )
+    quota = {
+        "remaining": resp.headers.get("x-requests-remaining"),
+        "used": resp.headers.get("x-requests-used"),
+        "last": resp.headers.get("x-requests-last"),
+    }
+    if resp.status_code == 401:
+        raise OddsApiError("The Odds API rejected the key (401). Check ODDS_API_KEY.")
+    if resp.status_code == 429:
+        raise OddsApiError(f"The Odds API quota is exhausted (429). Remaining={quota['remaining']}.")
+    resp.raise_for_status()
+    return resp.json(), quota
+
+
 def fetch_nba_odds(
     api_key: Optional[str] = None,
     markets: str = DEFAULT_MARKETS,

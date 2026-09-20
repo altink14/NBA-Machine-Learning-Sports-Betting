@@ -76,6 +76,17 @@ LOG_DIR = os.path.join(REPO_ROOT, "logs")
 JOBS = {
     "frequent": [
         ("odds recorder (NFL)", ["src/Sports/odds_recorder.py", "--sport", "nfl"]),
+        # NBA added 2026-09-20, a month before opening night, so the machinery
+        # is proven boring before it matters. Nothing scheduled ran the NBA
+        # recorder at all: daily_update took one board snapshot a morning,
+        # which is an archive entry, not a closing line. On opening night that
+        # would have meant no closing price for any game.
+        #
+        # Safe to add this early because the recorder checks the schedule
+        # first and that check is free. Through the offseason every run costs
+        # 0 credits and logs "nearest tip is N hours away"; it starts spending
+        # only when a game is genuinely close.
+        ("odds recorder (NBA)", ["snapshot_odds_api.py"]),
     ],
     "hourly": [
         ("injury recorder (NFL)", ["src/Sports/nfl/poll_injuries.py"]),

@@ -78,6 +78,20 @@ logger = logging.getLogger("snapshot_odds_api")
 
 DB_PATH = os.path.join(REPO_ROOT, "Data", "OddsData.sqlite")
 
+#: Stop capturing when the month's remaining credits fall this low.
+#:
+#: NBA and NFL share one API key. From 20 October both recorders run on the
+#: same 15-minute job, and an NBA night is the heavier of the two -- games
+#: cluster into a few tip times, so the closing window fires repeatedly. With
+#: no floor, a busy basketball week could drain the month and leave the NFL
+#: silently uncaptured on the Sunday, which is the expensive failure: NFL
+#: closing lines feed a ledger that is already live.
+#:
+#: The NFL recorder has had a floor of 60 from the start; this matches it, so
+#: whichever sport hits the wall first leaves the same reserve for the other.
+#: --force overrides, for when a human decides one slate matters more.
+QUOTA_FLOOR = 60
+
 #: (minutes until the nearest tip, minimum minutes between captures).
 #: Checked in order; the first window the nearest tip falls into wins.
 CAPTURE_LADDER = ((30, 10), (180, 90), (1800, 720))
@@ -156,6 +170,17 @@ def main() -> int:
                 if not ok:
                     logger.info("skipping: %s (%d event(s) on the board, schedule check "
                                 "cost %s credits)", why, len(events), eq.get("last") or "0")
+                    if not args.loop:
+                        return 0
+                    time.sleep(args.loop * 60)
+                    continue
+                remaining = eq.get("remaining")
+                if remaining is not None and int(remaining) < QUOTA_FLOOR and not args.force:
+                    logger.warning(
+                        "NOT capturing despite %s: only %s credits remain, below the floor of "
+                        "%d. The reserve is held so the other sport's recorder is not starved "
+                        "by this one -- they share a key. Raise the tier or wait for the reset.",
+                        why, remaining, QUOTA_FLOOR)
                     if not args.loop:
                         return 0
                     time.sleep(args.loop * 60)

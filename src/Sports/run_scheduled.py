@@ -73,6 +73,17 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 PY = os.path.join(REPO_ROOT, "venv", "Scripts", "python.exe")
 LOG_DIR = os.path.join(REPO_ROOT, "logs")
 
+
+def _nfl_season(today=None) -> int:
+    """The season nflverse would call today's games.
+
+    A season is named for the year it kicked off in, and it runs into
+    February, so January and February belong to the year before them.
+    """
+    d = today or datetime.now(timezone.utc).date()
+    return d.year - 1 if d.month <= 2 else d.year
+
+
 JOBS = {
     "frequent": [
         ("odds recorder (NFL)", ["src/Sports/odds_recorder.py", "--sport", "nfl"]),
@@ -93,6 +104,40 @@ JOBS = {
         ("predictions (NFL)", ["src/Sports/nfl/predict.py"]),
     ],
     "daily": [
+        # FIRST, because everything below it grades, seals or prices against
+        # a final score, and until 2026-09-21 nothing in any scheduled job
+        # fetched one. The ledger had fourteen finished games sitting at
+        # `pending_past_kickoff` and would have sat there all season: the
+        # grader was working perfectly and being handed a table in which no
+        # 2026 game had ever finished. The rehearsal could not catch this --
+        # it grades archive games, which already have their scores.
+        #
+        # nflverse refreshes the schedules release daily and the ingest is
+        # idempotent (INSERT OR REPLACE on a natural key), so re-running it
+        # every morning costs one download and converges on the truth.
+        #
+        # The season is derived, not typed. An NFL season carries the year it
+        # kicked off in, so January and February belong to the season before
+        # them; hardcoding "2026" would have quietly ingested the wrong year
+        # from 1 January and nobody would have noticed until the ledger
+        # stopped grading again.
+        ("ingest results (NFL)", ["src/Sports/nfl/ingest_games.py",
+                                  "--season", str(_nfl_season())]),
+        # The same gap one layer down, found by the validator the moment the
+        # step above started marking games final: week 2 had play-by-play for
+        # one game out of fifteen. Nothing was keeping the current season's
+        # plays current either.
+        #
+        # --force is needed because the ingest skips a season it already
+        # holds, and the current season is always one we already hold and
+        # always incomplete. It is safe: every write is INSERT OR REPLACE on
+        # (game_id, sequence), nothing is deleted, so a half-finished run
+        # simply leaves the rest for tomorrow. The whole season re-ingests in
+        # about 4 seconds off a 10 MB file in September, growing to ~100 MB
+        # by January, which is still cheaper than tracking which games are
+        # new.
+        ("ingest play-by-play (NFL)", ["src/Sports/nfl/ingest_pbp.py",
+                                       "--season", str(_nfl_season()), "--force"]),
         ("grade ledger (NFL)", ["src/Sports/nfl/predict.py", "--grade"]),
         # Repair before the seal, so anything rebuilt tonight is sealed by the
         # step after it as well as by the repair's own seal.
@@ -103,6 +148,36 @@ JOBS = {
         ("closing line value (NFL)", ["src/Sports/nfl/predict.py", "--clv"]),
     ],
 }
+
+
+def _tail(result: subprocess.CompletedProcess, lines: int = 2) -> list:
+    """The last couple of lines a job said, wherever it said them.
+
+    This used to read `stdout` only, and every one of these jobs reports
+    through `logging`, which writes to STDERR. So the tail was always empty
+    and every run logged a bare "ok". On 2026-09-21 that hid a real failure
+    for a full day: the grader was returning `still_pending: 31` with
+    fourteen finished games waiting, and the daily log said "grade ledger
+    (NFL): ok" exactly as it does on a good morning.
+
+    A monitoring line that cannot distinguish success from doing nothing is
+    worse than no monitoring line, because it is trusted. Read both streams,
+    prefer whichever carried the substance, and drop the timestamp prefix so
+    the message survives the wrapper's own formatting.
+    """
+    for stream in (result.stderr, result.stdout):
+        got = [ln.strip() for ln in (stream or "").strip().split("\n") if ln.strip()]
+        if got:
+            return [_strip_stamp(ln) for ln in got[-lines:]]
+    return []
+
+
+def _strip_stamp(line: str) -> str:
+    """Drop a leading '2026-09-21 09:30:02,081 - INFO - ' if there is one."""
+    for sep in (" - INFO - ", " - WARNING - ", " - ERROR - "):
+        if sep in line:
+            return line.split(sep, 1)[1]
+    return line
 
 
 def main() -> int:
@@ -127,7 +202,7 @@ def main() -> int:
         try:
             r = subprocess.run([PY] + argv, cwd=REPO_ROOT, capture_output=True,
                                text=True, timeout=900, encoding="utf-8", errors="replace")
-            tail = [ln for ln in (r.stdout or "").strip().split("\n") if ln][-2:]
+            tail = _tail(r)
             if r.returncode == 0:
                 logger.info("%s: ok%s", name, (" | " + " | ".join(tail)) if tail else "")
             else:

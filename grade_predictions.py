@@ -64,6 +64,10 @@ _CLV_COLUMNS = [
     ("closing_away_ml", "REAL"),
     ("closing_captured_at", "TEXT"),
     ("closing_minutes_before_tip", "REAL"),
+    # Whether the close we settled against is a price we watched or one
+    # rebuilt from a vendor archive. Pooling the two and publishing the
+    # average is the mistake this column exists to make impossible.
+    ("closing_provenance", "TEXT"),
     ("clv", "REAL"),
 ]
 
@@ -109,6 +113,12 @@ def price_clv(odds_db: str = None) -> dict:
 
     Only predictions whose game has actually started are priced: before tip
     there is no close, whatever the newest snapshot says.
+
+    WHICH PRICE, AND WHOSE. The close is the same book's last price before
+    tip -- never a better one from a book we did not log -- and each row
+    records `closing_provenance` so a CLV settled against a rebuilt price is
+    never pooled with one settled against a price we watched. Report the two
+    apart or not at all.
     """
     odds_db = odds_db or ODDS_DB
     if not os.path.exists(odds_db):
@@ -128,11 +138,22 @@ def price_clv(odds_db: str = None) -> dict:
             if not tip or tip > now:
                 counts["not_started"] += 1
                 continue
+            # Latest price before tip, and where two share a timestamp the
+            # one we watched wins. Ordering by captured_at alone was fine
+            # while the live recorder was the only writer; a repair inserts
+            # reconstructed rows today carrying last week's captured_at, and
+            # an arbitrary tiebreak would let a rebuilt price outrank a
+            # watched one. Same rule as odds_recorder.seal().
             close = conn.execute(
-                "SELECT captured_at, home_ml, away_ml FROM odds_snapshots "
+                "SELECT captured_at, home_ml, away_ml, "
+                "COALESCE(provenance, 'observed') AS provenance FROM odds_snapshots "
                 "WHERE game_key = ? AND sportsbook = ? AND captured_at < ? "
                 "AND home_ml IS NOT NULL AND away_ml IS NOT NULL "
-                "ORDER BY captured_at DESC LIMIT 1",
+                "ORDER BY captured_at DESC, "
+                "         CASE COALESCE(provenance, 'observed') "
+                "              WHEN 'observed' THEN 0 ELSE 1 END, "
+                "         id DESC "
+                "LIMIT 1",
                 (r["game_key"], r["sportsbook"], tip),
             ).fetchone()
             if not close:
@@ -153,9 +174,10 @@ def price_clv(odds_db: str = None) -> dict:
                 gap = None
             conn.execute(
                 "UPDATE predictions_log SET closing_home_ml=?, closing_away_ml=?, "
-                "closing_captured_at=?, closing_minutes_before_tip=?, clv=? WHERE id=?",
+                "closing_captured_at=?, closing_minutes_before_tip=?, "
+                "closing_provenance=?, clv=? WHERE id=?",
                 (close["home_ml"], close["away_ml"], close["captured_at"], gap,
-                 (d_ours / d_theirs) - 1.0, r["id"]),
+                 close["provenance"], (d_ours / d_theirs) - 1.0, r["id"]),
             )
             counts["priced"] += 1
         conn.commit()

@@ -173,6 +173,12 @@ def american_to_decimal(price: Optional[int]) -> Optional[float]:
     return 1.0 + (price / 100.0 if price > 0 else 100.0 / -price)
 
 
+#: Strongest kind of closing price first. A price we watched beats one we
+#: bought back out of an archive, which beats a consensus number that names
+#: no book and no time. CLV is only settled inside the best tier available
+#: for that game and market -- see apply_clv.
+_PROVENANCE_ORDER = ("observed", "reconstructed", "third_party")
+
 #: Which closing price settles which side of which market.
 _SIDE_COLUMN = {
     ("moneyline", "home"): "price_home", ("moneyline", "away"): "price_away",
@@ -209,16 +215,31 @@ def apply_clv(conn: sqlite3.Connection,
     average.
 
     ONLY AFTER KICKOFF. A prediction whose game has not started is skipped.
-    `is_closing` alone is not proof of a close: the nflverse schedule file
-    carries lines for scheduled games and our ingest marks them closing, so
-    the flag can be true days before there is anything to close. Time is the
-    check that cannot be wrong.
+    The ingest no longer flags a scheduled game's line as closing -- it did
+    until 2026-09-19, which is how this check earned its keep -- but the time
+    test stays, because `is_closing` is a flag somebody sets and a kickoff
+    time is a fact about the world. Of the two, trust the one that cannot be
+    set wrong.
 
     WHICH BOOK CLOSES IT. `closes` maps (game_id, market_type) to every book
     that closed that market. We settle against the BEST close for the side we
     backed -- the longest price still available at the bell. That is the
     conservative choice, not a generous one: a better closing price makes our
     CLV smaller, so picking a worse book would flatter the number for free.
+
+    BUT ONLY WITHIN ONE PROVENANCE. "Best price" ranks books against each
+    other; it must not rank a price we watched against one we did not. Once
+    the results ingest runs, nflverse publishes a consensus closing line for
+    every finished game -- no book, no capture time -- alongside the nine real
+    books we polled a minute before kickoff. Whenever that consensus number
+    happened to be the longest, it would win, and the CLV for that game would
+    quietly stop being a claim about a price anyone could have taken.
+
+    So the candidates are tiered: observed, then reconstructed, then
+    third_party. We use the best price inside the best tier that has one, and
+    never mix. A run of games would otherwise flip between provenances on the
+    accident of which number was longer, and the average of that is not a
+    quantity with a meaning.
 
     Rows already carrying a clv are left alone: like grading, this settles
     once.
@@ -252,10 +273,15 @@ def apply_clv(conn: sqlite3.Connection,
         dec_taken = american_to_decimal(taken)
         best = None
         if col and dec_taken is not None:
-            for cand in candidates:
-                dec = american_to_decimal(cand.get(col))
-                if dec is not None and dec > 1.0 and (best is None or dec > best[0]):
-                    best = (dec, cand)
+            for tier in _PROVENANCE_ORDER:
+                for cand in candidates:
+                    if (cand.get("provenance") or "observed") != tier:
+                        continue
+                    dec = american_to_decimal(cand.get(col))
+                    if dec is not None and dec > 1.0 and (best is None or dec > best[0]):
+                        best = (dec, cand)
+                if best is not None:
+                    break       # a weaker kind of price never displaces a stronger one
         if best is None:
             counts["no_close"] += 1
             continue

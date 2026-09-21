@@ -303,7 +303,11 @@ def _odds_snapshot_conn():
             home_ml REAL,
             away_ml REAL,
             ou_line REAL,
-            game_start_time_utc TEXT
+            game_start_time_utc TEXT,
+            -- observed | reconstructed | third_party. See _EXTRA_COLUMNS in
+            -- src/Utils/odds_api_client.py, which owns this taxonomy and the
+            -- trigger that enforces it.
+            provenance TEXT NOT NULL DEFAULT 'observed'
         )
         """
     )
@@ -342,8 +346,8 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
                 conn.execute(
                     """
                     INSERT INTO odds_snapshots
-                        (captured_at, sport, sportsbook, game_key, home_team, away_team, home_ml, away_ml, ou_line, game_start_time_utc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (captured_at, sport, sportsbook, game_key, home_team, away_team, home_ml, away_ml, ou_line, game_start_time_utc, provenance)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'observed')
                     """,
                     (captured_at, sport, sportsbook, game_key, home_team, away_team, home_ml, away_ml, ou_line, start_str)
                 )

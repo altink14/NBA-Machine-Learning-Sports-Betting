@@ -46,7 +46,37 @@ _EXTRA_COLUMNS = [
     ("spread_away_price", "REAL"),
     ("ou_over_price", "REAL"),        # American juice on the over/under
     ("ou_under_price", "REAL"),
+    # How we came to know this price. 'observed' = this recorder read it off
+    # the live board at captured_at; 'reconstructed' = pulled out of The Odds
+    # API's historical archive after a missed run. captured_at means "when the
+    # price was true" either way, and provenance is the difference between
+    # "we watched this" and "a vendor says it existed".
+    #
+    # The NFL side has carried this since it was built. The NBA -- which is
+    # the product -- did not, so a repaired snapshot would have been
+    # indistinguishable from a watched one in exactly the table the public
+    # track record's CLV is computed from. Added 2026-09-21, before the
+    # season, while there is nothing to get wrong.
+    ("provenance", "TEXT NOT NULL DEFAULT 'observed'"),
 ]
+
+#: Every row already in the table was written by the live recorder, so
+#: 'observed' is the truth for all of them, not a guess. Nothing has ever
+#: written a reconstructed NBA snapshot: the repair path is NFL-only today.
+_PROVENANCE_BACKFILL = (
+    "UPDATE odds_snapshots SET provenance = 'observed' WHERE provenance IS NULL")
+
+#: Refuse anything outside the taxonomy. NULL is checked explicitly because
+#: `NULL NOT IN (...)` is NULL, not true, and would sail through.
+_PROVENANCE_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS odds_snapshots_provenance_valid
+BEFORE INSERT ON odds_snapshots
+WHEN NEW.provenance IS NULL
+  OR NEW.provenance NOT IN ('observed', 'reconstructed', 'third_party')
+BEGIN
+  SELECT RAISE(ABORT, 'odds_snapshots.provenance must be observed, reconstructed or third_party');
+END;
+"""
 
 
 class OddsApiError(RuntimeError):
@@ -190,12 +220,17 @@ def events_to_rows(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def ensure_snapshot_schema(conn: sqlite3.Connection) -> None:
-    """Additive migration: the five price/spread columns, if missing."""
+    """Additive migration: the price/spread columns and provenance, if missing."""
     existing = {r[1] for r in conn.execute("PRAGMA table_info(odds_snapshots)")}
+    if not existing:
+        return                      # no table yet; the creator will make it
     for col, ctype in _EXTRA_COLUMNS:
         if col not in existing:
             conn.execute(f"ALTER TABLE odds_snapshots ADD COLUMN {col} {ctype}")
             logger.info("odds_snapshots: added column %s", col)
+    conn.execute(_PROVENANCE_BACKFILL)
+    conn.execute(_PROVENANCE_TRIGGER)
+    conn.commit()
 
 
 _CHANGE_FIELDS = [
@@ -227,8 +262,9 @@ def write_snapshot_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]],
         conn.execute(
             "INSERT INTO odds_snapshots (captured_at, sport, sportsbook, game_key, home_team, "
             "away_team, home_ml, away_ml, ou_line, game_start_time_utc, spread_home, "
-            "spread_home_price, spread_away_price, ou_over_price, ou_under_price) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "spread_home_price, spread_away_price, ou_over_price, ou_under_price, "
+            "provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'observed')",
             (
                 captured_at, sport, row["sportsbook"], row["game_key"], row["home_team"],
                 row["away_team"], row["home_ml"], row["away_ml"], row["ou_line"],

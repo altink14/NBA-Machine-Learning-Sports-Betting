@@ -627,7 +627,14 @@ class PredictionRunner:
         self.sport = sport
         self.project_root = os.path.dirname(os.path.abspath(__file__))
         self.team_stats_df = self._load_team_stats()
+        self.team_game_dates = self._last_game_dates()
         self.schedule_df = self._load_schedule()
+        if not self.team_game_dates:
+            logger.warning(
+                "Days-Rest is falling back to the schedule CSV because no game dates "
+                "could be read from the archive. That file is refreshed by hand once a "
+                "season, so if it predates the current one every team will look fully "
+                "rested in every game. Check Data/TeamData.sqlite.")
         self.odds_provider = SbrOddsProvider(sportsbook=self.sportsbook, sport=self.sport)
         # The provider falls back from NBA to WNBA out of season; record what it
         # actually scraped so snapshots and the prediction log are labeled truthfully.
@@ -674,8 +681,62 @@ class PredictionRunner:
             logger.error(f"Failed to load team stats from database: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Server configuration error: Could not load team stats.")
 
+    def _last_game_dates(self):
+        """{team full name: [game dates]} from the archive, most recent first.
+
+        WHY NOT THE SCHEDULE CSV. Days-Rest used to be read out of the newest
+        `Data/nba-*-UTC.csv`, which is a file a human drops in once a year.
+        On 2026-09-21 the newest was the 2025-26 season, ending 13 April 2026.
+        Nothing would have added the 2026-27 file, so on opening night every
+        team's last game would have been found six months earlier, the value
+        clipped to MAX_DAYS_REST, and the model handed a constant 7 for both
+        sides of every game for the whole season. Silently: a stale CSV
+        produces a plausible number, not an error.
+
+        The archive does not have that problem. `box_scores` is updated by the
+        daily backfill, covers every season we hold, and is the same source
+        `candidate_live._rest_vectors` already uses for back-to-backs and
+        3-in-4s. Two places computing rest from two sources was the smell.
+
+        Loaded once per runner and cached: a slate is a handful of games and
+        this is a few thousand rows.
+        """
+        try:
+            conn = get_db_conn()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT m.full_name AS team, b.game_date AS d
+                    FROM box_scores b
+                    JOIN team_metadata m
+                      ON m.team_id = b.home_team_id OR m.team_id = b.away_team_id
+                    WHERE b.game_date IS NOT NULL
+                    ORDER BY b.game_date DESC
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error("Could not load game dates for days-rest: %s", e)
+            return None
+        # `box_scores.game_date` is already the NBA (US Eastern) calendar date
+        # as a plain 'YYYY-MM-DD' string. It must NOT go through to_nba_date,
+        # which reads a bare date as UTC midnight and converts it back an hour
+        # or five, landing every game on the previous day.
+        out: Dict[str, List[Any]] = {}
+        for r in rows:
+            raw = r["d"]
+            try:
+                d = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                continue
+            out.setdefault(r["team"], []).append(d)
+        return out or None
+
     def _load_schedule(self):
-        # Use the most recent season's schedule file (nba-<year>-UTC.csv)
+        # Kept only as a fallback for days-rest when the archive cannot be
+        # read. It is a per-season file nobody refreshes, so it must never be
+        # the primary source again -- see _last_game_dates.
         schedule_files = sorted(glob.glob(os.path.join(self.project_root, 'Data', 'nba-*-UTC.csv')), reverse=True)
         if not schedule_files:
             logger.error("No schedule file (Data/nba-*-UTC.csv) found.")
@@ -703,7 +764,20 @@ class PredictionRunner:
         previous implementation compared UTC timestamps against a naive local clock,
         which made the answer depend on the server's timezone and the hour of the call.
         """
-        if self.schedule_df is None or game_date is None:
+        if game_date is None:
+            return DEFAULT_DAYS_REST
+
+        # The archive first: it is current because the backfill keeps it so.
+        played_dates = (self.team_game_dates or {}).get(team)
+        if played_dates:
+            # Sorted descending, so the first date before this game is the
+            # most recent one. A game never contributes to its own rest.
+            for d in played_dates:
+                if d < game_date:
+                    return (game_date - d).days
+            return DEFAULT_DAYS_REST
+
+        if self.schedule_df is None:
             return DEFAULT_DAYS_REST
         if 'GameDateET' not in self.schedule_df.columns:
             return DEFAULT_DAYS_REST

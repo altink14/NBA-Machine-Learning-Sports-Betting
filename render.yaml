@@ -1,7 +1,11 @@
-# Render blueprint — free-tier deployment.
-# Free instances have no persistent disk and sleep after 15 idle minutes;
-# bootstrap_db.py re-downloads the 47MB database snapshot on every boot,
-# so no disk is needed. Upgrade to a paid instance later to kill cold starts.
+# Render blueprint.
+# WARNING (2026-09-22): this targets the free plan, which has no persistent
+# disk and sleeps after 15 idle minutes, so bootstrap_db.py re-downloads the
+# whole snapshot on every wake. That was tolerable when the snapshot was
+# 47 MB. TeamData.sqlite is now 2.93 GB and the published snapshot is a
+# 349 MB archive from 9 August that predates the served model's supporting
+# data. Re-publish the snapshot (DEPLOY.md section 3) and move to a plan
+# with a >=4 GB volume before treating this file as a working deployment.
 services:
   - type: web
     name: bettingbuddy-api
@@ -16,5 +20,9 @@ services:
         value: "8000"
       - key: DEFAULT_SPORTSBOOK
         value: fanduel
+      # Pay the ~1-2 minute model load at boot rather than on the first
+      # prediction request, which a gateway would time out first.
+      - key: WARM_MODEL_ON_START
+        value: "true"
       # Set CORS_ORIGINS to your Vercel URL in the Render dashboard after
       # the frontend deploys, e.g. https://bettingbuddy.vercel.app

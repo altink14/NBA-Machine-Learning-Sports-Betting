@@ -79,6 +79,33 @@ Two services: this repo (FastAPI backend) → **Railway**, the frontend
    `https://<vercel-url>/api/webhooks/stripe` (new signing secret →
    update `STRIPE_WEBHOOK_SECRET` in Vercel).
 
+## 2b. Sync the Stripe catalogue BEFORE taking any money
+
+Checked 2026-09-22: `products` and `prices` in Supabase are **empty**, and
+`subscriptions.price_id` has a validated, non-deferrable foreign key to
+`prices.id`. The only things that fill those tables are the webhook's
+`product.created` / `price.created` handlers, and **Stripe does not re-fire
+creation events for objects that already existed when a webhook endpoint is
+registered.**
+
+So the first real sale would go: checkout succeeds, card is charged, Stripe
+sends `customer.subscription.created`, the upsert hits a foreign key violation,
+no subscription row is written, `isUserSubscribed()` returns false — a paying
+customer with no access, and Stripe retrying the webhook for days.
+
+After the frontend deploys, set `ADMIN_SYNC_SECRET` (32+ random chars) in
+Vercel, then run once:
+
+```
+curl -X POST https://<vercel-url>/api/admin/sync-stripe-catalog   -H "x-admin-secret: $ADMIN_SYNC_SECRET"
+```
+
+It returns `{"synced":{"products":N,"prices":M},"ok":true}`. It is idempotent —
+re-run it whenever you add a product or price in the Stripe dashboard. With the
+secret unset the route refuses, so an unconfigured deploy cannot expose it.
+
+Verify before selling: `select count(*) from prices;` should be non-zero.
+
 ## 3. Data freshness in production (read this)
 
 **stats.nba.com blocks most cloud-datacenter IPs**, so the daily backfill

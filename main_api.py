@@ -50,6 +50,7 @@ from src.Utils import LineupEngine as lineup_engine
 from src.Utils import ShotQuality as shot_quality
 from src.Utils import Officials as officials_engine
 from src.Utils import Market as market_engine
+from src.Sports.nfl import market as nfl_market
 from src.Utils import DailyGame as daily_game
 from src.Utils import BuildLab as build_lab
 _buildlab_era_cache: dict = {}
@@ -9346,6 +9347,78 @@ def get_model_backtest():
         )
     _backtest_summary_cache["summary"] = summary
     return summary
+
+# --- NFL ---------------------------------------------------------------------
+# The first endpoints that make any of the NFL archive reachable from the site.
+# It has held 7,548 games and closing lines back to 1999 since 17 September and
+# none of it has ever been served.
+#
+# Read-only, and pointed at a different database from every NBA endpoint, so
+# nothing here can write to the archive the scheduled jobs depend on.
+NFL_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data', 'NflData.sqlite')
+
+_nfl_market_cache: Dict[tuple, Any] = {}
+
+
+def _nfl_read_conn():
+    conn = sqlite3.connect(f"file:{NFL_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.get("/api/nfl/market/seasons")
+def get_nfl_market_seasons():
+    """Which seasons the market pages can serve, and what is withheld and why.
+
+    2026 is the sealed holdout for the NFL model and is deliberately absent;
+    the payload says so rather than letting the gap look like missing data.
+    """
+    key = ("seasons",)
+    if key in _nfl_market_cache:
+        return _nfl_market_cache[key]
+    conn = _nfl_read_conn()
+    try:
+        result = nfl_market.available_seasons(conn)
+    finally:
+        conn.close()
+    _nfl_market_cache[key] = result
+    return result
+
+
+@app.get("/api/nfl/market/season/{season}")
+def get_nfl_season_market(season: int, season_type: str = "REG"):
+    """Every team's straight-up, against-the-spread and over/under record."""
+    if season_type not in nfl_market.SEASON_TYPE_GROUPS:
+        raise HTTPException(status_code=422, detail="season_type must be REG or POST")
+    key = ("season", season, season_type)
+    if key in _nfl_market_cache:
+        return _nfl_market_cache[key]
+    conn = _nfl_read_conn()
+    try:
+        result = nfl_market.season_market(conn, season, season_type)
+    finally:
+        conn.close()
+    _nfl_market_cache[key] = result
+    return result
+
+
+@app.get("/api/nfl/market/splits")
+def get_nfl_line_splits(season_from: int = None, season_to: int = None,
+                        season_type: str = "REG"):
+    """How favourites of each spread size actually did, over a range of seasons."""
+    if season_type not in nfl_market.SEASON_TYPE_GROUPS:
+        raise HTTPException(status_code=422, detail="season_type must be REG or POST")
+    key = ("splits", season_from, season_to, season_type)
+    if key in _nfl_market_cache:
+        return _nfl_market_cache[key]
+    conn = _nfl_read_conn()
+    try:
+        result = nfl_market.line_splits(conn, season_from, season_to, season_type)
+    finally:
+        conn.close()
+    _nfl_market_cache[key] = result
+    return result
+
 
 # --- Live scoreboard (official NBA live CDN; cheap, cached, keyless by design) ---
 @app.get("/api/live/scoreboard")

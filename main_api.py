@@ -589,6 +589,62 @@ DEFAULT_DAYS_REST = 7          # used when a team has no earlier game on record
 MIN_DAYS_REST = 1
 MAX_DAYS_REST = 7
 
+
+def _canonical_team(name: str) -> str:
+    """One spelling per franchise, borrowed from the training pipeline.
+
+    Three sources name the same team three ways: the archive says
+    'Los Angeles Clippers', the team-stats snapshot and the odds feed say
+    'LA Clippers', and the 1996-2001 box scores say 'Washington Bullets' and
+    'Vancouver Grizzlies'. `retrain_features.normalize_team` already owns that
+    mapping and is what the model itself uses, so this defers to it rather
+    than starting a fourth opinion.
+
+    Unknown names pass through unchanged: this is a lookup key, not a
+    validator, and a miss here should degrade to "no rest on record" rather
+    than take down a slate.
+    """
+    normalize_team = _load_normalize_team()
+    if normalize_team is None:
+        return name
+    try:
+        return normalize_team(name)
+    except KeyError:
+        return name
+
+
+_normalize_team_fn = None
+_normalize_team_tried = False
+
+
+def _load_normalize_team():
+    """Load retrain_features.normalize_team once. The directory has a hyphen,
+    so it cannot be a package; load it by path the way candidate_live does."""
+    global _normalize_team_fn, _normalize_team_tried
+    if _normalize_team_tried:
+        return _normalize_team_fn
+    _normalize_team_tried = True
+    try:
+        import importlib.util
+        import sys                      # main_api does not import sys at module scope
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'src', 'Process-Data', 'retrain_features.py')
+        spec = importlib.util.spec_from_file_location('retrain_features_for_api', path)
+        mod = importlib.util.module_from_spec(spec)
+        # Must be registered BEFORE exec_module: the module defines dataclasses,
+        # and @dataclass resolves its own __module__ out of sys.modules while
+        # the class body is being processed. Without this it dies with a bare
+        # AttributeError on NoneType, which is what candidate_live._load_module
+        # has always known and this copy did not.
+        sys.modules['retrain_features_for_api'] = mod
+        spec.loader.exec_module(mod)
+        _normalize_team_fn = mod.normalize_team
+    except Exception as e:
+        logger.warning("Could not load normalize_team (%s); team names will be "
+                       "compared raw, which misses the Clippers.", e)
+        _normalize_team_fn = None
+    return _normalize_team_fn
+
 try:
     from zoneinfo import ZoneInfo
     _NBA_TZ = ZoneInfo("America/New_York")
@@ -723,6 +779,13 @@ class PredictionRunner:
         # as a plain 'YYYY-MM-DD' string. It must NOT go through to_nba_date,
         # which reads a bare date as UTC midnight and converts it back an hour
         # or five, landing every game on the previous day.
+        #
+        # Keyed by the CANONICAL name, because the sources disagree: the
+        # archive says 'Los Angeles Clippers' and both the team-stats snapshot
+        # and the odds feed say 'LA Clippers'. Looking up the raw name would
+        # have missed that team and quietly dropped it back to the stale
+        # schedule CSV -- one team out of thirty, with no error, which is the
+        # same shape of bug this whole function exists to remove.
         out: Dict[str, List[Any]] = {}
         for r in rows:
             raw = r["d"]
@@ -730,7 +793,7 @@ class PredictionRunner:
                 d = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
             except (TypeError, ValueError):
                 continue
-            out.setdefault(r["team"], []).append(d)
+            out.setdefault(_canonical_team(r["team"]), []).append(d)
         return out or None
 
     def _load_schedule(self):
@@ -768,7 +831,7 @@ class PredictionRunner:
             return DEFAULT_DAYS_REST
 
         # The archive first: it is current because the backfill keeps it so.
-        played_dates = (self.team_game_dates or {}).get(team)
+        played_dates = (self.team_game_dates or {}).get(_canonical_team(team))
         if played_dates:
             # Sorted descending, so the first date before this game is the
             # most recent one. A game never contributes to its own rest.

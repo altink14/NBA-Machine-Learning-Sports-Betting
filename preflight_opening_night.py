@@ -164,6 +164,31 @@ def check_days_rest(today: date) -> None:
               f"{this_season} game(s) — if this stays 0 after games are played, the "
               "backfill is not running and rest will be wrong all season")
 
+    # The names the runner will actually be handed come from the team-stats
+    # snapshot, and the archive spells one of them differently: 'LA Clippers'
+    # there, 'Los Angeles Clippers' here. Every one has to land on real rest,
+    # or that team quietly drops to the stale-CSV path on its own.
+    try:
+        import main_api
+        import pandas as pd
+        conn = sqlite3.connect(f"file:{TEAM_DB}?mode=ro", uri=True)
+        newest = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '202%' "
+            "ORDER BY name DESC LIMIT 1").fetchone()[0]
+        names = [r[0] for r in conn.execute(f'SELECT TEAM_NAME FROM "{newest}"')]
+        conn.close()
+        keyed = main_api.PredictionRunner._last_game_dates(
+            type("_", (), {"project_root": REPO_ROOT})()) or {}
+        unresolved = [n for n in names if main_api._canonical_team(n) not in keyed]
+    except Exception as e:
+        unresolved = None
+        check("every team the feed can name has rest history", BAD, str(e)[:140])
+    if unresolved is not None:
+        check("every team the feed can name has rest history",
+              OK if not unresolved else BAD,
+              f"{len(names)} names, all resolved" if not unresolved
+              else f"no rest history for: {', '.join(unresolved)}")
+
     csvs = sorted(glob.glob(os.path.join(REPO_ROOT, "Data", "nba-*-UTC.csv")), reverse=True)
     newest = os.path.basename(csvs[0]) if csvs else None
     check("the schedule CSV is only a fallback now", OK,

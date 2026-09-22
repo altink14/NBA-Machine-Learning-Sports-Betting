@@ -28,6 +28,7 @@ Register with:
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import date
@@ -220,6 +221,45 @@ def snapshot_odds_board() -> str:
         return "failed"
 
 
+def run_preflight() -> int:
+    """Check the configuration opening night depends on, and say what is wrong.
+
+    WHY THIS RUNS EVERY MORNING. The sealed candidate model stopped loading on
+    22 August 2026 and nobody noticed for a month, because the only symptom was
+    a fallback to the old model that logged once per process. A check nobody
+    runs is a check that does not exist, and the one thing guaranteed to run
+    daily is this job.
+
+    NON-FATAL BY DESIGN. It reports; it does not decide. Most of what it looks
+    at is upstream of grading and ingest, so failing the whole task on a
+    preflight finding would hide a working night's work behind a warning. The
+    count goes in the log either way, and a non-zero "wrong" is loud.
+
+    Returns the number of wrong checks, or -1 if the preflight itself failed.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "preflight_opening_night.py")],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=900,
+            encoding="utf-8", errors="replace")
+        tail = [ln for ln in (r.stdout or "").strip().split("\n") if ln.strip()]
+        # The counts line ("18 pass, 4 not yet, 0 wrong"), not the prose line
+        # after it -- both contain the word "wrong".
+        summary = next((ln.strip() for ln in reversed(tail)
+                        if re.match(r"^\d+ pass,", ln.strip())), "")
+        if r.returncode == 0:
+            logger.info("Preflight: %s", summary or "clean")
+            return 0
+        logger.error("Preflight found problems — %s", summary or "see below")
+        for line in tail:
+            if line.strip().startswith("WRONG"):
+                logger.error("  %s", line.strip())
+        return sum(1 for ln in tail if ln.strip().startswith("WRONG")) or 1
+    except Exception as exc:
+        logger.error("Preflight could not run: %s", exc, exc_info=True)
+        return -1
+
+
 def main() -> int:
     season = current_season(date.today())
     logger.info("=== Daily update starting for season %s ===", season)
@@ -230,6 +270,9 @@ def main() -> int:
     prediction_status = log_todays_predictions()
     odds_status = snapshot_odds_board()
     ingests_ok = refresh_periodic_ingests()
+    # Last, so it sees the state this run leaves behind rather than the state
+    # it started from.
+    preflight_wrong = run_preflight()
 
     failures = []
     if not backfill_ok:
@@ -248,7 +291,11 @@ def main() -> int:
     if failures:
         logger.error("=== Daily update finished WITH ERRORS: %s ===", ", ".join(failures))
         return 1
-    logger.info("=== Daily update finished OK (predictions: %s) ===", prediction_status)
+    logger.info("=== Daily update finished OK (predictions: %s, preflight: %s) ===",
+                prediction_status,
+                "clean" if preflight_wrong == 0
+                else "COULD NOT RUN" if preflight_wrong < 0
+                else f"{preflight_wrong} WRONG")
     return 0
 
 

@@ -153,7 +153,7 @@ Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `STRIPE_SECRET_KEY`,
 `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`,
 `NEXT_PUBLIC_STRIPE_PRICE_*` (4x), `NEXT_PUBLIC_NBA_API_URL`,
-`NEXT_PUBLIC_SITE_URL`, `NBA_API_KEY?`, `PREMIUM_BYPASS?` (local only).
+`NEXT_PUBLIC_SITE_URL`, `NBA_API_KEY?`, `ADMIN_SYNC_SECRET` (required once, see 2b — without it the first sale charges the card and grants nothing), `PREMIUM_BYPASS?` (local only).
 
 ## Security notes — read before going live
 

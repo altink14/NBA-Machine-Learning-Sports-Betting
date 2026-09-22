@@ -196,6 +196,60 @@ def check_days_rest(today: date) -> None:
           "longer silently pins every team at maximum rest")
 
 
+def check_job_coverage(today: date) -> None:
+    """Did the scheduled jobs actually FIRE as often as they are set to?
+
+    Everything else in this file checks that the machinery is correct. This
+    checks that it ran, which is a different question and was the one nobody
+    was asking: on 2026-09-22 the hourly job had fired 38 times out of ~76 due
+    and the 15-minute job 156 out of ~306. Both near 50%, in long contiguous
+    blocks -- the machine was asleep.
+
+    That is not a cosmetic gap. Replaying a real NBA schedule at a 50% miss
+    rate puts 25.1% of tip-offs on a closing line more than 20 minutes early,
+    worst case 157 minutes, against 0.0% when every run fires. A quarter of the
+    season's closing lines, and no API tier buys it back.
+
+    Cause was four booleans on the task definitions (WakeToRun,
+    StartWhenAvailable and both battery settings), corrected 2026-09-22. This
+    check exists so the correction is visible and a regression is not.
+
+    Window is the last 24 hours, so it reflects the machine's CURRENT
+    behaviour rather than averaging in a period that has already been fixed.
+    """
+    section("DID THE JOBS ACTUALLY RUN")
+    import re
+    cutoff = datetime.now() - timedelta(hours=24)
+    jobs = (("frequent", 15), ("hourly", 60))
+    for name, every_min in jobs:
+        path = os.path.join(REPO_ROOT, "logs", f"scheduled_{name}.log")
+        if not os.path.exists(path):
+            check(f"{name} job has a log", BAD, path)
+            continue
+        stamps = []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ - INFO - === \w+ run starting",
+                             line)
+                if m:
+                    t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                    if t >= cutoff:
+                        stamps.append(t)
+        expected = max(1, int(24 * 60 / every_min))
+        pct = 100.0 * len(stamps) / expected
+        detail = f"{len(stamps)}/{expected} runs in 24h ({pct:.0f}%)"
+        if pct >= 90:
+            check(f"the {name} job is firing on schedule", OK, detail)
+        elif pct >= 75:
+            check(f"the {name} job is firing on schedule", PENDING,
+                  detail + " — some runs missed; watch it")
+        else:
+            check(f"the {name} job is firing on schedule", BAD,
+                  detail + " — the machine is sleeping through runs. Check "
+                  "WakeToRun / StartWhenAvailable / the battery settings on the "
+                  "task; see the NFL runbook.")
+
+
 def check_ledger() -> None:
     section("THE PREDICTION LEDGER")
     if not os.path.exists(ODDS_DB):
@@ -392,6 +446,7 @@ def main() -> int:
     check_season_labels(today)
     check_team_stats(today)
     check_days_rest(today)
+    check_job_coverage(today)
     check_ledger()
     check_model()
     check_feed(today, args.skip_network)

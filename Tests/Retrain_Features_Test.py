@@ -115,9 +115,22 @@ class TestTeamNameMap(unittest.TestCase):
         self.assertEqual(rf.normalize_team("Boston Celtics"),
                          "Boston Celtics")
 
-    def test_unknown_name_raises(self):
+    def test_pre_2001_franchise_names_map(self):
+        """The 1996-2001 backfill (22 August 2026) introduced two names the
+        normalizer had never seen, and every caller that walks the whole
+        archive raised on them -- which took the sealed candidate model down
+        with it for a month. They map to the modern franchise now, the way
+        the rest of the project displays relocated teams."""
+        self.assertEqual(rf.normalize_team("Vancouver Grizzlies"), "Memphis Grizzlies")
+        self.assertEqual(rf.normalize_team("Washington Bullets"), "Washington Wizards")
+
+    def test_unknown_name_still_raises(self):
+        """Unrecognised names must not pass through. This test used to use
+        'Vancouver Grizzlies', which is now deliberately known; the point was
+        never that specific name, it is that a typo or a new relocation is
+        caught loudly rather than silently becoming a 31st franchise."""
         with self.assertRaises(KeyError):
-            rf.normalize_team("Vancouver Grizzlies")
+            rf.normalize_team("Saint Louis Spirits")
 
     def test_every_db_name_normalizes_to_30_teams(self):
         """Every name in every odds table and a spread of snapshot tables

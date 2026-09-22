@@ -227,11 +227,80 @@ def check_model() -> None:
     rest = [c for c in cols if "rest" in c.lower()]
     check("the rest features the model expects are named",
           OK if len(rest) >= 2 else BAD, ", ".join(rest))
+    # Importing the module proves nothing. The first version of this check was
+    # `candidate_live imports` and it passed happily on 2026-09-22 while
+    # get_candidate() was returning None and every prediction was falling back
+    # to the old model. A check that cannot fail is worse than no check.
     try:
         from src.Predict import candidate_live
-        check("candidate_live imports", OK if candidate_live else BAD, "")
+        cand = candidate_live.get_candidate()
     except Exception as e:
-        check("candidate_live imports", BAD, str(e)[:120])
+        return check("the candidate model actually loads", BAD, str(e)[:160])
+    if cand is None:
+        return check(
+            "the candidate model actually loads", BAD,
+            f"get_candidate() returned None ({candidate_live._instance_error}). Every "
+            "prediction silently falls back to the OLD model while the site advertises "
+            "the candidate's 67.2%.")
+    check("the candidate model actually loads", OK,
+          f"{len(cand.tg):,} team-game rows through {cand._tg_max_date}")
+
+    # And that it produces a number, which is the only proof the feature
+    # pipeline still lines up with the sealed artifact.
+    try:
+        import pandas as pd
+        conn = sqlite3.connect(f"file:{TEAM_DB}?mode=ro", uri=True)
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '202%' "
+            "ORDER BY name DESC LIMIT 1").fetchone()[0]
+        df = pd.read_sql_query(f'SELECT * FROM "{table}"', conn, index_col="index")
+        conn.close()
+        home, away = "Boston Celtics", "Los Angeles Lakers"
+        row = pd.concat([df[df.TEAM_NAME == home].iloc[0],
+                         df[df.TEAM_NAME == away].iloc[0].rename(lambda x: x + ".1")])
+        row["Days-Rest-Home"], row["Days-Rest-Away"] = 2.0, 1.0
+        frame = pd.DataFrame([row])
+        frame = frame.drop(columns=[c for c in frame.columns
+                                    if not pd.api.types.is_numeric_dtype(frame[c])],
+                           errors="ignore")
+        p = float(cand.predict(frame, [(home, away)], ["2026-04-01"])[0])
+    except Exception as e:
+        return check("the candidate model produces a probability", BAD, str(e)[:160])
+    check("the candidate model produces a probability",
+          OK if 0.0 < p < 1.0 else BAD, f"{p:.4f} on a synthetic matchup")
+
+    # Every team the archive has ever named must map to a modern franchise, or
+    # the canonical map raises and takes the whole model down with it. This is
+    # what actually broke: the 1996-2001 backfill introduced two names nobody
+    # had taught the normalizer.
+    try:
+        sys.path.insert(0, os.path.join(REPO_ROOT, "src", "Process-Data"))
+        from retrain_features import normalize_team
+        import json as _json
+        conn = sqlite3.connect(f"file:{TEAM_DB}?mode=ro", uri=True)
+        names = set()
+        for (tj,) in conn.execute("SELECT traditional_json FROM box_scores"):
+            t = _json.loads(tj)["boxScoreTraditional"]
+            for side in ("homeTeam", "awayTeam"):
+                s = t[side]
+                names.add(f"{s.get('teamCity','').strip()} "
+                          f"{s.get('teamName','').strip()}".strip())
+        conn.close()
+        unknown = sorted(n for n in names if not _known(normalize_team, n))
+    except Exception as e:
+        return check("every team name in the archive is known", BAD, str(e)[:160])
+    check("every team name in the archive is known",
+          OK if not unknown else BAD,
+          f"{len(names)} distinct names" if not unknown
+          else f"unmapped: {', '.join(unknown)} — add them to TEAM_NAME_MAP")
+
+
+def _known(normalize, name: str) -> bool:
+    try:
+        normalize(name)
+        return True
+    except KeyError:
+        return False
 
 
 def check_feed(today: date, skip_network: bool) -> None:

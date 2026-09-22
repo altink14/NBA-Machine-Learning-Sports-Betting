@@ -129,6 +129,21 @@ TEAM_NAME_MAP: Dict[str, str] = {
     "New Orleans/Oklahoma City Hornets": "New Orleans Pelicans",
     "Charlotte Bobcats": "Charlotte Hornets",
     "LA Clippers": "Los Angeles Clippers",
+    # Added 2026-09-22. These two appear only in 1996-97..2000-01, which were
+    # backfilled on 22 August 2026 -- eleven days AFTER the candidate model was
+    # sealed and put into service. From that day `team_canonical_map` walked
+    # every team name in the archive, hit 'Washington Bullets' and raised, so
+    # `candidate_live.get_candidate()` returned None and every prediction
+    # silently fell back to the old model. Nothing user-facing was affected
+    # because the NBA is out of season and predictions_log is empty, but on
+    # opening night the site would have advertised the candidate's 67.2% while
+    # serving the model whose honest figure is 65.8%.
+    #
+    # Adding a name that previously raised cannot change any path that already
+    # worked, and both map to the modern franchise the way the rest of the
+    # project displays them.
+    "Vancouver Grizzlies": "Memphis Grizzlies",
+    "Washington Bullets": "Washington Wizards",
 }
 
 CANONICAL_TEAMS: Tuple[str, ...] = (

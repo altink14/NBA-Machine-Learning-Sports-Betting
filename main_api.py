@@ -979,6 +979,23 @@ class PredictionRunner:
                 calibrated_ml = True
             except Exception as exc:
                 logger.error(f"Candidate model path failed; serving old model: {exc}", exc_info=True)
+        if not calibrated_ml:
+            # Say it on EVERY slate, not once. get_candidate() caches its
+            # failure, so before this the only trace was a single line the
+            # first time the process asked -- which in a long-running API
+            # server means one line at startup and silence forever after.
+            # That is how the candidate stayed dead from 22 August to 22
+            # September without anyone noticing.
+            #
+            # This matters beyond tidiness: the published accuracy claim of
+            # 67.2% belongs to the candidate. Picks served by the old model
+            # are not what that number measured, and predictions_log records
+            # `model` so the two can always be told apart afterwards.
+            logger.error(
+                "SERVING THE OLD MODEL for %d game(s): the sealed candidate is "
+                "unavailable (%s). The published 67.2%% figure describes the "
+                "candidate, not these picks. Run preflight_opening_night.py.",
+                len(processed_games), candidate_live._instance_error or "predict() failed")
 
         return self._attach_availability(
             self._format_predictions(processed_games, ml_predictions, ou_predictions, home_team_odds,

@@ -36,8 +36,8 @@ Two services: this repo (FastAPI backend) → **Railway**, the frontend
    select `altink14/NBA-Machine-Learning-Sports-Betting` (branch
    `bettingbuddy2.0`). The `render.yaml` configures everything, including
    `DB_SNAPSHOT_URL` — just click Apply.
-2. Wait for the first deploy (build + snapshot download — budget for a
-   ~600 MB-plus archive, not the 47 MB this used to say), then hit
+2. Wait for the first deploy (build + a **407 MB** snapshot download, not
+   the 47 MB this used to say), then hit
    `https://<render-url>/health`.
 3. Free-tier tradeoffs, and they are worse than they look for THIS app:
    no persistent disk, sleeps after 15 idle minutes, 512MB RAM. Every wake
@@ -89,9 +89,19 @@ generally cannot run on Railway. The working pipeline:
 - To push fresh data to production, re-publish the snapshot and redeploy:
 
   ```
-  tar czf %TEMP%\db-snapshot.tar.gz -C Data TeamData.sqlite OddsData.sqlite
-  gh release upload db-snapshot-v1 %TEMP%\db-snapshot.tar.gz --clobber
+  venv/Scripts/python.exe publish_db_snapshot.py
   ```
+
+  It prints the `gh release upload` command and stops; publishing stays a
+  deliberate act. **Do not go back to `tar czf` on the live files.**
+  TeamData.sqlite is in WAL mode, so a committed transaction can still be
+  sitting in the `-wal` sidecar that the tar does not copy — run it after the
+  9am job and the snapshot silently omits the newest data, or mid-write and
+  the copy is torn. Either way it looks fine and fails in production. The
+  script uses `VACUUM INTO`, which SQLite guarantees is a consistent
+  point-in-time copy even with other connections active, then runs
+  `quick_check` on the result. Last measured: 2,929 MB → 2,799 MB → **407 MB**
+  compressed, in about nine minutes.
 
   then delete `TeamData.sqlite` from the Railway volume (or bump
   `DB_SNAPSHOT_URL` to a new tag) and redeploy so bootstrap re-downloads.

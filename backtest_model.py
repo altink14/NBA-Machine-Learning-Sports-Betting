@@ -115,31 +115,47 @@ def load_team_games(con) -> pd.DataFrame:
         versus the league dashboard. We recover the official team total from the
         advanced box score: estimatedTeamTurnoverPercentage * possessions / 100.
     """
-    df = pd.read_sql_query(
+    # Read in chunks. This used to be one read_sql_query over the whole table,
+    # which pulls every game's traditional_json and advanced_json into memory
+    # at once -- 1.6 GB of text across 37,982 games. Measured 2026-09-22:
+    # bringing the served model up peaked at 1,831 MB of Python allocation and
+    # settled at 104 MB, because that frame is iterated once and thrown away.
+    # A transient 18x overshoot decides which hosting plan the API can run on,
+    # and 512 MB plans simply OOM on boot.
+    #
+    # The result is unchanged by construction: every row depends only on its
+    # own record, and the return is sorted on (game_date, game_id) and
+    # reindexed, so read order cannot reach the output. Verified equal to the
+    # single-query version with assert_frame_equal before this was committed.
+    chunks = pd.read_sql_query(
         "select game_id, season, season_type, game_date, traditional_json, advanced_json "
-        "from box_scores", con)
+        "from box_scores", con, chunksize=500)
     rows = []
-    for r in df.itertuples():
-        t = json.loads(r.traditional_json)['boxScoreTraditional']
-        a = json.loads(r.advanced_json)['boxScoreAdvanced']
-        for side, opp in (('homeTeam', 'awayTeam'), ('awayTeam', 'homeTeam')):
-            s = t[side]['statistics']
-            o = t[opp]['statistics']
-            adv = a[side]['statistics']
-            tov = int(np.floor(adv['estimatedTeamTurnoverPercentage'] * adv['possessions'] / 100.0 + 0.5))
-            rows.append(dict(
-                game_id=r.game_id, season=r.season, season_type=r.season_type,
-                game_date=r.game_date, team_id=t[side]['teamId'],
-                team_name=f"{t[side]['teamCity']} {t[side]['teamName']}",
-                is_home=(side == 'homeTeam'),
-                MIN=parse_minutes(s['minutes']),
-                FGM=s['fieldGoalsMade'], FGA=s['fieldGoalsAttempted'],
-                FG3M=s['threePointersMade'], FG3A=s['threePointersAttempted'],
-                FTM=s['freeThrowsMade'], FTA=s['freeThrowsAttempted'],
-                OREB=s['reboundsOffensive'], DREB=s['reboundsDefensive'], REB=s['reboundsTotal'],
-                AST=s['assists'], TOV=tov, STL=s['steals'], BLK=s['blocks'], BLKA=o['blocks'],
-                PF=s['foulsPersonal'], PFD=o['foulsPersonal'],
-                PTS=s['points'], OPP_PTS=o['points']))
+    for df in chunks:
+        for r in df.itertuples():
+            t = json.loads(r.traditional_json)['boxScoreTraditional']
+            a = json.loads(r.advanced_json)['boxScoreAdvanced']
+            for side, opp in (('homeTeam', 'awayTeam'), ('awayTeam', 'homeTeam')):
+                s = t[side]['statistics']
+                o = t[opp]['statistics']
+                adv = a[side]['statistics']
+                tov = int(np.floor(
+                    adv['estimatedTeamTurnoverPercentage'] * adv['possessions'] / 100.0 + 0.5))
+                rows.append(dict(
+                    game_id=r.game_id, season=r.season, season_type=r.season_type,
+                    game_date=r.game_date, team_id=t[side]['teamId'],
+                    team_name=f"{t[side]['teamCity']} {t[side]['teamName']}",
+                    is_home=(side == 'homeTeam'),
+                    MIN=parse_minutes(s['minutes']),
+                    FGM=s['fieldGoalsMade'], FGA=s['fieldGoalsAttempted'],
+                    FG3M=s['threePointersMade'], FG3A=s['threePointersAttempted'],
+                    FTM=s['freeThrowsMade'], FTA=s['freeThrowsAttempted'],
+                    OREB=s['reboundsOffensive'], DREB=s['reboundsDefensive'],
+                    REB=s['reboundsTotal'],
+                    AST=s['assists'], TOV=tov, STL=s['steals'], BLK=s['blocks'],
+                    BLKA=o['blocks'],
+                    PF=s['foulsPersonal'], PFD=o['foulsPersonal'],
+                    PTS=s['points'], OPP_PTS=o['points']))
     tg = pd.DataFrame(rows)
     tg['W'] = (tg.PTS > tg.OPP_PTS).astype(int)
     tg['L'] = 1 - tg.W

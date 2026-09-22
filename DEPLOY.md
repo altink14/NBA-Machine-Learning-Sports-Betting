@@ -141,7 +141,9 @@ generally cannot run on Railway. The working pipeline:
 The authoritative, annotated list now lives in `.env.example` in each repo —
 those are kept in sync with the code. Summary:
 
-Backend: `DB_SNAPSHOT_URL`, `CORS_ORIGINS`, `API_KEY?`, `RATE_LIMIT_DEFAULT?`,
+Backend: `DB_SNAPSHOT_URL`, `CORS_ORIGINS`, **`API_KEY`** (not optional once you
+charge for anything — unset, `/predictions` is served to anyone who finds the
+host, which is the product), `RATE_LIMIT_DEFAULT?`,
 `RATE_LIMIT_GLOBAL?`, `RATE_LIMIT_EXPENSIVE?`, `RATE_LIMIT_UPSTREAM?`,
 `NBA_CACHE_DIR?`, `WARM_MODEL_ON_START` (set it to `true` in production —
 otherwise the first prediction after every restart pays the model's cold

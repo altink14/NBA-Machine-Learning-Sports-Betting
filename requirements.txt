@@ -1,29 +1,59 @@
 # requirements.txt
+#
+# WHY THESE ARE PINNED (2026-09-22). This file had no version constraints at
+# all, so `docker build` resolved whatever was newest on the day. Checked: the
+# image was installing pandas 3.0.6, numpy 2.4.6, xgboost 3.2.0, scikit-learn
+# 1.9.1 and scipy 1.17.1, against a model that was sealed, evaluated and is
+# served locally on pandas 2.3.0, numpy 2.3.0, xgboost 3.0.2, scikit-learn
+# 1.7.0 and scipy 1.15.3. A major pandas boundary, silently, in production.
+#
+# To be clear about what was and was not shown: nothing here demonstrates that
+# the newer stack produces different predictions. What it demonstrates is that
+# production was running a DIFFERENT numerical stack from the one the sealed
+# evaluation measured, and that nobody would have found out from a log — the
+# build succeeds either way. The 67.2% figure describes the model as evaluated,
+# and that claim is only as good as the code underneath it staying put.
+#
+# The numerical stack is pinned exactly: these decide what the model outputs.
+# The web stack has floors and upper bounds instead, because a break there
+# fails loudly at boot rather than quietly in a number.
+#
+# When upgrading the numerical pins: re-run Tests/ (135 tests) and
+# preflight_opening_night.py, and check the candidate still produces the same
+# probabilities on a fixed slate. Do not bump them casually.
 
-# Core FastAPI and Server
-fastapi
-uvicorn[standard]
-python-dotenv
-slowapi
+# xgboost-cpu, not xgboost: the regular wheel drags in 469 MB of CUDA
+# libraries plus a GPU-enabled libxgboost, which took the image from 1.1 GB
+# to 2.69 GB for hardware no deploy target has. Verified identical before
+# swapping -- Tests/Sealed_Model_Fingerprint_Test.py scores the sealed model
+# on a fixed matrix and both builds produce the same SHA256.
+#
+# --- Numerical stack: EXACT. Changes here can change predictions. ---
+pandas==2.3.0
+numpy==2.3.0
+scipy==1.15.3
+scikit-learn==1.7.0
+xgboost-cpu==3.0.2
+shin==0.2.2
 
-# Data and ML libraries
-pandas
-numpy
-scikit-learn
-xgboost
-shin
+# --- Web stack: bounded. A break here is loud, not silent. ---
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.34,<0.35
+python-dotenv>=1.1,<2
+slowapi>=0.1.10,<0.2
+python-multipart>=0.0.20
 
-# External APIs and Services
-sbrscrape
-google-generativeai
-requests
-python-multipart
+# --- External APIs and data sources ---
+# Pinned because they parse third-party payloads: a new version changing how a
+# field is read is exactly the kind of thing that shows up as missing data
+# rather than an exception.
+sbrscrape==0.0.10
+nba-api==1.11.4
+pbpstats==1.3.11
+google-generativeai>=0.8,<0.9
+requests>=2.32,<3
 
-# NBA Data Pipeline (Phase 1)
-nba-api>=1.11.4
-pbpstats>=1.3.11
-
-# Utilities
+# --- Utilities ---
 colorama
 tqdm
 toml

@@ -24,6 +24,11 @@ Data/nba_cache/
 # --- Secrets ---
 .env
 
+# --- The published database archive. bootstrap_db.py DOWNLOADS this at boot;
+#     a copy sitting at the repo root is a stale build artifact, and it was
+#     shipping 49 MB of eight-week-old database into every image. ---
+db-snapshot.tar.gz
+
 # --- Python bytecode / tooling artifacts ---
 __pycache__/
 *.pyc

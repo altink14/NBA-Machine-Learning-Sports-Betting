@@ -290,6 +290,38 @@ _instance_error: Optional[str] = None
 MODEL_TAG = "xgboost_cand_2026-08"
 
 
+def status() -> Dict[str, object]:
+    """What the model is doing right now, WITHOUT triggering a load.
+
+    A cold load walks every box score in the archive and takes about a minute,
+    so a health check must never call get_candidate(). This reports only what
+    is already known, which is what a health check should do anyway: say what
+    is true, not go and make it true.
+
+    `loaded` false with `error` None means nobody has asked yet. `loaded`
+    false with an `error` means every prediction is being served by the old
+    model, and the published accuracy figure does not describe it.
+    """
+    return {
+        "loaded": _instance is not None,
+        "tag": MODEL_TAG if _instance is not None else None,
+        "error": _instance_error,
+        "serving": ("candidate" if _instance is not None
+                    else "old model fallback" if _instance_error
+                    else "not yet loaded"),
+    }
+
+
+def warm() -> bool:
+    """Load the model now. Returns whether it came up.
+
+    Called at startup so a deployed container pays the ~55s cold load during
+    boot rather than on the first user's request, which most gateways would
+    time out. Safe to call more than once; the singleton handles that.
+    """
+    return get_candidate() is not None
+
+
 def get_candidate() -> Optional[CandidateLive]:
     """Singleton accessor. Returns None (and remembers why) if the artifact
     or its supporting data can't be loaded -- callers then use the old model."""

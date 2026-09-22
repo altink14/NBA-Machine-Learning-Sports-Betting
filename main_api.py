@@ -1377,11 +1377,63 @@ def read_root():
 @app.get("/health")
 @limiter.exempt
 def health_check():
+    """Liveness, and whether the model behind the published figure is running.
+
+    This used to return "healthy" unconditionally. It did so for the whole
+    month the sealed candidate could not load and every prediction was being
+    served by the old model -- a health check that cannot distinguish healthy
+    from broken, which is the same shape as a log line that always says "ok".
+
+    `model` is read from cached state and never triggers a load: a cold load
+    walks the entire archive and takes about a minute, and a health endpoint
+    that can block for a minute is its own outage. `status` degrades to
+    "degraded" when the candidate has failed, because serving the old model
+    while the site advertises the candidate's accuracy is not healthy, even
+    though every request still succeeds.
+    """
+    model = candidate_live.status()
     return {
-        "status": "healthy",
+        "status": "degraded" if model["error"] else "healthy",
         "version": "1.1.1-stable-fixed",
+        "model": model,
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
+
+
+@app.on_event("startup")
+def _warm_model_on_start():
+    """Pay the model's cold load at boot, not on the first user's request.
+
+    Measured 2026-09-22: ~55 seconds, because CandidateLive parses the
+    traditional and advanced box-score JSON for all 37,982 archived games.
+    Deployed behind a gateway that gives up at 30 seconds, the first
+    prediction after every restart would fail while the model quietly warmed
+    in the background.
+
+    Off by default so `npm run dev` against a local backend stays instant;
+    set WARM_MODEL_ON_START=true in any environment that serves real traffic.
+    Warming in a thread rather than inline keeps the port listening, so a
+    platform health check does not time out waiting for boot -- /health will
+    honestly report "not yet loaded" until it finishes.
+    """
+    if os.getenv("WARM_MODEL_ON_START", "").lower() not in ("1", "true", "yes"):
+        logger.info("Model warm-up disabled (set WARM_MODEL_ON_START=true in production); "
+                    "the first prediction request will pay the ~55s cold load.")
+        return
+
+    def _warm():
+        started = datetime.now(timezone.utc)
+        ok = candidate_live.warm()
+        took = (datetime.now(timezone.utc) - started).total_seconds()
+        if ok:
+            logger.info("Candidate model warm in %.1fs; /health now reports it loaded.", took)
+        else:
+            logger.error("Candidate model FAILED to warm after %.1fs: %s. Predictions will "
+                         "serve the old model and /health will report degraded.",
+                         took, candidate_live.status()["error"])
+
+    threading.Thread(target=_warm, name="warm-candidate", daemon=True).start()
+    logger.info("Warming the candidate model in the background.")
 
 # Supported sportsbooks endpoint for frontend dropdown
 @app.get("/sportsbooks")

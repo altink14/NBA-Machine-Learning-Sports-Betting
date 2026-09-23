@@ -39,7 +39,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("players_ingest")
 
 DB_PATH = os.path.join(REPO_ROOT, "Data", "TeamData.sqlite")
-CURRENT_SEASON = "2025-26"
+# The season follows the calendar (October starts a new one), the same rule
+# as daily_update.current_season. This was a hand-typed "2025-26" that nothing
+# reminded anyone to bump: from opening night the directory would have gone on
+# asking for last season's roster status all year, a plausible answer that is
+# wrong, without an error anywhere.
+def _season_start_year(today=None):
+    from datetime import date as _date
+    today = today or _date.today()
+    return today.year if today.month >= 10 else today.year - 1
+
+
+CURRENT_SEASON = f"{_season_start_year()}-{(_season_start_year() + 1) % 100:02d}"
 
 # A response much smaller than the league's real history means something is wrong
 # upstream, and rewriting the directory from it would delete most of the game.

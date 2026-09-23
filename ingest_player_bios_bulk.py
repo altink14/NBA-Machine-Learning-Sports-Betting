@@ -36,7 +36,18 @@ logger = logging.getLogger("player_bios_bulk")
 
 DB_PATH = os.path.join(REPO_ROOT, "Data", "TeamData.sqlite")
 FIRST_SEASON = 1946
-CURRENT_SEASON_START = 2025
+# The season follows the calendar (October starts a new one), the same rule
+# as daily_update.current_season. This was a hand-typed "2025-26" that nothing
+# reminded anyone to bump: from opening night the directory would have gone on
+# asking for last season's roster status all year, a plausible answer that is
+# wrong, without an error anywhere.
+def _season_start_year(today=None):
+    from datetime import date as _date
+    today = today or _date.today()
+    return today.year if today.month >= 10 else today.year - 1
+
+
+CURRENT_SEASON_START = _season_start_year()
 
 COLUMNS = {
     "position": "TEXT",

@@ -110,11 +110,27 @@ def check_season_labels(today: date) -> None:
               f"is {backend}, should be {expected}. Every endpoint defaulting to "
               f"CURRENT_SEASON is serving last season.")
 
-    # The frontend keeps its own copies and this script cannot import TypeScript,
-    # so name them rather than pretend to have checked them.
-    check("frontend season constants are a MANUAL step", PENDING,
-          "CURRENT_SEASON in src/lib/nba-api.ts and CURRENT_END_YEAR in "
-          "src/lib/archive-seasons.ts must be bumped by hand the same morning")
+    # The frontend keeps its own copies. They are read here as text, with the
+    # same patterns bump_season.py edits, so this is a real check rather than
+    # the reminder it used to be.
+    frontend = os.environ.get("FRONTEND_REPO") or os.path.join(os.path.dirname(REPO_ROOT), "basic-saas-starter")
+    try:
+        import bump_season
+        found = {os.path.basename(path): bump_season.read_current(path, pat)
+                 for path, pat, _ in bump_season.targets(REPO_ROOT, frontend)[1:]}
+    except (SystemExit, OSError) as exc:
+        check("frontend season constants match today's season", BAD,
+              f"could not read them from {frontend}: {exc}")
+    else:
+        shown = ", ".join(f"{k} {v}" for k, v in found.items())
+        if set(found.values()) == {expected}:
+            check("frontend season constants match today's season", OK, shown)
+        elif not started:
+            check("frontend season constants match today's season", PENDING,
+                  f"{shown}; run bump_season.py --apply on {OPENING_NIGHT}")
+        else:
+            check("frontend season constants match today's season", BAD,
+                  f"{shown}, should be {expected}: run bump_season.py --apply")
 
 
 def check_team_stats(today: date) -> None:

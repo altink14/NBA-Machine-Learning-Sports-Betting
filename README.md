@@ -1,7 +1,14 @@
 # NBA Sports Betting Using Machine Learning 🏀
 <img src="https://github.com/kyleskom/NBA-Machine-Learning-Sports-Betting/blob/master/Screenshots/output.png" width="1010" height="292" />
 
-A machine learning AI used to predict the winners and under/overs of NBA games. Takes all team data from the 2007-08 season to current season, matched with odds of those games, using a neural network to predict winning bets for today's games. Achieves ~69% accuracy on money lines and ~55% on under/overs. Outputs expected value for teams money lines to provide better insight. The fraction of your bankroll to bet based on the Kelly Criterion is also outputted. Note that a popular, less risky approach is to bet 50% of the stake recommended by the Kelly Criterion.
+> **About this fork (Betting Buddy backend).** This repo began as a fork of [kyleskom/NBA-Machine-Learning-Sports-Betting](https://github.com/kyleskom/NBA-Machine-Learning-Sports-Betting); much of the text below is the original project's. Two of its claims no longer describe this code and are corrected here:
+>
+> - **Accuracy.** The original README quoted a moneyline accuracy that was the best of many random train/test splits, not a measure of how the model does on games it has not seen, and this project does not use it. The model served here (`Models/candidate_2026-08`, XGBoost, calibrated) was evaluated once, sealed, on games played entirely after training: **67.2% moneyline accuracy across 2,597 games in 2024-25 and 2025-26** (95% CI 65.3-68.9%). Picking the home team every time would have gone 55.1%. Accuracy is not profitability; no return on investment has been measured.
+> - **Over/under.** The totals pick was withdrawn on 2026-09-19: it never had a sealed evaluation. The market's total is still shown; our pick is not.
+>
+> Every prediction is logged before tip-off and graded in public. The API is FastAPI (`main_api.py`); see `DEPLOY.md`.
+
+A machine learning model used to predict the winners of NBA games from team data matched with the odds of those games. Outputs expected value for teams money lines to provide better insight. The fraction of your bankroll to bet based on the Kelly Criterion is also outputted. Note that a popular, less risky approach is to bet 50% of the stake recommended by the Kelly Criterion.
 ## Packages Used
 
 Use Python 3.11. In particular the packages/libraries used are...
@@ -35,6 +42,9 @@ If `-odds` is not given, enter the under/over and odds for today's games manuall
 Optionally, you can add '-kc' as a command line argument to see the recommended fraction of your bankroll to wager based on the model's edge
 
 ## Flask Web App
+
+> *From the original project. There is no Flask app in this repo; the API is FastAPI: `venv/Scripts/python.exe -m uvicorn main_api:app --port 8000`.*
+
 <img src="https://github.com/kyleskom/NBA-Machine-Learning-Sports-Betting/blob/master/Screenshots/Flask-App.png" width="922" height="580" />
 
 This repo also includes a small Flask application to help view the data from this tool in the browser.  To run it:

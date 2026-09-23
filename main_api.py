@@ -2287,24 +2287,31 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
 
     # Tracking extras, each behind its era floor and each already process-cached.
     sq_row = reb_row = clutch_row = None
+    # A section can be empty for three different reasons: the era predates the
+    # data (see "eras"), the player is not in that season's tracked list, or
+    # the fetch FAILED. Only the last is "try again later", so it is flagged
+    # here; before, all three came back as the same null.
+    unavailable = {"shot_quality": False, "rebounding": False, "clutch": False}
     if season >= "2013-14":
         try:
             sq = get_shot_quality(season)
             sq_row = next((p for p in sq.get("players", []) if p.get("player_id") == player_id), None)
-        except Exception:
-            sq_row = None
+        except Exception as exc:
+            logger.warning("2K DNA: shot-quality tracking unavailable for %s: %s", season, exc)
+            sq_row, unavailable["shot_quality"] = None, True
         try:
             rb = _rebounding_for(season, "Regular Season")
             reb_row = next((p for p in rb.get("players", []) if p.get("player_id") == player_id), None)
         except Exception as exc:
             logger.warning("2K DNA: rebounding tracking unavailable for %s: %s", season, exc)
-            reb_row = None
+            reb_row, unavailable["rebounding"] = None, True
     if season >= PBP_FIRST_SEASON:
         try:
             cl = _clutch_for(season, "Regular Season")
             clutch_row = next((p for p in cl.get("players", []) if p.get("player_id") == player_id), None)
-        except Exception:
-            clutch_row = None
+        except Exception as exc:
+            logger.warning("2K DNA: clutch ledger unavailable for %s: %s", season, exc)
+            clutch_row, unavailable["clutch"] = None, True
 
     return {
         "player": {
@@ -2327,6 +2334,7 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
             "rebounding": season >= "2013-14",
             "clutch": season >= PBP_FIRST_SEASON,
         },
+        "unavailable": unavailable,
         "build_notes": build_lab.build_notes(totals, p36, sq_row,
                                              reb_row and {"reb": reb_row.get("reb")}, clutch_row),
         "method": (
@@ -3923,6 +3931,10 @@ def get_milestone_watch(limit: int = 25):
 
         watch = []
         stale = []
+        # Players we could not check. They used to vanish from the list, so a
+        # failed stats.nba.com call made the board look complete and wrong
+        # (the nearest milestone simply was not there).
+        unavailable = []
         for pid, name in [(r[0], r[1]) for r in seed_rows]:
             try:
                 state = _career_official_freshness(conn, pid)
@@ -3936,7 +3948,9 @@ def get_milestone_watch(limit: int = 25):
                     # holding the page while up to sixty careers are refetched
                     # in a row.
                     stale.append(pid)
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"Milestones: career for {name} ({pid}) unavailable: {exc}")
+                unavailable.append({"player_id": pid, "full_name": name})
                 continue
             tot = conn.execute(
                 """
@@ -3946,6 +3960,7 @@ def get_milestone_watch(limit: int = 25):
                 (pid,),
             ).fetchone()
             if not tot:
+                unavailable.append({"player_id": pid, "full_name": name})
                 continue
             for stat, step in MILESTONE_STEPS.items():
                 val = tot[stat]
@@ -3968,7 +3983,9 @@ def get_milestone_watch(limit: int = 25):
         watch.sort(key=lambda w: w["remaining"] / MILESTONE_STEPS[w["stat"]])
         if stale:
             _refresh_career_official_async(stale)
-        return {"count": len(watch), "milestones": watch[:limit]}
+        return {"count": len(watch), "milestones": watch[:limit],
+                "players_checked": len(seed_rows) - len(unavailable),
+                "unavailable": unavailable}
     except Exception as e:
         logger.error(f"Error building milestone watch: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -4871,11 +4888,14 @@ def _season_from_game_id(game_id: str) -> str:
     start = 2000 + yy if yy < 90 else 1900 + yy
     return f"{start}-{(start + 1) % 100:02d}"
 
-def _get_league_shot_averages(season: str, season_type: str = "Regular Season") -> List[Dict[str, Any]]:
+def _get_league_shot_averages(season: str, season_type: str = "Regular Season") -> Optional[List[Dict[str, Any]]]:
     """
     Zone-level league-average shooting for a season, in response shape:
     [{"zone_basic", "zone_area", "zone_range", "fga", "fgm", "fg_pct"}].
-    Returns [] on failure so the additive field never breaks an endpoint.
+    Returns None when the fetch FAILED, so callers can say "unavailable"
+    rather than serve an empty list that reads as "the league took no shots".
+    (It used to return [] for both, and the game shot chart then cached that
+    [] forever inside its whole-response cache.)
     """
     cache_key = f"{season}_{season_type}"
     if cache_key in league_shot_averages_cache:
@@ -4899,7 +4919,7 @@ def _get_league_shot_averages(season: str, season_type: str = "Regular Season") 
         return averages
     except Exception as e:
         logger.warning(f"League shot averages fetch failed for {season} ({season_type}): {e}")
-        return []
+        return None
 
 TEAM_TO_BR_ABBR = {
     "atlanta hawks": "ATL", "boston celtics": "BOS", "brooklyn nets": "BRK", "charlotte hornets": "CHO", "chicago bulls": "CHI",
@@ -4913,33 +4933,6 @@ TEAM_TO_BR_ABBR = {
     "mil": "MIL", "min": "MIN", "nop": "NOP", "nyk": "NYK", "okc": "OKC", "orl": "ORL", "phi": "PHI", "pho": "PHO", "por": "POR",
     "sac": "SAC", "sas": "SAS", "tor": "TOR", "uta": "UTA", "was": "WAS"
 }
-
-TATUM_MOCK_SHOTS = [
-    {"player": "Jayson Tatum", "x": 250, "y": 50, "result": "made", "description": "1st Q, 10:14 remaining, Jayson Tatum makes 3-pointer from 26 ft"},
-    {"player": "Jayson Tatum", "x": 120, "y": 80, "result": "missed", "description": "1st Q, 8:45 remaining, Jayson Tatum misses 2-pointer from 12 ft"},
-    {"player": "Jayson Tatum", "x": 260, "y": 45, "result": "made", "description": "1st Q, 5:12 remaining, Jayson Tatum makes 3-pointer from 28 ft"},
-    {"player": "Jayson Tatum", "x": 250, "y": 240, "result": "made", "description": "1st Q, 3:20 remaining, Jayson Tatum makes driving layup"},
-    {"player": "Jayson Tatum", "x": 380, "y": 120, "result": "missed", "description": "2nd Q, 11:05 remaining, Jayson Tatum misses 3-pointer from 24 ft"},
-    {"player": "Jayson Tatum", "x": 255, "y": 235, "result": "made", "description": "2nd Q, 9:40 remaining, Jayson Tatum makes dunk"},
-    {"player": "Jayson Tatum", "x": 245, "y": 242, "result": "made", "description": "2nd Q, 6:15 remaining, Jayson Tatum makes running layup"},
-    {"player": "Jayson Tatum", "x": 80, "y": 150, "result": "made", "description": "2nd Q, 2:50 remaining, Jayson Tatum makes 2-pointer from 15 ft"},
-    {"player": "Jayson Tatum", "x": 250, "y": 55, "result": "missed", "description": "3rd Q, 10:30 remaining, Jayson Tatum misses 3-pointer from 25 ft"},
-    {"player": "Jayson Tatum", "x": 350, "y": 180, "result": "made", "description": "3rd Q, 8:15 remaining, Jayson Tatum makes 2-pointer from 18 ft"},
-    {"player": "Jayson Tatum", "x": 248, "y": 238, "result": "made", "description": "3rd Q, 5:04 remaining, Jayson Tatum makes layup"},
-    {"player": "Jayson Tatum", "x": 100, "y": 70, "result": "made", "description": "3rd Q, 1:40 remaining, Jayson Tatum makes 3-pointer from 25 ft"},
-    {"player": "Jayson Tatum", "x": 252, "y": 245, "result": "missed", "description": "4th Q, 11:20 remaining, Jayson Tatum misses tip-in"},
-    {"player": "Jayson Tatum", "x": 250, "y": 240, "result": "made", "description": "4th Q, 9:05 remaining, Jayson Tatum makes driving dunk"},
-    {"player": "Jayson Tatum", "x": 265, "y": 48, "result": "made", "description": "4th Q, 7:30 remaining, Jayson Tatum makes 3-pointer from 29 ft"},
-    {"player": "Jayson Tatum", "x": 150, "y": 110, "result": "missed", "description": "4th Q, 4:10 remaining, Jayson Tatum misses 2-pointer from 10 ft"},
-    {"player": "Jayson Tatum", "x": 250, "y": 240, "result": "made", "description": "4th Q, 1:55 remaining, Jayson Tatum makes driving layup"},
-    {"player": "Jayson Tatum", "x": 245, "y": 140, "result": "made", "description": "4th Q, 0:45 remaining, Jayson Tatum makes 2-pointer from 11 ft"},
-    {"player": "Jaylen Brown", "x": 250, "y": 242, "result": "made", "description": "1st Q, 11:30 remaining, Jaylen Brown makes dunk"},
-    {"player": "Jaylen Brown", "x": 100, "y": 60, "result": "missed", "description": "1st Q, 6:40 remaining, Jaylen Brown misses 3-pointer from 26 ft"},
-    {"player": "Jaylen Brown", "x": 280, "y": 140, "result": "made", "description": "2nd Q, 4:15 remaining, Jaylen Brown makes 2-pointer from 12 ft"},
-    {"player": "Trae Young", "x": 252, "y": 50, "result": "made", "description": "1st Q, 9:55 remaining, Trae Young makes 3-pointer from 27 ft"},
-    {"player": "Trae Young", "x": 248, "y": 150, "result": "missed", "description": "2nd Q, 8:20 remaining, Trae Young misses driving floater"},
-    {"player": "Trae Young", "x": 250, "y": 240, "result": "made", "description": "3rd Q, 7:10 remaining, Trae Young makes driving layup"}
-]
 
 @app.get("/api/shot-chart")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
@@ -8177,12 +8170,15 @@ def get_game_shot_chart(request: Request, game_id: str):
         logger.info(f"Returning cached shot chart data for game: {game_id}")
         cached = shot_chart_cache[game_id]
         # Entries written by /api/shot-chart (shared cache) may predate the
-        # league_averages field - backfill it additively.
-        if "league_averages" not in cached:
+        # league_averages field, and an entry cached while the averages fetch
+        # was failing is marked unavailable: fill or retry it, additively.
+        if "league_averages" not in cached or cached.get("league_averages_unavailable"):
             try:
-                cached["league_averages"] = _get_league_shot_averages(_season_from_game_id(game_id))
+                la = _get_league_shot_averages(_season_from_game_id(game_id))
             except Exception:
-                cached["league_averages"] = []
+                la = None
+            cached["league_averages"] = la or []
+            cached["league_averages_unavailable"] = la is None
         return cached
 
     try:
@@ -8234,12 +8230,15 @@ def get_game_shot_chart(request: Request, game_id: str):
         try:
             league_averages = _get_league_shot_averages(_season_from_game_id(game_id))
         except Exception:
-            league_averages = []
+            league_averages = None
 
         response_data = {
             "game_id": game_id,
             "shots": shots,
-            "league_averages": league_averages
+            "league_averages": league_averages or [],
+            # True = the averages fetch failed (retried on the next request),
+            # not "the league took no shots".
+            "league_averages_unavailable": league_averages is None
         }
         shot_chart_cache[game_id] = response_data
         return response_data
@@ -8923,6 +8922,33 @@ def get_stats_leaders(category: str = "pts", season: str = CURRENT_SEASON, seaso
     finally:
         conn.close()
 
+_SEASON_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
+def _check_standings_request(conn, season: str, season_type: str) -> bool:
+    """Refuse a standings request that can only produce a misleading answer.
+
+    Before 2026-09-23 an unknown season ("1990-91", or a bare "2026" from a
+    typed URL) came back as [], which a page renders as a league with no
+    teams. Returns True when an empty result is genuine: the current season
+    before its first game. Raises 400/404 otherwise.
+    """
+    m = _SEASON_RE.match(season or "")
+    if not m or (int(m.group(1)) + 1) % 100 != int(m.group(2)):
+        raise HTTPException(status_code=400, detail=(
+            f"Season must look like {CURRENT_SEASON} (start year, dash, two-digit end year); got {season!r}."))
+    if season_type not in ("Regular Season", "Playoffs"):
+        raise HTTPException(status_code=400, detail=(
+            "Standings exist for 'Regular Season' and 'Playoffs' only "
+            "(play-in games are not a standings table)."))
+    if season >= CURRENT_SEASON:
+        return True   # this season, possibly before its first game
+    archived = conn.execute("SELECT 1 FROM box_scores WHERE season = ? LIMIT 1", (season,)).fetchone()
+    if not archived:
+        raise HTTPException(status_code=404, detail=f"{season} is not in the archive.")
+    return False
+
+
 @app.get("/api/stats/standings")
 def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
@@ -8930,6 +8956,7 @@ def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regula
     """
     conn = get_db_conn()
     try:
+        empty_is_genuine = _check_standings_request(conn, season, season_type)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -8942,8 +8969,14 @@ def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regula
             (season, season_type)
         )
         rows = cursor.fetchall()
-        
+        if not rows and not empty_is_genuine:
+            # An archived season with no standings rows is a pipeline gap, not
+            # a league without teams.
+            raise HTTPException(status_code=503, detail=(
+                f"{season} {season_type} standings have not been built from the archive."))
         return [dict(r) for r in rows]
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching standings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

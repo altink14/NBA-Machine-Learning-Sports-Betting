@@ -375,6 +375,20 @@ def check_model() -> None:
     check("the candidate model produces a probability",
           OK if 0.0 < p < 1.0 else BAD, f"{p:.4f} on a synthetic matchup")
 
+    # "Why this pick" is logged with every pick. If explaining breaks, picks
+    # still go out without one (main_api falls back to predict()), so this is
+    # the only place that failure would be noticed.
+    try:
+        p2, reasons = cand.predict_explained(frame, [(home, away)], ["2026-04-01"])
+        groups = (reasons[0] or {}).get("groups") or []
+        same = abs(float(p2[0]) - p) < 1e-12
+    except Exception as e:
+        return check("pick explanations work and match the pick", BAD, str(e)[:160])
+    check("pick explanations work and match the pick",
+          OK if same and groups else BAD,
+          f"{len(groups)} factors, top: {groups[0]['label']}" if same and groups
+          else "explained probability differs from predict()" if not same else "no factors")
+
     # Every team the archive has ever named must map to a modern franchise, or
     # the canonical map raises and takes the whole model down with it. This is
     # what actually broke: the 1996-2001 backfill introduced two names nobody
@@ -477,6 +491,46 @@ def check_feed(today: date, skip_network: bool) -> None:
               f"resolves to '{resolved}' — no NBA pick will be logged tonight")
 
 
+def check_operations(today: date) -> None:
+    section("OPERATIONS")
+    # Two things read OPENING_NIGHT besides this script: the preseason guard in
+    # main_api.log_predictions (keeps exhibition picks off the public record)
+    # and the in-season test that turns an empty odds board into a failure.
+    # Left stale, both quietly stop working next fall.
+    stale = today > OPENING_NIGHT + timedelta(days=270)
+    check("OPENING_NIGHT is this season's", BAD if stale else OK,
+          f"{OPENING_NIGHT} is last season's: bump it (and the three season constants)"
+          if stale else f"{OPENING_NIGHT}")
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(REPO_ROOT, ".env"))
+    except Exception:
+        pass
+    configured = bool((os.environ.get("LEDGER_SYNC_URL") or "").strip()
+                      and (os.environ.get("LEDGER_SYNC_SECRET") or "").strip())
+    check("the ledger is mirrored to the public server", OK if configured else PENDING,
+          "LEDGER_SYNC_URL and LEDGER_SYNC_SECRET set" if configured
+          else "no public server yet; push_ledger.py prints SKIPPED (DEPLOY.md 3a)")
+
+    # The data is backed up only by backup_to_drive.py (OneDrive is full and
+    # syncs nothing). A missing or old backup is a reminder, not a failure.
+    root = os.environ.get("BACKUP_ROOT") or ("D:" + chr(92) + "BettingBuddy-Backup")
+    if not os.path.isdir(root):
+        check("a recent data backup exists", PENDING,
+              f"{root} not found (drive unplugged?); run backup_to_drive.py")
+        return
+    dated = sorted(d for d in os.listdir(root)
+                   if len(d) >= 10 and d[:4].isdigit() and os.path.exists(os.path.join(root, d, "README.txt")))
+    if not dated:
+        check("a recent data backup exists", PENDING, f"no completed backup in {root}")
+        return
+    last = datetime.strptime(dated[-1][:10], "%Y-%m-%d").date()
+    age = (today - last).days
+    check("a recent data backup exists", OK if age <= 7 else PENDING,
+          f"last {last} ({age} day(s) ago)" + ("" if age <= 7 else "; run backup_to_drive.py"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Check everything opening night depends on.")
     ap.add_argument("--as-of", help="Pretend it is this date (YYYY-MM-DD).")
@@ -498,6 +552,7 @@ def main() -> int:
     check_ledger()
     check_model()
     check_feed(today, args.skip_network)
+    check_operations(today)
 
     bad = [r for r in results if r[0] == BAD]
     pending = [r for r in results if r[0] == PENDING]

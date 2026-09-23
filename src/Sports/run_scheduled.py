@@ -12,8 +12,8 @@ THE THREE JOBS AND WHY THEIR CADENCES DIFFER
              ones inside thirty minutes of kickoff, and those are the closing
              lines. Running it rarely would defeat the point.
 
-  hourly     the injury recorder and the predictor. Injuries move on a scale of
-             hours, and pulling ESPN's 9 MB feed every fifteen minutes would be
+  hourly     the injury recorders (NFL, NBA) and the predictor. Injuries move on
+             a scale of hours, and pulling ESPN's 9 MB feed every fifteen minutes would be
              rude to them and pointless to us. The predictor is idempotent (a
              UNIQUE key per game and model) so an hourly run simply catches any
              fixture that has come into the horizon.
@@ -101,6 +101,14 @@ JOBS = {
     ],
     "hourly": [
         ("injury recorder (NFL)", ["src/Sports/nfl/poll_injuries.py"]),
+        # Added 2026-09-23. Until then nothing recorded the NBA injury report
+        # at all: src/Utils/espn_injuries.py reads it at request time and
+        # keeps nothing, so "who was reported Out before that game?" had no
+        # answer anywhere. ESPN is free and the feed is ~50 KB. Unlike the NFL
+        # recorder this one exits 1 when the feed cannot be read, and writes a
+        # 'failed' poll row rather than an empty one, so this line goes red on
+        # an hour we could not see instead of saying "ok".
+        ("injury recorder (NBA)", ["src/Sports/nba/poll_injuries.py"]),
         ("predictions (NFL)", ["src/Sports/nfl/predict.py"]),
         # Last in the job, so the public copy gets this hour's picks. Says
         # SKIPPED (exit 0) until a public server is configured.

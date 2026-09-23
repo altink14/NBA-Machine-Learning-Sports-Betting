@@ -82,6 +82,12 @@ logger = logging.getLogger(__name__)
 # Latest season with complete data in the stats database.
 # Bump each fall once the new season's games start flowing in.
 CURRENT_SEASON = "2025-26"
+
+# The three season types the archive stores, spelled exactly as box_scores and
+# team_game_advanced store them, and the game-id prefix that encodes each.
+# Play-in games (005) are neither regular season nor playoffs; every
+# regular-season-only query must exclude them explicitly.
+GAME_ID_PREFIX_BY_SEASON_TYPE = {"Regular Season": "002", "Playoffs": "004", "PlayIn": "005"}
 # First season with play-by-play in pbp_events (backfill_pbp.py --season, one at a time).
 # Move this when another season lands; the frontend floor lives in archive-seasons.ts callers.
 #
@@ -845,12 +851,18 @@ class PredictionRunner:
         self.odds_provider = SbrOddsProvider(sportsbook=self.sportsbook, sport=self.sport)
         # The provider falls back from NBA to WNBA out of season; record what it
         # actually scraped so snapshots and the prediction log are labeled truthfully.
+        #
+        # If that cannot be read, it stays None. It used to fall back to the
+        # REQUESTED sport, 'NBA', and that is how 23 WNBA odds snapshots were
+        # stored as NBA lines. Unknown is recorded as unknown: run_predictions
+        # then saves no snapshot at all.
         try:
-            self.resolved_sport = self.odds_provider.get_resolved_sport() or self.sport
+            self.resolved_sport = self.odds_provider.get_resolved_sport() or None
         except Exception as exc:
-            logger.warning(f"Could not resolve scraped sport, falling back to '{self.sport}': {exc}")
-            self.resolved_sport = self.sport
-        if self.resolved_sport != self.sport:
+            logger.error("Could not tell which league the odds feed returned (%s). No odds "
+                         "snapshot will be saved from this run.", exc)
+            self.resolved_sport = None
+        if self.resolved_sport and self.resolved_sport != self.sport:
             logger.info(f"Requested sport '{self.sport}' resolved to '{self.resolved_sport}' by the odds provider.")
         self.xgb_ml_model, self.xgb_uo_model = self._load_xgboost_models()
 
@@ -1049,14 +1061,20 @@ class PredictionRunner:
                                   resolved_sport=resolved)
 
     def run_predictions(self):
-        resolved = getattr(self, 'resolved_sport', None) or self.sport
+        known_sport = getattr(self, 'resolved_sport', None)
+        resolved = known_sport or self.sport   # for messages only
         odds_data = self.odds_provider.get_odds()
         if not odds_data:
             return self._empty_board(resolved)
-        try:
-            snapshot_odds(odds_data, self.sportsbook, resolved)
-        except Exception as exc:
-            logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
+        if not known_sport:
+            logger.error("Not saving an odds snapshot for %d game(s): the league they belong "
+                         "to could not be determined, and a snapshot filed under the wrong "
+                         "sport is worse than none.", len(odds_data))
+        else:
+            try:
+                snapshot_odds(odds_data, self.sportsbook, known_sport)
+            except Exception as exc:
+                logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
         games_list = create_todays_games_from_odds(odds_data)
         if not games_list:
             if (resolved or "").upper() != "NBA":
@@ -4695,36 +4713,51 @@ def get_historical_matchup(request: Request, team1: str, team2: str, season: int
                 
             res1 = resolve_id(team1)
             res2 = resolve_id(team2)
-            
+
             if not res1 or not res2:
-                return {
-                    "team1": team1.upper(),
-                    "team2": team2.upper(),
-                    "season": season,
-                    "total_games": 0,
-                    "win_percentage": {team1.upper(): 0, team2.upper(): 0},
-                    "wins": {team1.upper(): 0, team2.upper(): 0},
-                    "matchups": []
-                }
+                # This used to answer with a 0-0 series, which reads as "they
+                # never met" rather than "we do not know that team".
+                unknown = [t for t, r in ((team1, res1), (team2, res2)) if not r]
+                raise HTTPException(status_code=404, detail=(
+                    f"Unknown team: {', '.join(unknown)}."))
                 
             tid1, name1 = res1["team_id"], res1["full_name"]
             tid2, name2 = res2["team_id"], res2["full_name"]
             
+            # The season series is the REGULAR season, as everywhere else it is
+            # quoted. This read every game type, so a playoff series -- and,
+            # since play-in games entered the archive, a play-in game -- was
+            # added to the head-to-head record. Postseason meetings are still
+            # returned, separately, in `postseason`.
             cursor.execute(
                 """
-                SELECT game_id, team_id, opp_team_id, game_date, pts, opp_pts
+                SELECT game_id, team_id, opp_team_id, game_date, pts, opp_pts, season_type
                 FROM team_game_advanced
                 WHERE team_id = ? AND opp_team_id = ? AND season = ?
+                ORDER BY game_date
                 """,
                 (tid1, tid2, season_str)
             )
-            rows = cursor.fetchall()
-            
+            all_rows = cursor.fetchall()
+            rows = [r for r in all_rows if r["season_type"] == "Regular Season"]
+            postseason_list = []
+            for r in all_rows:
+                if r["season_type"] == "Regular Season":
+                    continue
+                p1, p2 = r["pts"], r["opp_pts"]
+                postseason_list.append({
+                    "date": r["game_date"],
+                    "season_type": r["season_type"],
+                    "game_id": r["game_id"],
+                    "winner": (name1 if p1 > p2 else name2) if p1 is not None and p2 is not None else None,
+                    "score": {name1: p1, name2: p2},
+                })
+
             matchups_list = []
             team1_wins = 0
             team2_wins = 0
             total_games = 0
-            
+
             for r in rows:
                 pts1 = r["pts"] if r["pts"] is not None else 0
                 pts2 = r["opp_pts"] if r["opp_pts"] is not None else 0
@@ -4753,6 +4786,7 @@ def get_historical_matchup(request: Request, team1: str, team2: str, season: int
                 total_games += 1
                 matchups_list.append({
                     "date": r["game_date"],
+                    "season_type": r["season_type"],
                     "visitor": visitor,
                     "visitor_pts": visitor_pts,
                     "home": home,
@@ -4777,10 +4811,14 @@ def get_historical_matchup(request: Request, team1: str, team2: str, season: int
                     team1.upper(): team1_wins,
                     team2.upper(): team2_wins
                 },
-                "matchups": matchups_list
+                "matchups": matchups_list,
+                "series_scope": "Regular Season",
+                "postseason": postseason_list,
             }
         finally:
             conn.close()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching historical matchup details: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5909,7 +5947,9 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                 """
                 SELECT COUNT(*) as games, SUM(pts) as pts, SUM(ast) as ast, SUM(reb) as reb, SUM(min) as min
                 FROM player_game_log
-                WHERE player_id = ? AND game_id IN (SELECT game_id FROM box_scores WHERE season = ?)
+                WHERE player_id = ? AND game_id IN (
+                    SELECT game_id FROM box_scores
+                    WHERE season = ? AND season_type = 'Regular Season')
                 """,
                 (id, season)
             )
@@ -5927,7 +5967,9 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                 }
                 
         # Format properties
-        bio_position = bio_data.get("position") or "Forward/Guard"
+        # "N/A" like every other unknown field here. It said "Forward/Guard",
+        # which is a claim, not a placeholder.
+        bio_position = bio_data.get("position") or "N/A"
         bio_height = bio_data.get("height") or "N/A"
         bio_weight = bio_data.get("weight") or "N/A"
         bio_height_weight = f"{bio_height}, {bio_weight}lb" if (bio_height != "N/A" and bio_weight != "N/A") else f"{bio_height}"
@@ -5968,8 +6010,10 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                 "draft_round": bio_draft_round,
                 "draft_number": bio_draft_number,
                 "active": bool(player_info["is_active"]),
-                "instagram": player_info["full_name"].lower().replace(" ", ""),
-                "nicknames": "None"
+                # Both were invented: the "handle" was the name with the spaces
+                # taken out, which is somebody's account, just not reliably his.
+                "instagram": None,
+                "nicknames": None
             },
             "totals": totals,
             "advanced": advanced
@@ -6078,7 +6122,7 @@ def get_player_heat_calendar(id: int, season: Optional[str] = None):
                    g.plus_minus, g.starter,
                    CASE SUBSTR(g.game_id, 1, 3)
                         WHEN '004' THEN 'Playoffs'
-                        WHEN '005' THEN 'Play-In'
+                        WHEN '005' THEN 'PlayIn'
                         WHEN '001' THEN 'Preseason'
                         ELSE 'Regular Season' END AS season_type,
                    {GAME_SCORE_SQL} AS game_score
@@ -6359,10 +6403,19 @@ def get_team_roster(abbr: str, season: str = CURRENT_SEASON):
         conn.close()
 
 @app.get("/api/teams/{abbr}/games")
-def get_team_games(abbr: str, season: str = CURRENT_SEASON):
+def get_team_games(abbr: str, season: str = CURRENT_SEASON, season_type: Optional[str] = None):
     """
     Fetch all games played by a team in a season, including score, outcome, and location.
+
+    Every row carries `season_type` ("Regular Season", "Playoffs", "PlayIn").
+    Without it a play-in game was indistinguishable from a regular-season
+    one. `season_type` filters to one type; left out, every game is returned
+    as before, so a caller that wants regular-season-only numbers must ask
+    for them (or filter on the field).
     """
+    if season_type is not None and season_type not in GAME_ID_PREFIX_BY_SEASON_TYPE:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(GAME_ID_PREFIX_BY_SEASON_TYPE)}."))
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
@@ -6377,15 +6430,17 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
         cursor.execute(
             """
             SELECT tga.game_id, tga.game_date, tga.pts, tga.opp_pts, tga.season,
+                   tga.season_type,
                    m.abbreviation as opp_abbr, m.full_name as opp_name,
                    (CASE WHEN bs.home_team_id = ? THEN 1 ELSE 0 END) as is_home
             FROM team_game_advanced tga
             JOIN team_metadata m ON tga.opp_team_id = m.team_id
             JOIN box_scores bs ON tga.game_id = bs.game_id
             WHERE tga.team_id = ? AND tga.season = ?
+              AND (? IS NULL OR tga.season_type = ?)
             ORDER BY tga.game_date DESC
             """,
-            (team_id, team_id, season)
+            (team_id, team_id, season, season_type, season_type)
         )
         rows = cursor.fetchall()
         results = []
@@ -6395,6 +6450,8 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
             rec["wl"] = "W" if rec["pts"] > rec["opp_pts"] else "L"
             results.append(rec)
         return results
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching team games for {abbr}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -8649,7 +8706,7 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
 def get_daily_leaders(
     date: Optional[str] = None,
     category: str = "pts",
-    season_type: str = "Regular Season",
+    season_type: Optional[str] = None,
     limit: int = 10,
 ):
     """
@@ -8671,15 +8728,30 @@ def get_daily_leaders(
         raise HTTPException(
             status_code=400, detail=f"Category must be one of {sorted(CATEGORIES)}"
         )
+    # season_type used to be accepted, defaulted to "Regular Season", and
+    # ignored: a Finals night came back under a regular-season label. It is
+    # now honoured when given. Left out, every game type counts, which is what
+    # the endpoint has always actually returned (and what the page relies on:
+    # the latest night on record is often a playoff one).
+    if season_type is not None and season_type not in GAME_ID_PREFIX_BY_SEASON_TYPE:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(GAME_ID_PREFIX_BY_SEASON_TYPE)}."))
+    type_sql = ""
+    type_params: tuple = ()
+    if season_type is not None:
+        type_sql = " AND SUBSTR(g.game_id, 1, 3) = ?"
+        type_params = (GAME_ID_PREFIX_BY_SEASON_TYPE[season_type],)
 
     conn = get_db_conn()
     try:
         latest = conn.execute(
-            "SELECT MAX(DATE(game_date)) FROM player_game_log"
+            "SELECT MAX(DATE(g.game_date)) FROM player_game_log g WHERE 1=1" + type_sql,
+            type_params,
         ).fetchone()[0]
         day = (date or latest or "")[:10]
         if not day:
-            return {"date": None, "category": cat, "games": 0, "leaders": [], "available_dates": []}
+            return {"date": None, "category": cat, "season_type": season_type,
+                    "games": 0, "leaders": [], "available_dates": []}
 
         expr = CATEGORIES[cat]
         rows = conn.execute(
@@ -8690,29 +8762,33 @@ def get_daily_leaders(
                    {expr} AS value
             FROM player_game_log g
             JOIN players p ON p.player_id = g.player_id
-            WHERE DATE(g.game_date) = ?
+            WHERE DATE(g.game_date) = ?{type_sql}
             ORDER BY value DESC, g.min DESC
             LIMIT ?
             """,
-            (day, max(1, min(limit, 50))),
+            (day, *type_params, max(1, min(limit, 50))),
         ).fetchall()
 
         games = conn.execute(
-            "SELECT COUNT(DISTINCT game_id) FROM player_game_log WHERE DATE(game_date) = ?",
-            (day,),
+            "SELECT COUNT(DISTINCT g.game_id) FROM player_game_log g WHERE DATE(g.game_date) = ?"
+            + type_sql,
+            (day, *type_params),
         ).fetchone()[0]
 
         # Neighbouring dates, so a page can step night by night without guessing
         # which dates exist - the archive has gaps between seasons.
         prev_day = conn.execute(
-            "SELECT MAX(DATE(game_date)) FROM player_game_log WHERE DATE(game_date) < ?", (day,)
+            "SELECT MAX(DATE(g.game_date)) FROM player_game_log g WHERE DATE(g.game_date) < ?"
+            + type_sql, (day, *type_params)
         ).fetchone()[0]
         next_day = conn.execute(
-            "SELECT MIN(DATE(game_date)) FROM player_game_log WHERE DATE(game_date) > ?", (day,)
+            "SELECT MIN(DATE(g.game_date)) FROM player_game_log g WHERE DATE(g.game_date) > ?"
+            + type_sql, (day, *type_params)
         ).fetchone()[0]
 
         return {
             "date": day,
+            "season_type": season_type,
             "is_latest": day == latest,
             "latest_date": latest,
             "prev_date": prev_day,
@@ -9041,7 +9117,7 @@ SEASON_TYPE_BY_PREFIX = {
     "002": "Regular Season",
     "003": "All-Star",
     "004": "Playoffs",
-    "005": "Play-In",
+    "005": "PlayIn",   # the archive's own spelling (box_scores.season_type)
     "006": "Special Event",
 }
 
@@ -9084,6 +9160,12 @@ def get_league_schedule(
     (ESPN, ABC, NBC, Peacock, Prime Video). `hide_previous` drops dates before
     today. Every filter is optional and they compose.
     """
+    # Play-in games were labelled "Play-In" here while the archive stores
+    # "PlayIn", so ?season_type=PlayIn matched nothing and came back as an
+    # empty schedule. The label is now the archive's; the old spelling is
+    # still accepted on the way in.
+    if season_type == "Play-In":
+        season_type = "PlayIn"
     try:
         from src.Utils.nba_stats_client import get_client
 

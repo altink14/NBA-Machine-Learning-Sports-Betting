@@ -2003,7 +2003,7 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
     """
     One player-season translated into build language: body, per-36 profile,
     tracking extras where the era supports them (shot quality 2013-14+,
-    rebounding 2013-14+, clutch 2022-23+), and editorial build notes derived
+    rebounding 2013-14+, clutch from PBP_FIRST_SEASON), and editorial build notes derived
     from those measured numbers.
     """
     conn = get_db_conn()
@@ -2072,7 +2072,7 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
         "method": (
             "Every number here was measured from real NBA games in our own archive. "
             "The camera-tracked sections only exist from 2013-14 on (and clutch "
-            "from 2022-23) - older seasons show what the box score can tell, "
+            f"from {PBP_FIRST_SEASON}) - older seasons show what the box score can tell, "
             "honestly labeled. The build notes are our reading of those real "
             "numbers as build priorities - nothing in-game, no badge math."
         ),
@@ -2367,7 +2367,7 @@ def get_game_officials(game_id: str):
 @app.get("/api/games/{game_id}/line-score")
 def get_game_line_score(game_id: str):
     """Points by period, derived from the play-by-play period-end events
-    (2022-23 onward, where pbp_events exists). Overtime periods are labelled
+    (PBP_FIRST_SEASON onward, where pbp_events exists). Overtime periods are labelled
     OT1, OT2... available=false when the game has no play-by-play on file."""
     key = ("line", game_id)
     if key in _market_cache:
@@ -5656,7 +5656,7 @@ def get_player_heat_calendar(id: int, season: Optional[str] = None):
 
     Returns the seasons this player actually has games for, so a caller can offer
     only those rather than a season list the player was not in - the game-log
-    archive starts in 2022-23, and a calendar rendered empty for a retired player
+    archive starts in 1996-97, and a calendar rendered empty for a retired player
     would look broken rather than out of range.
     """
     conn = get_db_conn()
@@ -7752,7 +7752,7 @@ def get_game_shot_chart(request: Request, game_id: str):
 # less of an achievement than a twelve-game run of scoring thirty, so this board
 # sorts by how rare a streak of that length has been rather than by how long it is.
 #
-# Rarity is measured against our own archive, 2022-23 onward. That is not
+# Rarity is measured against our own archive, 1996-97 onward. That is not
 # "historical" in the all-time sense and the response says so rather than
 # implying a century of context.
 #
@@ -9425,7 +9425,7 @@ def _get_elo_history() -> Dict[str, Any]:
 def get_power_ratings(season: str = CURRENT_SEASON):
     """
     FiveThirtyEight-style Elo power ratings (see src/Utils/elo.py for the
-    methodology). Elo runs continuously from 2022-23 through today, with 25%
+    methodology). Elo runs continuously from 1996-97 through today, with 25%
     reversion toward 1505 between seasons; `season` selects which season's
     final (or, mid-season, current) state to report.
     """

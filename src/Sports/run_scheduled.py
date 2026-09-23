@@ -43,7 +43,8 @@ WHAT A MISSED RUN ACTUALLY COSTS, WHICH DIFFERS BY JOB.
   the recorder running; the repair path is for accidents, not a substitute.
 
 THE DAILY JOB SPENDS MONEY, CAREFULLY. `repair_odds.py --unattended` runs here
-every night. Unattended spending earns its guardrails: a three-day window, a
+every night, once per sport (NFL, then NBA; they share one key and each
+re-reads the balance). Unattended spending earns its guardrails: a three-day window, a
 90-credit cap (three kickoff times), a backlog worked down a slice a night
 rather than bought in one gulp, and a hard refusal to spend if it would leave
 the live recorder short -- a price we can still watch beats one we would have
@@ -153,6 +154,15 @@ JOBS = {
         # Repair before the seal, so anything rebuilt tonight is sealed by the
         # step after it as well as by the repair's own seal.
         ("repair missed odds (NFL)", ["src/Sports/repair_odds.py", "--sport", "nfl",
+                                      "--unattended", "--apply"]),
+        # The NBA equivalent, added 2026-09-23. Same unattended guards, and
+        # it runs second so the NFL repair has spent whatever it spent before
+        # this one re-reads the balance. It learns the slate from ESPN's free
+        # scoreboard; in the offseason that is empty and the step spends 0
+        # credits. It exits 1 if the schedule cannot be read, because "we
+        # could not look" is not "nothing was missed". No seal step follows:
+        # the NBA's CLV reads odds_snapshots directly.
+        ("repair missed odds (NBA)", ["src/Sports/repair_odds.py", "--sport", "nba",
                                       "--unattended", "--apply"]),
         ("odds seal (NFL)", ["src/Sports/odds_recorder.py", "--sport", "nfl", "--seal"]),
         # Last, because it reads the closing lines the two steps above produce.

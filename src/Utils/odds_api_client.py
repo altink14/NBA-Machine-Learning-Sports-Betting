@@ -61,8 +61,10 @@ _EXTRA_COLUMNS = [
 ]
 
 #: Every row already in the table was written by the live recorder, so
-#: 'observed' is the truth for all of them, not a guess. Nothing has ever
-#: written a reconstructed NBA snapshot: the repair path is NFL-only today.
+#: 'observed' is the truth for all of them, not a guess. Only rows written
+#: before the column existed are touched: the NBA repair path
+#: (src/Sports/repair_odds.py --sport nba, 2026-09-23) always writes
+#: 'reconstructed' explicitly, so it never reaches this backfill.
 _PROVENANCE_BACKFILL = (
     "UPDATE odds_snapshots SET provenance = 'observed' WHERE provenance IS NULL")
 

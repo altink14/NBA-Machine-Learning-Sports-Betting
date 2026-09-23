@@ -141,7 +141,7 @@ generally cannot run on Railway. The working pipeline:
 Found 2026-09-22. The ledger is `predictions_log` in `OddsData.sqlite`, and as
 things stand a deploy creates TWO of them:
 
-| | Laptop | Production server |
+| | Home PC | Production server |
 |---|---|---|
 | Writes predictions | 9am job (`daily_update.py`) and any `/predictions` visit | any `/predictions` visit |
 | Records closing lines | yes, every 15 minutes | no |
@@ -151,9 +151,9 @@ things stand a deploy creates TWO of them:
 So on the live site the public record would be rows written whenever a
 visitor happened to load the picks, built on team stats only as fresh as the
 last snapshot, and never graded. The complete, graded record would sit on
-the laptop where nobody can see it.
+the home PC where nobody can see it.
 
-Two guards landed with this note; neither changes laptop behaviour:
+Two guards landed with this note; neither changes how the home PC behaves:
 
 - `bootstrap_db.py` never overwrites an existing `OddsData.sqlite`. Before
   this, the refresh in section 3 (delete TeamData, redeploy) re-extracted the
@@ -164,21 +164,21 @@ Two guards landed with this note; neither changes laptop behaviour:
 
 The decision still needed is which machine is the single writer:
 
-- **A. Laptop writes, production mirrors (recommended).** Everything that
-  already works stays where it is. After the 9am job, the laptop pushes
+- **A. Home PC writes, production mirrors (recommended).** Everything that
+  already works stays where it is. After the 9am job, the home PC pushes
   `OddsData.sqlite` (about 5 MB) to production through a key-protected
   upload that refuses any file missing or altering a row production already
   has, so the public record can only grow. Production shows the picks that
   were logged instead of recomputing them on older team stats: the pick a
   visitor sees is the pick on the record. Cost: the upload route, the push
-  step and its checks, roughly a day. Risk: if the laptop is off, the record
+  step and its checks, roughly a day. Risk: if the home PC is off or offline, the record
   is late; it is never wrong.
 - **B. Production writes.** Move the recorder, grader and logging to the
   server. Blocked by the same thing as section 3: stats.nba.com refuses
   cloud IPs, so the server's team stats (and so its picks) are only as fresh
   as the last snapshot.
-- **C. The laptop IS the backend,** exposed through a tunnel. One copy, no
-  sync, but the whole site goes down whenever the laptop sleeps, restarts or
+- **C. The home PC IS the backend,** exposed through a tunnel. One copy, no
+  sync, but the whole site goes down whenever the home PC sleeps, restarts or
   loses Wi-Fi.
 
 ## Env inventory

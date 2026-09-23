@@ -173,7 +173,7 @@ PROTECTED_PATH_PREFIXES = (
 ALWAYS_OPEN_PATHS = {"/", "/health"}
 
 # LOG_PREDICTIONS_ON_REQUEST: whether a visit to /predictions writes to the
-# ledger. Default on, which is how the laptop has always worked. Set it to
+# ledger. Default on, which is how the home PC has always worked. Set it to
 # "false" on any server that is NOT the ledger's single writer. The ledger is
 # first-write-wins, so two machines writing their own copies each keep a
 # different "first" pick for the same game, built from different data, and

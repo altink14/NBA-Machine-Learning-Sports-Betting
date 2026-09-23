@@ -8,14 +8,16 @@ integrated with rate-limiting, exponential-backoff retries, and two-tier disk ca
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
+import tempfile
 import time
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 # Import nba_api endpoints
 from nba_api.stats.endpoints import (
@@ -56,38 +58,122 @@ _BACKFILL_RATE_DELAY = 2.0
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2.0
 
+# On-disk format. Every entry used to be a plain `<key>.json`; new writes are
+# `<key>.json.gz` (the cache is ~90% smaller gzipped: 4.1 GB -> ~0.44 GB,
+# measured 2026-09-23). Plain .json files stay readable forever - nothing has
+# to be converted for the cache to keep working, and compact_nba_cache.py can
+# convert the old ones at leisure. A cache key's ".json" path is still the
+# canonical name; the gzip file is the same name plus ".gz".
+_GZ_SUFFIX = ".gz"
+
+
 def _cache_path(endpoint: str, params: Dict[str, Any]) -> Path:
     safe_params = {k: v for k, v in sorted(params.items()) if v is not None}
     key = endpoint + "_" + "_".join(f"{k}={v}" for k, v in safe_params.items())
     key = "".join(c if c.isalnum() or c in "-_=." else "_" for c in key)
     return _CACHE_ROOT / f"{key}.json"
 
+
+def gz_path(path: Path) -> Path:
+    """The gzip sibling of a cache entry's plain `.json` path."""
+    path = Path(path)
+    return path if path.name.endswith(".json" + _GZ_SUFFIX) else path.with_name(path.name + _GZ_SUFFIX)
+
+
+def plain_path(path: Path) -> Path:
+    """The plain `.json` name of a cache entry, given either of its two names."""
+    path = Path(path)
+    if path.name.endswith(".json" + _GZ_SUFFIX):
+        return path.with_name(path.name[: -len(_GZ_SUFFIX)])
+    return path
+
+
+def load_cache_file(path) -> Any:
+    """Parse one cache file, gzipped or plain, chosen by its name.
+
+    The whole gzip stream is decompressed before any JSON is parsed, so a
+    truncated or corrupt .gz raises (EOFError / BadGzipFile / zlib.error)
+    instead of yielding a prefix of the payload. Callers that treat a bad
+    entry as a miss catch Exception.
+    """
+    path = Path(path)
+    with open(path, "rb") as f:
+        raw = f.read()
+    if path.name.endswith(_GZ_SUFFIX):
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def cache_candidates(path: Path) -> List[Tuple[Path, os.stat_result]]:
+    """The files that currently exist for one cache key, newest first.
+
+    Both formats can exist at once: an old-format writer (a process still
+    running the previous version of this module) may refresh `.json` after a
+    `.json.gz` was written, or compact_nba_cache.py may be mid-conversion. The
+    newest copy is the truth; on a tie (the compactor preserves mtime) the
+    gzip copy is tried first.
+    """
+    path = plain_path(path)
+    found = []
+    for rank, p in enumerate((gz_path(path), path)):
+        try:
+            found.append((p, p.stat(), rank))
+        except OSError:
+            continue
+    found.sort(key=lambda t: (-t[1].st_mtime, t[2]))
+    return [(p, s) for p, s, _ in found]
+
+
 def _read_cache(path: Path, ttl_seconds: Optional[int]) -> Optional[Dict]:
-    if not path.exists():
-        return None
-    if ttl_seconds is not None:
-        age = time.time() - path.stat().st_mtime
-        if age > ttl_seconds:
-            return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        logger.debug("Cache read error (%s): %s", path, exc)
-        return None
+    """A cached payload for this key, or None to mean "fetch it".
+
+    None covers: no file, every copy older than the TTL, and every copy
+    unreadable. A partial or corrupt file is never returned as data.
+    """
+    now = time.time()
+    for candidate, st in cache_candidates(path):
+        if ttl_seconds is not None and now - st.st_mtime > ttl_seconds:
+            continue
+        try:
+            return load_cache_file(candidate)
+        except Exception as exc:
+            logger.debug("Cache read error (%s): %s", candidate, exc)
+            continue
+    return None
+
 
 def _write_cache(path: Path, data: Dict) -> None:
-    tmp = path.with_suffix(".tmp")
+    """Write `<key>.json.gz` atomically: a unique temp file, then replace.
+
+    Readers therefore see the old complete file or the new complete file,
+    never a half-written one. Once the gzip copy is in place, a plain `.json`
+    for the same key is superseded and removed (best effort - if another
+    process holds it open, it stays, and the newest-first read rule still
+    picks the fresh copy).
+    """
+    path = plain_path(path)
+    target = gz_path(path)
+    tmp_name = None
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        tmp.replace(path)
+        payload = gzip.compress(json.dumps(data).encode("utf-8"), compresslevel=6)
+        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.replace(tmp_name, target)
+        tmp_name = None
     except Exception as exc:
-        logger.debug("Cache write error (%s): %s", path, exc)
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        logger.debug("Cache write error (%s): %s", target, exc)
+        return
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Could not remove superseded %s: %s", path, exc)
 
 class NBAStatsClient:
     """
@@ -400,9 +486,14 @@ class NBAStatsClient:
     ) -> List[Dict]:
         """
         League-wide FG% by shot zone for a season (the "LeagueAverages" result
-        set of shotchartdetail). Fetched with player_id=0/team_id=0 so the
-        Shot_Chart_Detail set is empty and the payload stays tiny. One call
+        set of shotchartdetail), fetched with player_id=0/team_id=0. One call
         serves every player/game for the season; disk-cached in nba_cache.
+
+        The payload is NOT small: player_id=0 means "every player", so the
+        Shot_Chart_Detail set comes back with the league's shots (102,400
+        rows for 2024-25) alongside the 20 LeagueAverages rows - about 26 MB per season on disk
+        (measured 2026-09-23; ~2 MB gzipped). With a 24 h TTL that is a 26 MB
+        refetch per season per day of use.
         """
         params = {
             "team_id": 0,

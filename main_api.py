@@ -1,7 +1,9 @@
 # main_api.py
 # FINAL STABLE VERSION - Corrected endpoint routing and data handling.
+import bisect
 import collections
 import threading
+import time
 import glob
 import re
 import os
@@ -80,6 +82,12 @@ logger = logging.getLogger(__name__)
 # Latest season with complete data in the stats database.
 # Bump each fall once the new season's games start flowing in.
 CURRENT_SEASON = "2025-26"
+
+# The three season types the archive stores, spelled exactly as box_scores and
+# team_game_advanced store them, and the game-id prefix that encodes each.
+# Play-in games (005) are neither regular season nor playoffs; every
+# regular-season-only query must exclude them explicitly.
+GAME_ID_PREFIX_BY_SEASON_TYPE = {"Regular Season": "002", "Playoffs": "004", "PlayIn": "005"}
 # First season with play-by-play in pbp_events (backfill_pbp.py --season, one at a time).
 # Move this when another season lands; the frontend floor lives in archive-seasons.ts callers.
 #
@@ -396,6 +404,81 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
 # never reach predictions_log (the public track record grades what is in there)
 # and are filtered again on the way out, in case any were written historically.
 SIMULATED_MODEL_TAG = "implied_probability_sim"
+
+# --- What a /predictions answer means ----------------------------------------
+# Every result from PredictionRunner.run_predictions() carries one of these in
+# `status`. Before 2026-09-23 a broken run and an empty slate looked the same:
+# HTTP 200, `predictions: []`, and an "error" string nobody's code read. The
+# picks board then said "no games on the board", which was a lie whenever the
+# real answer was "we could not compute the picks".
+#
+#   ok           model picks are in `predictions`.
+#   market_only  NBA games are on the board but the team-stats snapshot covers
+#                none of them, so `predictions` holds the market's own de-vigged
+#                probabilities tagged SIMULATED_MODEL_TAG. Never logged, never
+#                graded. Still HTTP 200 (see the note in run_predictions).
+#   no_games     there are no NBA games to predict (the odds feed fell back to
+#                another league, which it does in the NBA offseason). HTTP 200.
+#   no_odds      the odds feed produced nothing usable and, outside the regular
+#                season, we cannot tell an empty board from a failed scrape
+#                (sbrscrape swallows its own request errors into "no games").
+#                HTTP 200, with a `message` that says exactly that.
+#   failed       something that should have worked did not. The endpoint turns
+#                this into HTTP 503 with `error` as the detail.
+PRED_STATUS_OK = "ok"
+PRED_STATUS_MARKET_ONLY = "market_only"
+PRED_STATUS_NO_GAMES = "no_games"
+PRED_STATUS_NO_ODDS = "no_odds"
+PRED_STATUS_FAILED = "failed"
+# Ledger mode only (PREDICTIONS_SOURCE=ledger): nothing has been logged for
+# today yet. That is either no slate or a morning run that has not happened
+# or failed; the public server cannot tell which, and says so in `note`.
+PRED_STATUS_NOT_LOGGED = "not_logged"
+
+# /sportsbooks advertises these; anything else can only ever produce an empty
+# board, which is a plausible answer to a typo. Refuse it instead.
+SUPPORTED_SPORTSBOOKS = ("fanduel", "draftkings", "betmgm",
+                         "pointsbet", "caesars", "wynn", "bet_rivers_ny")
+
+# The last date of a regular season on which every seven-day window is certain
+# to contain NBA games. The league's regular season ends in the second week of
+# April; the 10th is a safe floor. Month and day only -- the year is the one
+# after OPENING_NIGHT.
+_REGULAR_SEASON_SAFE_END = (4, 10)
+
+
+def _nba_regular_season_under_way(today=None) -> bool:
+    """True only on dates when an empty NBA board cannot be genuine.
+
+    Opening night comes from preflight_opening_night.OPENING_NIGHT, the one
+    constant daily_update also reads, so there is still only one date to bump
+    each fall. If it cannot be read, or it has not been bumped and the window
+    has passed, this returns False: the endpoint then falls back to the
+    cautious "no_odds" answer rather than ever crying failure on a genuine
+    offseason day.
+    """
+    if today is None:
+        today = to_nba_date(datetime.now(timezone.utc)) or datetime.now().date()
+    try:
+        from preflight_opening_night import OPENING_NIGHT
+    except Exception:
+        return False
+    end = OPENING_NIGHT.replace(year=OPENING_NIGHT.year + 1,
+                                month=_REGULAR_SEASON_SAFE_END[0],
+                                day=_REGULAR_SEASON_SAFE_END[1])
+    return OPENING_NIGHT <= today <= end
+
+
+def _prediction_result(status: str, sportsbook: str, *, message: Optional[str] = None,
+                       error: Optional[str] = None, **extra) -> Dict[str, Any]:
+    """An empty-predictions result that says why it is empty."""
+    out: Dict[str, Any] = {"sportsbook": sportsbook, "status": status, "predictions": []}
+    if message:
+        out["message"] = message
+    if error:
+        out["error"] = error
+    out.update(extra)
+    return out
 
 
 #: The NBA prediction log, with the guarantees the NFL ledger has had from the
@@ -768,12 +851,18 @@ class PredictionRunner:
         self.odds_provider = SbrOddsProvider(sportsbook=self.sportsbook, sport=self.sport)
         # The provider falls back from NBA to WNBA out of season; record what it
         # actually scraped so snapshots and the prediction log are labeled truthfully.
+        #
+        # If that cannot be read, it stays None. It used to fall back to the
+        # REQUESTED sport, 'NBA', and that is how 23 WNBA odds snapshots were
+        # stored as NBA lines. Unknown is recorded as unknown: run_predictions
+        # then saves no snapshot at all.
         try:
-            self.resolved_sport = self.odds_provider.get_resolved_sport() or self.sport
+            self.resolved_sport = self.odds_provider.get_resolved_sport() or None
         except Exception as exc:
-            logger.warning(f"Could not resolve scraped sport, falling back to '{self.sport}': {exc}")
-            self.resolved_sport = self.sport
-        if self.resolved_sport != self.sport:
+            logger.error("Could not tell which league the odds feed returned (%s). No odds "
+                         "snapshot will be saved from this run.", exc)
+            self.resolved_sport = None
+        if self.resolved_sport and self.resolved_sport != self.sport:
             logger.info(f"Requested sport '{self.sport}' resolved to '{self.resolved_sport}' by the odds provider.")
         self.xgb_ml_model, self.xgb_uo_model = self._load_xgboost_models()
 
@@ -809,7 +898,7 @@ class PredictionRunner:
             return df
         except Exception as e:
             logger.error(f"Failed to load team stats from database: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Server configuration error: Could not load team stats.")
+            raise HTTPException(status_code=503, detail="Server configuration error: Could not load team stats.")
 
     def _last_game_dates(self):
         """{team full name: [game dates]} from the archive, most recent first.
@@ -938,20 +1027,78 @@ class PredictionRunner:
             return xgb_ml, xgb_uo
         except xgb.core.XGBoostError as e:
             logger.error(f"Failed to load XGBoost models: {e}")
-            raise HTTPException(status_code=500, detail="Server configuration error: Could not load prediction models.")
+            raise HTTPException(status_code=503, detail="Server configuration error: Could not load prediction models.")
+
+    def _empty_board(self, resolved: str) -> Dict[str, Any]:
+        """The odds provider gave us nothing priced. Say what that means.
+
+        sbrscrape.Scoreboard catches every exception it hits (a timeout, a
+        503, SBR changing its page) and reports it as an empty list of games,
+        and SbrOddsProvider then looks seven days ahead and falls back to the
+        WNBA. So "no games" from this feed is EITHER a genuinely empty board
+        OR a failed scrape, and nothing in its output separates the two.
+
+        During the regular season the calendar separates them: there is no
+        seven-day stretch between opening night and mid-April without NBA
+        games, so an empty board is a failure. Outside it we say honestly
+        that we cannot tell.
+        """
+        scraped = len(getattr(self.odds_provider, "games", None) or [])
+        in_season = _nba_regular_season_under_way()
+        if scraped:
+            what = (f"{scraped} {resolved} game(s) are on the board, but {self.sportsbook} "
+                    f"has not posted a moneyline for any of them.")
+        else:
+            what = (f"The odds feed returned no {resolved} games for the next 7 days. "
+                    "The scraper reports a failed request the same way, so this is either "
+                    "an empty board or a failed scrape.")
+        if in_season:
+            logger.error("Prediction run FAILED during the NBA season: %s", what)
+            return _prediction_result(
+                PRED_STATUS_FAILED, self.sportsbook,
+                error=what + " The NBA regular season is under way, so it is a failure.")
+        return _prediction_result(PRED_STATUS_NO_ODDS, self.sportsbook, message=what,
+                                  resolved_sport=resolved)
 
     def run_predictions(self):
+        known_sport = getattr(self, 'resolved_sport', None)
+        resolved = known_sport or self.sport   # for messages only
         odds_data = self.odds_provider.get_odds()
         if not odds_data:
-            return {"error": f"No odds data found from {self.sportsbook}.", "predictions": []}
-        try:
-            snapshot_odds(odds_data, self.sportsbook, getattr(self, 'resolved_sport', self.sport) or self.sport)
-        except Exception as exc:
-            logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
+            return self._empty_board(resolved)
+        if not known_sport:
+            logger.error("Not saving an odds snapshot for %d game(s): the league they belong "
+                         "to could not be determined, and a snapshot filed under the wrong "
+                         "sport is worse than none.", len(odds_data))
+        else:
+            try:
+                snapshot_odds(odds_data, self.sportsbook, known_sport)
+            except Exception as exc:
+                logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
         games_list = create_todays_games_from_odds(odds_data)
         if not games_list:
-            return {"error": "No valid games processed from odds data.", "predictions": []}
-        
+            if (resolved or "").upper() != "NBA":
+                # The provider found no NBA games on any of the next seven days
+                # and fell back to another league. Out of season that is the
+                # offseason; in season it means the NBA scrape failed seven
+                # times in a row and the WNBA one did not.
+                if _nba_regular_season_under_way():
+                    msg = (f"The odds feed found no NBA games in the next 7 days and fell back to "
+                           f"{resolved}, during the NBA regular season. The NBA scrape failed.")
+                    logger.error(msg)
+                    return _prediction_result(PRED_STATUS_FAILED, self.sportsbook, error=msg)
+                return _prediction_result(
+                    PRED_STATUS_NO_GAMES, self.sportsbook, resolved_sport=resolved,
+                    message=(f"No NBA games in the next 7 days (the odds feed fell back to "
+                             f"{resolved}, which the model does not cover)."))
+            # NBA odds, but not one team name we recognise: the feed changed
+            # its spelling, which is a failure, not an empty slate.
+            names = sorted({t for key in odds_data for t in key.split(":")})[:6]
+            msg = (f"{len(odds_data)} NBA game(s) had odds, but none of their team names "
+                   f"matched the model's team list (e.g. {', '.join(names)}).")
+            logger.error(msg)
+            return _prediction_result(PRED_STATUS_FAILED, self.sportsbook, error=msg)
+
         # Check if we have database stats for the teams. If not, use bookmaker odds simulation.
         has_stats = False
         for home_team, away_team in games_list:
@@ -966,7 +1113,14 @@ class PredictionRunner:
                 break
 
         if not has_stats:
-            logger.info("No teams in today's games have stats in database. Using bookmaker implied probability simulation.")
+            # Every current NBA team is in every team-stats snapshot, so this
+            # branch means the snapshot is broken or renamed its teams. It is
+            # kept at HTTP 200 because the picks board already renders these
+            # rows as "on the slate, but not model picks" -- but it is logged
+            # as an error, and the result says market_only, not ok.
+            logger.error("No team in today's %d game(s) is in the team-stats table %s. Serving "
+                         "the market's own probabilities, tagged %s -- NOT model picks.",
+                         len(games_list), getattr(self, 'team_stats_table', '?'), SIMULATED_MODEL_TAG)
             predictions_list = []
             for home_team, away_team in games_list:
                 game_key = f"{home_team}:{away_team}"
@@ -1013,19 +1167,20 @@ class PredictionRunner:
                     else:
                         prob_home_norm = 0.5
                 
-                # Simulate a small model edge (e.g. adding 2% to favored team or a slight variation)
-                # to show a positive Expected Value and Kelly Criterion suggestion!
+                # The market's own favourite at the market's own probability.
+                # This used to add two points to the favourite "to show a
+                # positive Expected Value and Kelly Criterion suggestion" -- an
+                # edge invented from nothing, with a bet size attached, on a
+                # board whose copy says these numbers are "only the market's
+                # own implied probabilities". At the de-vigged price the EV is
+                # honest (about zero, less the vig) and Kelly says no bet.
                 if prob_home_norm >= 0.5:
-                    winner_confidence = min(0.99, prob_home_norm + 0.02)
+                    winner_confidence = prob_home_norm
                     winner_idx = 1
                 else:
-                    winner_confidence = min(0.99, (1 - prob_home_norm) + 0.02)
+                    winner_confidence = 1 - prob_home_norm
                     winner_idx = 0
-                
-                # Under/Over prediction: default to UNDER with a 51% simulated confidence
-                ou_idx = 0
-                ou_confidence = 0.51
-                
+
                 ev_home, ev_away, kelly_home, kelly_away = 0.0, 0.0, "No Bet", "No Bet"
                 try:
                     if home_odd is not None and away_odd is not None:
@@ -1086,19 +1241,31 @@ class PredictionRunner:
                     "home_team": home_team, "away_team": away_team, "home_odds": home_odd, "away_odds": away_odd,
                     "under_over_line": uo_line, "predicted_winner": home_team if winner_idx == 1 else away_team,
                     "winner_confidence": round(winner_confidence * 100, 2),
-                    "under_over_prediction": "OVER" if ou_idx == 1 else "UNDER",
-                    "under_over_confidence": round(ou_confidence * 100, 2), "model": SIMULATED_MODEL_TAG,
+                    # There was a hardcoded "UNDER at 51%" here. The over/under
+                    # pick is withdrawn everywhere, and this one was not even a
+                    # model's: it was a constant.
+                    "under_over_prediction": None,
+                    "under_over_confidence": None, "model": SIMULATED_MODEL_TAG,
                     "expected_value": {"home_team": ev_home, "away_team": ev_away},
                     "kelly_criterion": {"home_team": kelly_home, "away_team": kelly_away},
                     "game_start_time_utc": game_start_time_str
                 })
-            return self._attach_availability({"sportsbook": self.sportsbook, "predictions": predictions_list})
+            return self._attach_availability({
+                "sportsbook": self.sportsbook, "status": PRED_STATUS_MARKET_ONLY,
+                "message": ("The team-stats snapshot covers none of these teams, so the model "
+                            "could not price them. These are the market's own probabilities, "
+                            "not picks."),
+                "predictions": predictions_list})
 
         (data_for_model, todays_games_uo, frame_ml, home_team_odds, away_team_odds,
          game_start_times, processed_games, game_dates) = self._prepare_data_for_model(games_list, odds_data)
 
         if data_for_model.size == 0:
-            return {"error": "Could not prepare valid data for the prediction model.", "predictions": []}
+            msg = (f"Could not prepare valid data for the prediction model: none of the "
+                   f"{len(games_list)} game(s) had team stats for both sides in "
+                   f"{getattr(self, 'team_stats_table', 'the team-stats table')}.")
+            logger.error(msg)
+            return _prediction_result(PRED_STATUS_FAILED, self.sportsbook, error=msg)
 
         ml_predictions, ou_predictions = self._run_xgboost_models(data_for_model, frame_ml, todays_games_uo)
 
@@ -1148,9 +1315,16 @@ class PredictionRunner:
                                              calibrated_ml=calibrated_ml)
         if calibrated_ml and pick_explanations:
             _attach_why(formatted.get("predictions") or [], pick_explanations)
+        formatted["status"] = PRED_STATUS_OK
+        skipped = getattr(self, "games_without_stats", None) or []
+        if skipped:
+            formatted["games_without_stats"] = skipped
+            formatted["message"] = (f"{len(skipped)} game(s) on the board have no team-stats row "
+                                    f"and have no pick: {', '.join(skipped)}.")
         return self._attach_availability(formatted)
 
     def _prepare_data_for_model(self, games, odds):
+        self.games_without_stats = []
         game_data_list, home_odds_list, away_odds_list, uo_lines_list, game_start_times_list = [], [], [], [], []
         processed_games, game_dates_list = [], []
 
@@ -1174,6 +1348,9 @@ class PredictionRunner:
                 
             if home_stats_rows.empty or away_stats_rows.empty:
                 logger.warning(f"Skipping game {home_team} vs {away_team}: statistics row not found in database.")
+                # Recorded so the response can say a game is missing, rather
+                # than a 12-game slate quietly arriving as 11 picks.
+                self.games_without_stats.append(f"{away_team} @ {home_team}")
                 continue
 
             home_stats = home_stats_rows.iloc[0].copy()
@@ -1555,6 +1732,22 @@ predictions_cache = {}
 @app.get("/predictions")
 @limiter.limit(RATE_LIMIT_EXPENSIVE)
 def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kelly_criterion: bool = True, sport: str = 'NBA'):
+    """Today's picks, with `status` saying what an empty list means.
+
+    200 + status ok / market_only / no_games / no_odds (see PRED_STATUS_*).
+    503 when the run failed: a caller must never be able to mistake "we could
+    not compute the picks" for "there are no games".
+    400 for a sportsbook or sport we do not serve, which used to come back as
+    a perfectly plausible empty board.
+    """
+    sportsbook = (sportsbook or "").strip().lower()
+    if sportsbook not in SUPPORTED_SPORTSBOOKS:
+        raise HTTPException(status_code=400, detail=(
+            f"Unknown sportsbook '{sportsbook}'. Supported: {', '.join(SUPPORTED_SPORTSBOOKS)}."))
+    if (sport or "").strip().upper() != "NBA":
+        raise HTTPException(status_code=400, detail=(
+            f"sport='{sport}' is not served. The model and the prediction record cover the NBA only."))
+    sport = "NBA"
     if PREDICTIONS_SOURCE == "ledger":
         return _predictions_from_ledger(sportsbook, kelly_criterion, sport)
     cache_key = f"{sportsbook}_{kelly_criterion}_{sport}"
@@ -1575,18 +1768,24 @@ def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kell
     try:
         runner = PredictionRunner(sportsbook=sportsbook, kelly_criterion=kelly_criterion, sport=sport)
         res = runner.run_predictions()
-        predictions_cache[cache_key] = (res, now)
-        try:
-            # Log the sport the odds provider actually resolved (the NBA->WNBA
-            # offseason fallback means it is not always the requested one).
-            if LOG_PREDICTIONS_ON_REQUEST:
-                log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
-        except Exception as exc:
-            logger.warning(f"Prediction logging failed (non-fatal): {exc}")
-        return res
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in /predictions endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
+    if res.get("status") == PRED_STATUS_FAILED:
+        # Not cached: a failure should be retried on the next request rather
+        # than served for five minutes.
+        raise HTTPException(status_code=503, detail=res.get("error") or "The prediction run failed.")
+    predictions_cache[cache_key] = (res, now)
+    try:
+        # Log the sport the odds provider actually resolved (the NBA->WNBA
+        # offseason fallback means it is not always the requested one).
+        if LOG_PREDICTIONS_ON_REQUEST:
+            log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
+    except Exception as exc:
+        logger.warning(f"Prediction logging failed (non-fatal): {exc}")
+    return res
 
 # --- Parlay Evaluation ---
 class ParlayLeg(BaseModel):
@@ -2062,9 +2261,10 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
         except Exception:
             sq_row = None
         try:
-            rb = get_rebounding_chances(season)
+            rb = _rebounding_for(season, "Regular Season")
             reb_row = next((p for p in rb.get("players", []) if p.get("player_id") == player_id), None)
-        except Exception:
+        except Exception as exc:
+            logger.warning("2K DNA: rebounding tracking unavailable for %s: %s", season, exc)
             reb_row = None
     if season >= PBP_FIRST_SEASON:
         try:
@@ -2708,6 +2908,19 @@ def get_rebounding_chances(request: Request, season: str = CURRENT_SEASON, seaso
     CHANCE is being within 3.5 feet of the ball; DEFERRED chances (a teammate
     took it) are excluded by the adjusted rate.
     """
+    return _rebounding_for(season, season_type)
+
+
+def _rebounding_for(season: str, season_type: str = "Regular Season") -> Dict[str, Any]:
+    """The rebounding payload, callable from other handlers.
+
+    Split out on 2026-09-23. The 2K DNA page called the ROUTE as
+    get_rebounding_chances(season), which put the season string into the
+    `request` slot; slowapi's decorator then refused the call because that
+    was not a Request, a bare `except` turned the refusal into None, and every
+    player's DNA card said "rebounding: null" in the tracking era for as long
+    as the page has existed.
+    """
     key = (season, season_type)
     if key in _rebounding_cache:
         return _rebounding_cache[key]
@@ -3045,7 +3258,9 @@ def _predictions_from_ledger(sportsbook: str, kelly_criterion: bool, sport: str)
             "logged_at": r["logged_at"],
             "why": _why_from_row(r),
         })
-    out: Dict[str, Any] = {"sportsbook": sportsbook, "predictions": predictions,
+    out: Dict[str, Any] = {"sportsbook": sportsbook,
+                           "status": PRED_STATUS_OK if predictions else PRED_STATUS_NOT_LOGGED,
+                           "predictions": predictions,
                            "source": "ledger", "log_date": log_date}
     if not predictions:
         out["note"] = ("No picks have been logged for today yet. They appear here once the "
@@ -3451,7 +3666,7 @@ CAREER_STAT_COLS = [
 ]
 
 
-def _ensure_career_official(conn, player_id: int) -> None:
+def _ensure_career_official_table(conn) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS player_career_official (
@@ -3472,10 +3687,47 @@ def _ensure_career_official(conn, player_id: int) -> None:
         )
         """
     )
-    row = conn.execute(
-        "SELECT MAX(fetched_at) FROM player_career_official WHERE player_id = ?", (player_id,)
+
+
+CAREER_OFFICIAL_TTL = timedelta(days=7)
+
+
+def _career_official_freshness(conn, player_id: int) -> str:
+    """'fresh', 'stale' or 'missing' for one player's cached official career.
+
+    A career only changes when the player plays. The cache used to expire on
+    the calendar alone, every seven days, so in the offseason -- when no
+    total can move -- the milestone page still refetched sixty careers from
+    stats.nba.com one after another each week, and whoever loaded it next
+    waited over a minute (measured at 71 s). Now a row older than a week is
+    still fresh if our archive has no game for him on or after the fetch
+    date. An '__EMPTY__' marker (the endpoint returned nothing) keeps the
+    plain weekly retry.
+    """
+    _ensure_career_official_table(conn)
+    fetched, real_rows = conn.execute(
+        "SELECT MAX(fetched_at), SUM(season != '__EMPTY__') FROM player_career_official "
+        "WHERE player_id = ?", (player_id,)
     ).fetchone()
-    if row and row[0] and row[0] > (datetime.utcnow() - timedelta(days=7)).isoformat():
+    if not fetched:
+        return "missing"
+    if fetched > (datetime.utcnow() - CAREER_OFFICIAL_TTL).isoformat():
+        return "fresh"
+    if not real_rows:
+        return "missing"
+    last_game = conn.execute(
+        "SELECT MAX(DATE(game_date)) FROM player_game_log WHERE player_id = ?", (player_id,)
+    ).fetchone()[0]
+    # fetched_at is UTC and game_date the Eastern date; comparing the date
+    # parts with a strict < means a game ON the fetch day always counts as
+    # "played since", which errs towards refetching.
+    if last_game is None or last_game < fetched[:10]:
+        return "fresh"
+    return "stale"
+
+
+def _ensure_career_official(conn, player_id: int) -> None:
+    if _career_official_freshness(conn, player_id) == "fresh":
         return
 
     from nba_api.stats.endpoints import playercareerstats
@@ -3576,6 +3828,41 @@ def get_player_career_official(id: int):
         conn.close()
 
 
+_career_refresh_lock = threading.Lock()
+_career_refresh_pending: set = set()
+CAREER_REFRESH_PAUSE_S = 0.6   # between stats.nba.com calls in the background
+
+
+def _refresh_career_official_async(player_ids: List[int]) -> None:
+    """Refetch stale official careers on one background thread, one at a time.
+
+    Single-flight per player: a second page load while a refresh is running
+    does not start another fetch for the same player.
+    """
+    with _career_refresh_lock:
+        todo = [p for p in player_ids if p not in _career_refresh_pending]
+        _career_refresh_pending.update(todo)
+    if not todo:
+        return
+
+    def run():
+        conn = get_db_conn()
+        try:
+            for pid in todo:
+                try:
+                    _ensure_career_official(conn, pid)
+                except Exception as exc:
+                    logger.warning("Background career refresh failed for %s: %s", pid, exc)
+                finally:
+                    with _career_refresh_lock:
+                        _career_refresh_pending.discard(pid)
+                time.sleep(CAREER_REFRESH_PAUSE_S)
+        finally:
+            conn.close()
+
+    threading.Thread(target=run, name="career-official-refresh", daemon=True).start()
+
+
 # --- Milestone watch: proximity to career milestones ---
 MILESTONE_STEPS = {"pts": 1000, "ast": 500, "reb": 500, "fg3m": 250, "stl": 250, "blk": 250}
 
@@ -3602,9 +3889,20 @@ def get_milestone_watch(limit: int = 25):
         ).fetchall()
 
         watch = []
+        stale = []
         for pid, name in [(r[0], r[1]) for r in seed_rows]:
             try:
-                _ensure_career_official(conn, pid)
+                state = _career_official_freshness(conn, pid)
+                if state == "missing":
+                    # Nothing to show without asking; this is the only case a
+                    # visitor waits on stats.nba.com for.
+                    _ensure_career_official(conn, pid)
+                elif state == "stale":
+                    # He has played since the last fetch. Show the cached
+                    # total now and refresh it behind the response, instead of
+                    # holding the page while up to sixty careers are refetched
+                    # in a row.
+                    stale.append(pid)
             except Exception:
                 continue
             tot = conn.execute(
@@ -3635,6 +3933,8 @@ def get_milestone_watch(limit: int = 25):
                     })
 
         watch.sort(key=lambda w: w["remaining"] / MILESTONE_STEPS[w["stat"]])
+        if stale:
+            _refresh_career_official_async(stale)
         return {"count": len(watch), "milestones": watch[:limit]}
     except Exception as e:
         logger.error(f"Error building milestone watch: {e}", exc_info=True)
@@ -4413,36 +4713,51 @@ def get_historical_matchup(request: Request, team1: str, team2: str, season: int
                 
             res1 = resolve_id(team1)
             res2 = resolve_id(team2)
-            
+
             if not res1 or not res2:
-                return {
-                    "team1": team1.upper(),
-                    "team2": team2.upper(),
-                    "season": season,
-                    "total_games": 0,
-                    "win_percentage": {team1.upper(): 0, team2.upper(): 0},
-                    "wins": {team1.upper(): 0, team2.upper(): 0},
-                    "matchups": []
-                }
+                # This used to answer with a 0-0 series, which reads as "they
+                # never met" rather than "we do not know that team".
+                unknown = [t for t, r in ((team1, res1), (team2, res2)) if not r]
+                raise HTTPException(status_code=404, detail=(
+                    f"Unknown team: {', '.join(unknown)}."))
                 
             tid1, name1 = res1["team_id"], res1["full_name"]
             tid2, name2 = res2["team_id"], res2["full_name"]
             
+            # The season series is the REGULAR season, as everywhere else it is
+            # quoted. This read every game type, so a playoff series -- and,
+            # since play-in games entered the archive, a play-in game -- was
+            # added to the head-to-head record. Postseason meetings are still
+            # returned, separately, in `postseason`.
             cursor.execute(
                 """
-                SELECT game_id, team_id, opp_team_id, game_date, pts, opp_pts
+                SELECT game_id, team_id, opp_team_id, game_date, pts, opp_pts, season_type
                 FROM team_game_advanced
                 WHERE team_id = ? AND opp_team_id = ? AND season = ?
+                ORDER BY game_date
                 """,
                 (tid1, tid2, season_str)
             )
-            rows = cursor.fetchall()
-            
+            all_rows = cursor.fetchall()
+            rows = [r for r in all_rows if r["season_type"] == "Regular Season"]
+            postseason_list = []
+            for r in all_rows:
+                if r["season_type"] == "Regular Season":
+                    continue
+                p1, p2 = r["pts"], r["opp_pts"]
+                postseason_list.append({
+                    "date": r["game_date"],
+                    "season_type": r["season_type"],
+                    "game_id": r["game_id"],
+                    "winner": (name1 if p1 > p2 else name2) if p1 is not None and p2 is not None else None,
+                    "score": {name1: p1, name2: p2},
+                })
+
             matchups_list = []
             team1_wins = 0
             team2_wins = 0
             total_games = 0
-            
+
             for r in rows:
                 pts1 = r["pts"] if r["pts"] is not None else 0
                 pts2 = r["opp_pts"] if r["opp_pts"] is not None else 0
@@ -4471,6 +4786,7 @@ def get_historical_matchup(request: Request, team1: str, team2: str, season: int
                 total_games += 1
                 matchups_list.append({
                     "date": r["game_date"],
+                    "season_type": r["season_type"],
                     "visitor": visitor,
                     "visitor_pts": visitor_pts,
                     "home": home,
@@ -4495,10 +4811,14 @@ def get_historical_matchup(request: Request, team1: str, team2: str, season: int
                     team1.upper(): team1_wins,
                     team2.upper(): team2_wins
                 },
-                "matchups": matchups_list
+                "matchups": matchups_list,
+                "series_scope": "Regular Season",
+                "postseason": postseason_list,
             }
         finally:
             conn.close()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching historical matchup details: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -4734,12 +5054,22 @@ def get_active_players():
         raise HTTPException(status_code=500, detail=str(e))
 
 player_shot_chart_cache = {}
+SHOT_CHART_SEASON_TYPES = ("Regular Season", "Playoffs")
+SHOT_CHART_CURRENT_TTL = timedelta(hours=6)
 
 @app.get("/api/player-shot-chart")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
-def get_player_shot_chart(request: Request, player_id: int, season: str = CURRENT_SEASON):
+def get_player_shot_chart(request: Request, player_id: int, season: str = CURRENT_SEASON,
+                          season_type: str = "Regular Season"):
     """
     Per-shot chart data for a player-season, plus league-average FG% by zone.
+
+    `season_type` is "Regular Season" (default) or "Playoffs"; anything else
+    is a 400. It reaches ShotChartDetail, and therefore the LeagueAverages
+    result set that comes back from the same call, so a playoff chart is
+    compared against the playoff league average. It is part of every cache
+    key and echoed in the response. Until 2026-09-23 this always asked for
+    the regular season, so a playoff run never appeared on a shot chart.
 
     Coordinate space (stats.nba.com shotchartdetail convention): shot x/y are
     LOC_X / LOC_Y in tenths of feet with the basket at the origin -
@@ -4749,22 +5079,32 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
     `league_averages` (additive field) carries the same rows as the legacy
     `averages` field, matching the shared shot-chart response contract.
     """
-    cache_key = f"{player_id}_{season}"
-    if cache_key in player_shot_chart_cache:
-        logger.info(f"Returning cached player shot chart for key: {cache_key}")
-        return player_shot_chart_cache[cache_key]
-        
+    if season_type not in SHOT_CHART_SEASON_TYPES:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(SHOT_CHART_SEASON_TYPES)}; got '{season_type}'."))
+    cache_key = f"{player_id}_{season}_{season_type}"
+    cached = player_shot_chart_cache.get(cache_key)
+    if cached is not None:
+        payload, cached_at = cached
+        # A finished season never changes. The current one gains shots every
+        # game night, and this cache used to keep the first answer until the
+        # process restarted.
+        if season != CURRENT_SEASON or datetime.now() - cached_at < SHOT_CHART_CURRENT_TTL:
+            logger.info(f"Returning cached player shot chart for key: {cache_key}")
+            return payload
+
     if not shotchartdetail:
         raise HTTPException(status_code=500, detail="nba_api library not imported")
         
     try:
-        logger.info(f"Fetching shot chart detail from NBA stats API for player: {player_id}, season: {season}")
+        logger.info(f"Fetching shot chart detail from NBA stats API for player: {player_id}, "
+                    f"season: {season}, season_type: {season_type}")
         shot_chart = shotchartdetail.ShotChartDetail(
             player_id=player_id,
             team_id=0,
             season_nullable=season,
             context_measure_simple="FGA",
-            season_type_all_star="Regular Season"
+            season_type_all_star=season_type
         )
         data = shot_chart.get_dict()
         
@@ -4772,6 +5112,13 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
         
         # 1. Parse individual shots
         shots_set = next((rs for rs in result_sets if rs.get("name") == "Shot_Chart_Detail"), None)
+        if shots_set is None:
+            # A player with no attempts still gets this result set, with an
+            # empty rowSet. Its absence means the answer was not a shot chart
+            # at all, and caching `shots: []` for it would show "no shots"
+            # until the next restart.
+            raise HTTPException(status_code=502, detail=(
+                "stats.nba.com answered without a Shot_Chart_Detail result set."))
         shots = []
         if shots_set:
             headers = shots_set.get("headers", [])
@@ -4842,15 +5189,18 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
         response_data = {
             "player_id": player_id,
             "season": season,
+            "season_type": season_type,
             "shots": shots,
             "averages": averages,
             # Additive alias: same zone rows under the contract field name.
             "league_averages": averages
         }
         
-        player_shot_chart_cache[cache_key] = response_data
+        player_shot_chart_cache[cache_key] = (response_data, datetime.now())
         return response_data
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in get_player_shot_chart API: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5597,7 +5947,9 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                 """
                 SELECT COUNT(*) as games, SUM(pts) as pts, SUM(ast) as ast, SUM(reb) as reb, SUM(min) as min
                 FROM player_game_log
-                WHERE player_id = ? AND game_id IN (SELECT game_id FROM box_scores WHERE season = ?)
+                WHERE player_id = ? AND game_id IN (
+                    SELECT game_id FROM box_scores
+                    WHERE season = ? AND season_type = 'Regular Season')
                 """,
                 (id, season)
             )
@@ -5615,7 +5967,9 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                 }
                 
         # Format properties
-        bio_position = bio_data.get("position") or "Forward/Guard"
+        # "N/A" like every other unknown field here. It said "Forward/Guard",
+        # which is a claim, not a placeholder.
+        bio_position = bio_data.get("position") or "N/A"
         bio_height = bio_data.get("height") or "N/A"
         bio_weight = bio_data.get("weight") or "N/A"
         bio_height_weight = f"{bio_height}, {bio_weight}lb" if (bio_height != "N/A" and bio_weight != "N/A") else f"{bio_height}"
@@ -5656,8 +6010,10 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                 "draft_round": bio_draft_round,
                 "draft_number": bio_draft_number,
                 "active": bool(player_info["is_active"]),
-                "instagram": player_info["full_name"].lower().replace(" ", ""),
-                "nicknames": "None"
+                # Both were invented: the "handle" was the name with the spaces
+                # taken out, which is somebody's account, just not reliably his.
+                "instagram": None,
+                "nicknames": None
             },
             "totals": totals,
             "advanced": advanced
@@ -5766,7 +6122,7 @@ def get_player_heat_calendar(id: int, season: Optional[str] = None):
                    g.plus_minus, g.starter,
                    CASE SUBSTR(g.game_id, 1, 3)
                         WHEN '004' THEN 'Playoffs'
-                        WHEN '005' THEN 'Play-In'
+                        WHEN '005' THEN 'PlayIn'
                         WHEN '001' THEN 'Preseason'
                         ELSE 'Regular Season' END AS season_type,
                    {GAME_SCORE_SQL} AS game_score
@@ -6047,10 +6403,19 @@ def get_team_roster(abbr: str, season: str = CURRENT_SEASON):
         conn.close()
 
 @app.get("/api/teams/{abbr}/games")
-def get_team_games(abbr: str, season: str = CURRENT_SEASON):
+def get_team_games(abbr: str, season: str = CURRENT_SEASON, season_type: Optional[str] = None):
     """
     Fetch all games played by a team in a season, including score, outcome, and location.
+
+    Every row carries `season_type` ("Regular Season", "Playoffs", "PlayIn").
+    Without it a play-in game was indistinguishable from a regular-season
+    one. `season_type` filters to one type; left out, every game is returned
+    as before, so a caller that wants regular-season-only numbers must ask
+    for them (or filter on the field).
     """
+    if season_type is not None and season_type not in GAME_ID_PREFIX_BY_SEASON_TYPE:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(GAME_ID_PREFIX_BY_SEASON_TYPE)}."))
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
@@ -6065,15 +6430,17 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
         cursor.execute(
             """
             SELECT tga.game_id, tga.game_date, tga.pts, tga.opp_pts, tga.season,
+                   tga.season_type,
                    m.abbreviation as opp_abbr, m.full_name as opp_name,
                    (CASE WHEN bs.home_team_id = ? THEN 1 ELSE 0 END) as is_home
             FROM team_game_advanced tga
             JOIN team_metadata m ON tga.opp_team_id = m.team_id
             JOIN box_scores bs ON tga.game_id = bs.game_id
             WHERE tga.team_id = ? AND tga.season = ?
+              AND (? IS NULL OR tga.season_type = ?)
             ORDER BY tga.game_date DESC
             """,
-            (team_id, team_id, season)
+            (team_id, team_id, season, season_type, season_type)
         )
         rows = cursor.fetchall()
         results = []
@@ -6083,6 +6450,8 @@ def get_team_games(abbr: str, season: str = CURRENT_SEASON):
             rec["wl"] = "W" if rec["pts"] > rec["opp_pts"] else "L"
             results.append(rec)
         return results
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching team games for {abbr}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -6246,13 +6615,25 @@ WP_MARGIN_CAP = 30
 WP_MIN_POOLED = 50        # below this a point is reported without a probability
 
 
-def _build_wp_table(conn) -> Dict[tuple, List[int]]:
+# Final scores read off the play-by-play, kept with the table they were built
+# alongside so the exciting-games build does not rescan 1.1M rows for them.
+_WP_FINALS: Dict[str, tuple] = {}
+
+
+def _pbp_finals(conn) -> Dict[str, tuple]:
     finals: Dict[str, tuple] = {}
     for gid, sh, sa in conn.execute(
         "SELECT game_id, score_home, score_away FROM pbp_events "
         "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
     ):
         finals[gid] = (sh, sa)
+    return finals
+
+
+def _build_wp_table(conn) -> Dict[tuple, List[int]]:
+    global _WP_FINALS
+    finals = _pbp_finals(conn)
+    _WP_FINALS = finals
 
     table: Dict[tuple, List[int]] = {}
     marks = list(range(0, WP_REGULATION + 1, WP_STEP))
@@ -6279,11 +6660,31 @@ def _build_wp_table(conn) -> Dict[tuple, List[int]]:
     return table
 
 
+# The pooled answer depends only on the snapped (seconds, margin) pair, of
+# which there are about 6,000, while the exciting-games build asks a million
+# times. Memoised per table object, so a rebuilt table starts a fresh memo.
+# One (table, memo) tuple, swapped in a single assignment, so a thread can
+# never pair a new table with the previous table's memo.
+_wp_memo: tuple = (None, {})
+
+
 def _wp_lookup(table: Dict[tuple, List[int]], secs_left: float, margin: int) -> tuple:
     """Pooled (probability, sample_count) for a game state. (None, n) when thin."""
     # Snap to the sampling grid, and treat overtime as "zero seconds left".
     sl = max(0, min(WP_REGULATION, int(round(secs_left / WP_STEP) * WP_STEP)))
     m = max(-WP_MARGIN_CAP, min(WP_MARGIN_CAP, margin))
+    global _wp_memo
+    owner, memo = _wp_memo
+    if owner is not table:
+        memo = {}
+        _wp_memo = (table, memo)
+    hit = memo.get((sl, m))
+    if hit is None:
+        hit = memo[(sl, m)] = _wp_pooled(table, sl, m)
+    return hit
+
+
+def _wp_pooled(table: Dict[tuple, List[int]], sl: int, m: int) -> tuple:
     n = w = 0
     for dm in (-2, -1, 0, 1, 2):
         for dt in (-60, -30, 0, 30, 60):
@@ -6648,13 +7049,18 @@ EXCITEMENT_LATE_SECONDS = 300  # "late" = final five minutes of regulation onwar
 
 def _build_excitement(conn) -> List[Dict[str, Any]]:
     table = _get_wp_table(conn)
+    # Built with that table, from the same row count (_get_wp_table checked).
+    finals = _WP_FINALS or _pbp_finals(conn)
 
-    finals: Dict[str, tuple] = {}
-    for gid, sh, sa in conn.execute(
-        "SELECT game_id, score_home, score_away FROM pbp_events "
-        "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
-    ):
-        finals[gid] = (sh, sa)
+    # The longest period each game reached, over the same rows the walk below
+    # used to read it from. Asking SQLite for it lets the walk skip the ~3M
+    # rows that carry no score -- they only ever contributed `period`.
+    periods = {
+        gid: mp for gid, mp in conn.execute(
+            "SELECT game_id, MAX(period) FROM pbp_events "
+            "WHERE elapsed_seconds IS NOT NULL GROUP BY game_id"
+        )
+    }
 
     meta = {
         r["game_id"]: dict(r)
@@ -6703,16 +7109,16 @@ def _build_excitement(conn) -> List[Dict[str, Any]]:
         prev_p = None
         last = (0, 0)
 
-    for gid, es, period, sh, sa in conn.execute(
-        "SELECT game_id, elapsed_seconds, period, score_home, score_away FROM pbp_events "
-        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_number"
+    for gid, es, sh, sa in conn.execute(
+        "SELECT game_id, elapsed_seconds, score_home, score_away FROM pbp_events "
+        "WHERE elapsed_seconds IS NOT NULL AND score_home IS NOT NULL "
+        "AND score_away IS NOT NULL ORDER BY game_id, action_number"
     ):
         if gid != cur:
             flush(cur)
             cur = gid
-        if period:
-            max_period = max(max_period, period)
-        if sh is None or sa is None or (sh, sa) == last:
+            max_period = max(1, periods.get(gid) or 1)
+        if (sh, sa) == last:
             continue
         last = (sh, sa)
         p, _n = _wp_lookup(table, WP_REGULATION - es, sh - sa)
@@ -8214,11 +8620,20 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
             },
         )
 
+        # "How many streaks reached this length" used to be a linear scan of
+        # every streak of that kind, run once per board entry, with max() over
+        # the same list beside it -- 32 million comparisons, 25 of the 33
+        # seconds a cold build took. Sorted once per kind, it is a bisect.
+        sorted_lengths = {k: sorted(v) for k, v in lengths.items()}
+
         def reached(key: str, n: int) -> int:
-            return sum(1 for L in lengths[key] if L >= n)
+            ls = sorted_lengths[key]
+            return len(ls) - bisect.bisect_left(ls, n)
 
         def decorate(entries, k, d, active):
             out = []
+            ls = sorted_lengths[k]
+            longest_ever = ls[-1] if ls else None
             for a in entries:
                 if a["length"] < STREAK_FLOOR[k]:
                     continue
@@ -8229,7 +8644,7 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
                     "scope": d["scope"],
                     "active": active,
                     "as_long_or_longer": reached(k, a["length"]),
-                    "longest_ever": max(lengths[k]) if lengths[k] else a["length"],
+                    "longest_ever": longest_ever if longest_ever is not None else a["length"],
                 })
             return out
 
@@ -8291,7 +8706,7 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
 def get_daily_leaders(
     date: Optional[str] = None,
     category: str = "pts",
-    season_type: str = "Regular Season",
+    season_type: Optional[str] = None,
     limit: int = 10,
 ):
     """
@@ -8313,15 +8728,30 @@ def get_daily_leaders(
         raise HTTPException(
             status_code=400, detail=f"Category must be one of {sorted(CATEGORIES)}"
         )
+    # season_type used to be accepted, defaulted to "Regular Season", and
+    # ignored: a Finals night came back under a regular-season label. It is
+    # now honoured when given. Left out, every game type counts, which is what
+    # the endpoint has always actually returned (and what the page relies on:
+    # the latest night on record is often a playoff one).
+    if season_type is not None and season_type not in GAME_ID_PREFIX_BY_SEASON_TYPE:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(GAME_ID_PREFIX_BY_SEASON_TYPE)}."))
+    type_sql = ""
+    type_params: tuple = ()
+    if season_type is not None:
+        type_sql = " AND SUBSTR(g.game_id, 1, 3) = ?"
+        type_params = (GAME_ID_PREFIX_BY_SEASON_TYPE[season_type],)
 
     conn = get_db_conn()
     try:
         latest = conn.execute(
-            "SELECT MAX(DATE(game_date)) FROM player_game_log"
+            "SELECT MAX(DATE(g.game_date)) FROM player_game_log g WHERE 1=1" + type_sql,
+            type_params,
         ).fetchone()[0]
         day = (date or latest or "")[:10]
         if not day:
-            return {"date": None, "category": cat, "games": 0, "leaders": [], "available_dates": []}
+            return {"date": None, "category": cat, "season_type": season_type,
+                    "games": 0, "leaders": [], "available_dates": []}
 
         expr = CATEGORIES[cat]
         rows = conn.execute(
@@ -8332,29 +8762,33 @@ def get_daily_leaders(
                    {expr} AS value
             FROM player_game_log g
             JOIN players p ON p.player_id = g.player_id
-            WHERE DATE(g.game_date) = ?
+            WHERE DATE(g.game_date) = ?{type_sql}
             ORDER BY value DESC, g.min DESC
             LIMIT ?
             """,
-            (day, max(1, min(limit, 50))),
+            (day, *type_params, max(1, min(limit, 50))),
         ).fetchall()
 
         games = conn.execute(
-            "SELECT COUNT(DISTINCT game_id) FROM player_game_log WHERE DATE(game_date) = ?",
-            (day,),
+            "SELECT COUNT(DISTINCT g.game_id) FROM player_game_log g WHERE DATE(g.game_date) = ?"
+            + type_sql,
+            (day, *type_params),
         ).fetchone()[0]
 
         # Neighbouring dates, so a page can step night by night without guessing
         # which dates exist - the archive has gaps between seasons.
         prev_day = conn.execute(
-            "SELECT MAX(DATE(game_date)) FROM player_game_log WHERE DATE(game_date) < ?", (day,)
+            "SELECT MAX(DATE(g.game_date)) FROM player_game_log g WHERE DATE(g.game_date) < ?"
+            + type_sql, (day, *type_params)
         ).fetchone()[0]
         next_day = conn.execute(
-            "SELECT MIN(DATE(game_date)) FROM player_game_log WHERE DATE(game_date) > ?", (day,)
+            "SELECT MIN(DATE(g.game_date)) FROM player_game_log g WHERE DATE(g.game_date) > ?"
+            + type_sql, (day, *type_params)
         ).fetchone()[0]
 
         return {
             "date": day,
+            "season_type": season_type,
             "is_latest": day == latest,
             "latest_date": latest,
             "prev_date": prev_day,
@@ -8683,7 +9117,7 @@ SEASON_TYPE_BY_PREFIX = {
     "002": "Regular Season",
     "003": "All-Star",
     "004": "Playoffs",
-    "005": "Play-In",
+    "005": "PlayIn",   # the archive's own spelling (box_scores.season_type)
     "006": "Special Event",
 }
 
@@ -8726,6 +9160,12 @@ def get_league_schedule(
     (ESPN, ABC, NBC, Peacock, Prime Video). `hide_previous` drops dates before
     today. Every filter is optional and they compose.
     """
+    # Play-in games were labelled "Play-In" here while the archive stores
+    # "PlayIn", so ?season_type=PlayIn matched nothing and came back as an
+    # empty schedule. The label is now the archive's; the old spelling is
+    # still accepted on the way in.
+    if season_type == "Play-In":
+        season_type = "PlayIn"
     try:
         from src.Utils.nba_stats_client import get_client
 

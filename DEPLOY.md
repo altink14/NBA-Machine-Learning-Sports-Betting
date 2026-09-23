@@ -60,7 +60,9 @@ Two services: this repo (FastAPI backend) → **Railway**, the frontend
 3. **Variables** (service → Variables):
    - `DB_SNAPSHOT_URL` = `https://github.com/altink14/NBA-Machine-Learning-Sports-Betting/releases/download/db-snapshot-v1/db-snapshot.tar.gz`
    - `CORS_ORIGINS` = your Vercel URL once you have it (e.g. `https://bettingbuddy.vercel.app`)
-   - Optional: `ODDS_API_KEY`, `DEFAULT_SPORTSBOOK` (copy from local `.env`)
+   - Not needed here: `ODDS_API_KEY` (read only by the home PC's scheduled
+     odds jobs, not by the web server — see the env inventory below) and
+     `DEFAULT_SPORTSBOOK` (read by nothing).
 4. Settings → Networking → **Generate Domain**. Note the URL —
    that's your `NEXT_PUBLIC_NBA_API_URL`.
 5. First boot downloads the snapshot into the volume automatically
@@ -230,8 +232,20 @@ host, which is the product), `RATE_LIMIT_DEFAULT?`,
 `NBA_CACHE_DIR?`, `WARM_MODEL_ON_START` (set it to `true` in production —
 otherwise the first prediction after every restart pays the model's cold
 load and a 30s gateway gives up first), `PORT` (set by the platform).
-`ODDS_API_KEY` and `DEFAULT_SPORTSBOOK` are listed in `render.yaml` but read by
-no Python in this repo — setting them does nothing today.
+`ODDS_API_KEY` IS read, but only by the scheduled jobs on the home PC, never
+by the web server (`main_api.py` does not read it, and the Dockerfile runs
+nothing but `bootstrap_db.py` and uvicorn). Its readers, checked 2026-09-23:
+`src/Utils/odds_api_client.py` (`get_api_key`, used by the NBA recorder
+`snapshot_odds_api.py`, the 9am board snapshot in `daily_update.py`, which
+also warns when the key is missing, and the free schedule check in
+`preflight_opening_night.py`); `src/Sports/odds_recorder.py` (`api_key`, the
+NFL recorder, and through it `src/Sports/repair_odds.py` for both sports'
+repairs); and `backfill_odds_history.py` (a one-off, reads the env or `.env`).
+Keep it in the home PC's `.env`; setting it on the production service does
+nothing today. It is one key shared by both sports' recorders and repairs,
+which is why each keeps a quota floor for the other. `DEFAULT_SPORTSBOOK` is
+listed in `render.yaml` but read by no Python in this repo — the sportsbook is
+passed per request — so setting it does nothing.
 
 Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `STRIPE_SECRET_KEY`,

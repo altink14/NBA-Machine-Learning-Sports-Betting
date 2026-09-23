@@ -1,7 +1,9 @@
 # main_api.py
 # FINAL STABLE VERSION - Corrected endpoint routing and data handling.
+import bisect
 import collections
 import threading
+import time
 import glob
 import re
 import os
@@ -2241,9 +2243,10 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
         except Exception:
             sq_row = None
         try:
-            rb = get_rebounding_chances(season)
+            rb = _rebounding_for(season, "Regular Season")
             reb_row = next((p for p in rb.get("players", []) if p.get("player_id") == player_id), None)
-        except Exception:
+        except Exception as exc:
+            logger.warning("2K DNA: rebounding tracking unavailable for %s: %s", season, exc)
             reb_row = None
     if season >= PBP_FIRST_SEASON:
         try:
@@ -2886,6 +2889,19 @@ def get_rebounding_chances(request: Request, season: str = CURRENT_SEASON, seaso
     deferral-adjusted conversion, and average rebound distance. A rebound
     CHANCE is being within 3.5 feet of the ball; DEFERRED chances (a teammate
     took it) are excluded by the adjusted rate.
+    """
+    return _rebounding_for(season, season_type)
+
+
+def _rebounding_for(season: str, season_type: str = "Regular Season") -> Dict[str, Any]:
+    """The rebounding payload, callable from other handlers.
+
+    Split out on 2026-09-23. The 2K DNA page called the ROUTE as
+    get_rebounding_chances(season), which put the season string into the
+    `request` slot; slowapi's decorator then refused the call because that
+    was not a Request, a bare `except` turned the refusal into None, and every
+    player's DNA card said "rebounding: null" in the tracking era for as long
+    as the page has existed.
     """
     key = (season, season_type)
     if key in _rebounding_cache:
@@ -3632,7 +3648,7 @@ CAREER_STAT_COLS = [
 ]
 
 
-def _ensure_career_official(conn, player_id: int) -> None:
+def _ensure_career_official_table(conn) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS player_career_official (
@@ -3653,10 +3669,47 @@ def _ensure_career_official(conn, player_id: int) -> None:
         )
         """
     )
-    row = conn.execute(
-        "SELECT MAX(fetched_at) FROM player_career_official WHERE player_id = ?", (player_id,)
+
+
+CAREER_OFFICIAL_TTL = timedelta(days=7)
+
+
+def _career_official_freshness(conn, player_id: int) -> str:
+    """'fresh', 'stale' or 'missing' for one player's cached official career.
+
+    A career only changes when the player plays. The cache used to expire on
+    the calendar alone, every seven days, so in the offseason -- when no
+    total can move -- the milestone page still refetched sixty careers from
+    stats.nba.com one after another each week, and whoever loaded it next
+    waited over a minute (measured at 71 s). Now a row older than a week is
+    still fresh if our archive has no game for him on or after the fetch
+    date. An '__EMPTY__' marker (the endpoint returned nothing) keeps the
+    plain weekly retry.
+    """
+    _ensure_career_official_table(conn)
+    fetched, real_rows = conn.execute(
+        "SELECT MAX(fetched_at), SUM(season != '__EMPTY__') FROM player_career_official "
+        "WHERE player_id = ?", (player_id,)
     ).fetchone()
-    if row and row[0] and row[0] > (datetime.utcnow() - timedelta(days=7)).isoformat():
+    if not fetched:
+        return "missing"
+    if fetched > (datetime.utcnow() - CAREER_OFFICIAL_TTL).isoformat():
+        return "fresh"
+    if not real_rows:
+        return "missing"
+    last_game = conn.execute(
+        "SELECT MAX(DATE(game_date)) FROM player_game_log WHERE player_id = ?", (player_id,)
+    ).fetchone()[0]
+    # fetched_at is UTC and game_date the Eastern date; comparing the date
+    # parts with a strict < means a game ON the fetch day always counts as
+    # "played since", which errs towards refetching.
+    if last_game is None or last_game < fetched[:10]:
+        return "fresh"
+    return "stale"
+
+
+def _ensure_career_official(conn, player_id: int) -> None:
+    if _career_official_freshness(conn, player_id) == "fresh":
         return
 
     from nba_api.stats.endpoints import playercareerstats
@@ -3757,6 +3810,41 @@ def get_player_career_official(id: int):
         conn.close()
 
 
+_career_refresh_lock = threading.Lock()
+_career_refresh_pending: set = set()
+CAREER_REFRESH_PAUSE_S = 0.6   # between stats.nba.com calls in the background
+
+
+def _refresh_career_official_async(player_ids: List[int]) -> None:
+    """Refetch stale official careers on one background thread, one at a time.
+
+    Single-flight per player: a second page load while a refresh is running
+    does not start another fetch for the same player.
+    """
+    with _career_refresh_lock:
+        todo = [p for p in player_ids if p not in _career_refresh_pending]
+        _career_refresh_pending.update(todo)
+    if not todo:
+        return
+
+    def run():
+        conn = get_db_conn()
+        try:
+            for pid in todo:
+                try:
+                    _ensure_career_official(conn, pid)
+                except Exception as exc:
+                    logger.warning("Background career refresh failed for %s: %s", pid, exc)
+                finally:
+                    with _career_refresh_lock:
+                        _career_refresh_pending.discard(pid)
+                time.sleep(CAREER_REFRESH_PAUSE_S)
+        finally:
+            conn.close()
+
+    threading.Thread(target=run, name="career-official-refresh", daemon=True).start()
+
+
 # --- Milestone watch: proximity to career milestones ---
 MILESTONE_STEPS = {"pts": 1000, "ast": 500, "reb": 500, "fg3m": 250, "stl": 250, "blk": 250}
 
@@ -3783,9 +3871,20 @@ def get_milestone_watch(limit: int = 25):
         ).fetchall()
 
         watch = []
+        stale = []
         for pid, name in [(r[0], r[1]) for r in seed_rows]:
             try:
-                _ensure_career_official(conn, pid)
+                state = _career_official_freshness(conn, pid)
+                if state == "missing":
+                    # Nothing to show without asking; this is the only case a
+                    # visitor waits on stats.nba.com for.
+                    _ensure_career_official(conn, pid)
+                elif state == "stale":
+                    # He has played since the last fetch. Show the cached
+                    # total now and refresh it behind the response, instead of
+                    # holding the page while up to sixty careers are refetched
+                    # in a row.
+                    stale.append(pid)
             except Exception:
                 continue
             tot = conn.execute(
@@ -3816,6 +3915,8 @@ def get_milestone_watch(limit: int = 25):
                     })
 
         watch.sort(key=lambda w: w["remaining"] / MILESTONE_STEPS[w["stat"]])
+        if stale:
+            _refresh_career_official_async(stale)
         return {"count": len(watch), "milestones": watch[:limit]}
     except Exception as e:
         logger.error(f"Error building milestone watch: {e}", exc_info=True)
@@ -6457,13 +6558,25 @@ WP_MARGIN_CAP = 30
 WP_MIN_POOLED = 50        # below this a point is reported without a probability
 
 
-def _build_wp_table(conn) -> Dict[tuple, List[int]]:
+# Final scores read off the play-by-play, kept with the table they were built
+# alongside so the exciting-games build does not rescan 1.1M rows for them.
+_WP_FINALS: Dict[str, tuple] = {}
+
+
+def _pbp_finals(conn) -> Dict[str, tuple]:
     finals: Dict[str, tuple] = {}
     for gid, sh, sa in conn.execute(
         "SELECT game_id, score_home, score_away FROM pbp_events "
         "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
     ):
         finals[gid] = (sh, sa)
+    return finals
+
+
+def _build_wp_table(conn) -> Dict[tuple, List[int]]:
+    global _WP_FINALS
+    finals = _pbp_finals(conn)
+    _WP_FINALS = finals
 
     table: Dict[tuple, List[int]] = {}
     marks = list(range(0, WP_REGULATION + 1, WP_STEP))
@@ -6490,11 +6603,31 @@ def _build_wp_table(conn) -> Dict[tuple, List[int]]:
     return table
 
 
+# The pooled answer depends only on the snapped (seconds, margin) pair, of
+# which there are about 6,000, while the exciting-games build asks a million
+# times. Memoised per table object, so a rebuilt table starts a fresh memo.
+# One (table, memo) tuple, swapped in a single assignment, so a thread can
+# never pair a new table with the previous table's memo.
+_wp_memo: tuple = (None, {})
+
+
 def _wp_lookup(table: Dict[tuple, List[int]], secs_left: float, margin: int) -> tuple:
     """Pooled (probability, sample_count) for a game state. (None, n) when thin."""
     # Snap to the sampling grid, and treat overtime as "zero seconds left".
     sl = max(0, min(WP_REGULATION, int(round(secs_left / WP_STEP) * WP_STEP)))
     m = max(-WP_MARGIN_CAP, min(WP_MARGIN_CAP, margin))
+    global _wp_memo
+    owner, memo = _wp_memo
+    if owner is not table:
+        memo = {}
+        _wp_memo = (table, memo)
+    hit = memo.get((sl, m))
+    if hit is None:
+        hit = memo[(sl, m)] = _wp_pooled(table, sl, m)
+    return hit
+
+
+def _wp_pooled(table: Dict[tuple, List[int]], sl: int, m: int) -> tuple:
     n = w = 0
     for dm in (-2, -1, 0, 1, 2):
         for dt in (-60, -30, 0, 30, 60):
@@ -6859,13 +6992,18 @@ EXCITEMENT_LATE_SECONDS = 300  # "late" = final five minutes of regulation onwar
 
 def _build_excitement(conn) -> List[Dict[str, Any]]:
     table = _get_wp_table(conn)
+    # Built with that table, from the same row count (_get_wp_table checked).
+    finals = _WP_FINALS or _pbp_finals(conn)
 
-    finals: Dict[str, tuple] = {}
-    for gid, sh, sa in conn.execute(
-        "SELECT game_id, score_home, score_away FROM pbp_events "
-        "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
-    ):
-        finals[gid] = (sh, sa)
+    # The longest period each game reached, over the same rows the walk below
+    # used to read it from. Asking SQLite for it lets the walk skip the ~3M
+    # rows that carry no score -- they only ever contributed `period`.
+    periods = {
+        gid: mp for gid, mp in conn.execute(
+            "SELECT game_id, MAX(period) FROM pbp_events "
+            "WHERE elapsed_seconds IS NOT NULL GROUP BY game_id"
+        )
+    }
 
     meta = {
         r["game_id"]: dict(r)
@@ -6914,16 +7052,16 @@ def _build_excitement(conn) -> List[Dict[str, Any]]:
         prev_p = None
         last = (0, 0)
 
-    for gid, es, period, sh, sa in conn.execute(
-        "SELECT game_id, elapsed_seconds, period, score_home, score_away FROM pbp_events "
-        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_number"
+    for gid, es, sh, sa in conn.execute(
+        "SELECT game_id, elapsed_seconds, score_home, score_away FROM pbp_events "
+        "WHERE elapsed_seconds IS NOT NULL AND score_home IS NOT NULL "
+        "AND score_away IS NOT NULL ORDER BY game_id, action_number"
     ):
         if gid != cur:
             flush(cur)
             cur = gid
-        if period:
-            max_period = max(max_period, period)
-        if sh is None or sa is None or (sh, sa) == last:
+            max_period = max(1, periods.get(gid) or 1)
+        if (sh, sa) == last:
             continue
         last = (sh, sa)
         p, _n = _wp_lookup(table, WP_REGULATION - es, sh - sa)
@@ -8425,11 +8563,20 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
             },
         )
 
+        # "How many streaks reached this length" used to be a linear scan of
+        # every streak of that kind, run once per board entry, with max() over
+        # the same list beside it -- 32 million comparisons, 25 of the 33
+        # seconds a cold build took. Sorted once per kind, it is a bisect.
+        sorted_lengths = {k: sorted(v) for k, v in lengths.items()}
+
         def reached(key: str, n: int) -> int:
-            return sum(1 for L in lengths[key] if L >= n)
+            ls = sorted_lengths[key]
+            return len(ls) - bisect.bisect_left(ls, n)
 
         def decorate(entries, k, d, active):
             out = []
+            ls = sorted_lengths[k]
+            longest_ever = ls[-1] if ls else None
             for a in entries:
                 if a["length"] < STREAK_FLOOR[k]:
                     continue
@@ -8440,7 +8587,7 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
                     "scope": d["scope"],
                     "active": active,
                     "as_long_or_longer": reached(k, a["length"]),
-                    "longest_ever": max(lengths[k]) if lengths[k] else a["length"],
+                    "longest_ever": longest_ever if longest_ever is not None else a["length"],
                 })
             return out
 

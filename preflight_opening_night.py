@@ -64,6 +64,31 @@ def season_for(day: date) -> str:
     return f"{start}-{str(start + 1)[2:]}"
 
 
+def new_season_started(today: date) -> bool:
+    """Has any game of the upcoming/current season actually been played?
+
+    The team-stats checks used to key off the calendar (`today <
+    OPENING_NIGHT`). On opening night itself that is false, but no 2026-27
+    game has finished yet, so the snapshot is legitimately last season's and
+    legitimately weeks old -- and both checks went WRONG with advice ("run
+    refresh_team_stats.py") that cannot help, since the refresh writes
+    nothing until a game is played. Two red herrings on the one morning the
+    output matters is how a real finding gets scrolled past. Ask the
+    archive instead of the calendar.
+    """
+    season = season_for(max(today, OPENING_NIGHT))
+    try:
+        conn = sqlite3.connect(f"file:{TEAM_DB}?mode=ro", uri=True)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM box_scores WHERE season = ?",
+                             (season,)).fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:
+        return today > OPENING_NIGHT
+    return n > 0
+
+
 def section(name: str) -> None:
     print(f"\n=== {name} ===")
 
@@ -114,7 +139,7 @@ def check_team_stats(today: date) -> None:
         import main_api
         if age <= main_api.TEAM_STATS_MAX_AGE_DAYS:
             check("the snapshot is fresh", OK, f"{age} <= {main_api.TEAM_STATS_MAX_AGE_DAYS}")
-        elif today < OPENING_NIGHT:
+        elif not new_season_started(today):
             # refresh_team_stats writes nothing when the new season has no games
             # yet, so between 1 October and opening night the newest table stops
             # advancing and the age warning fires while nothing is actually wrong.
@@ -126,7 +151,7 @@ def check_team_stats(today: date) -> None:
                   f"{age} days old — run refresh_team_stats.py")
 
         gp = conn.execute(f'SELECT MAX(GP) FROM "{table}"').fetchone()[0]
-        if today < OPENING_NIGHT:
+        if not new_season_started(today):
             check("the snapshot holds this season", PENDING,
                   f"max GP {gp} — last season's finals, which is the only sensible "
                   "input until a 2026-27 game is played")
@@ -154,7 +179,9 @@ def check_days_rest(today: date) -> None:
         conn.close()
     check("the archive can supply game dates", OK if total else BAD, f"{total:,} games")
 
-    if today < OPENING_NIGHT:
+    # <=, not <: on the morning of opening night no game has been played, so
+    # zero is correct. From the 21st the backfill must have landed some.
+    if today <= OPENING_NIGHT:
         check(f"the archive has {season} games", PENDING,
               f"{this_season} so far, and the season has not started. Opening night "
               "correctly reads as fully rested for everyone; real rest appears from "

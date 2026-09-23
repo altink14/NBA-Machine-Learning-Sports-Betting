@@ -552,7 +552,14 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
                 """,
                 (
                     now_iso,
-                    now.strftime("%Y-%m-%d"),
+                    # The EASTERN date, not UTC. log_date is half of the UNIQUE key
+                    # that makes "the first prediction of the day stands" true, and
+                    # after 20:00 ET the UTC date has already rolled. So a 10:30pm ET
+                    # game could be logged at 9am (UTC date = today) and again by
+                    # anyone loading /predictions after 8pm (UTC date = tomorrow):
+                    # two rows for one game, possibly with different picks, both
+                    # graded, both counted. The NBA day is the Eastern day.
+                    (to_nba_date(now) or now.date()).isoformat(),
                     sport,
                     sportsbook,
                     f"{home}:{away}",

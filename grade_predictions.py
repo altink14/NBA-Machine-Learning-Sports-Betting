@@ -38,10 +38,37 @@ def _team_name_to_id(team_conn: sqlite3.Connection) -> dict:
     return mapping
 
 
+def _et_date(value) -> str:
+    """US Eastern calendar date of a tip-off, as 'YYYY-MM-DD'.
+
+    `team_game_advanced.game_date` is the NBA's own (Eastern) game date. A
+    tip-off is stored in UTC, and anything after 20:00 ET is already the next
+    day in UTC, so comparing the raw UTC date against the Eastern game date is
+    off by one for every late game.
+    """
+    s = str(value or "")
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return s[:10]
+        return dt.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return s[:10]
+
+
 def _find_result(team_conn, home_id: int, away_id: int, around_date: str):
     """
-    Find the home team's game against the away team within +/-1 day of the
-    logged date (game dates can straddle midnight UTC vs local).
+    Find the home team's game against the away team, preferring the exact
+    Eastern date and allowing +/-1 day only as a fallback.
+
+    WHY NOT `ORDER BY game_date ASC`. That took the EARLIEST game in a
+    three-day window, so if the same home team hosted the same opponent on
+    consecutive days, a prediction could be graded against the previous
+    night's result. And a wrong grade here is permanent: the
+    `predictions_log_no_regrade` trigger forbids correcting it. Nearest date
+    wins, so the exact day always beats a neighbour.
+
     Returns (home_pts, away_pts) or None.
     """
     row = team_conn.execute(
@@ -49,9 +76,10 @@ def _find_result(team_conn, home_id: int, away_id: int, around_date: str):
         SELECT pts, opp_pts, game_date FROM team_game_advanced
         WHERE team_id = ? AND opp_team_id = ?
           AND game_date BETWEEN date(?, '-1 day') AND date(?, '+1 day')
-        ORDER BY game_date ASC LIMIT 1
+        ORDER BY abs(julianday(game_date) - julianday(?)) ASC, game_date ASC
+        LIMIT 1
         """,
-        (home_id, away_id, around_date, around_date),
+        (home_id, away_id, around_date, around_date, around_date),
     ).fetchone()
     if row is None:
         return None
@@ -147,7 +175,15 @@ def price_clv(odds_db: str = None) -> dict:
             close = conn.execute(
                 "SELECT captured_at, home_ml, away_ml, "
                 "COALESCE(provenance, 'observed') AS provenance FROM odds_snapshots "
-                "WHERE game_key = ? AND sportsbook = ? AND captured_at < ? "
+                # Both sides go through one Clippers spelling. The prediction
+                # path (SbrOddsProvider) rewrites the team to "LA Clippers" and
+                # the closing-line recorder stores The Odds API's own name, so an
+                # exact game_key match could never find a Clippers close and every
+                # Clippers game would quietly count as no_close all season. The
+                # REPLACE is a no-op for the other 29 teams.
+                "WHERE REPLACE(game_key, 'Los Angeles Clippers', 'LA Clippers') = "
+                "      REPLACE(?, 'Los Angeles Clippers', 'LA Clippers') "
+                "AND sportsbook = ? AND captured_at < ? "
                 "AND home_ml IS NOT NULL AND away_ml IS NOT NULL "
                 "ORDER BY captured_at DESC, "
                 "         CASE COALESCE(provenance, 'observed') "
@@ -224,15 +260,26 @@ def grade(odds_db: str = None, team_db: str = None) -> int:
             return 0
 
         name_to_id = _team_name_to_id(team_conn)
+        unmatched_names, no_box_score = [], 0
         for row in ungraded:
             home_id = name_to_id.get(row["home_team"].strip().lower())
             away_id = name_to_id.get(row["away_team"].strip().lower())
             if not home_id or not away_id:
-                continue  # non-NBA game (e.g. WNBA fallback) — not gradeable from this DB
+                # Usually a non-NBA row (WNBA fallback). But a team name the
+                # mapper misses looks identical, and that game would sit
+                # ungraded forever -- quietly leaving the denominator of the
+                # published record. So count them and say which.
+                unmatched_names.append(f"{row['away_team']} @ {row['home_team']}")
+                continue
 
-            game_date = (row["game_start_time_utc"] or row["log_date"])[:10]
+            # The EASTERN date of the tip-off, not the UTC one: a 10:30pm ET
+            # game is the next day in UTC and would otherwise be looked up a
+            # day late.
+            game_date = (_et_date(row["game_start_time_utc"])
+                         if row["game_start_time_utc"] else row["log_date"][:10])
             result = _find_result(team_conn, home_id, away_id, game_date)
             if result is None:
+                no_box_score += 1
                 continue  # box score not ingested yet
 
             home_pts, away_pts = result
@@ -244,7 +291,13 @@ def grade(odds_db: str = None, team_db: str = None) -> int:
             graded += 1
 
         odds_conn.commit()
-        logger.info("Graded %d of %d ungraded predictions.", graded, len(ungraded))
+        logger.info("Graded %d of %d ungraded predictions (%d still waiting on a box "
+                    "score, %d with a team name the archive does not know).",
+                    graded, len(ungraded), no_box_score, len(unmatched_names))
+        if unmatched_names:
+            logger.warning("Ungradeable team names (fine if these are WNBA; a real NBA "
+                           "team here will never be graded): %s",
+                           ", ".join(sorted(set(unmatched_names))[:10]))
         return graded
     finally:
         odds_conn.close()

@@ -70,10 +70,10 @@ def current_season(today: date) -> str:
     return f"{start_year}-{str(start_year + 1)[2:]}"
 
 
-def run_backfill(season: str) -> bool:
+def run_backfill(season: str, season_type: str = "Regular Season") -> bool:
     python = sys.executable
     script = os.path.join(REPO_ROOT, "src", "Process-Data", "backfill.py")
-    cmd = [python, script, "--season", season, "--season-type", "Regular Season"]
+    cmd = [python, script, "--season", season, "--season-type", season_type]
     logger.info("Running backfill: %s", " ".join(cmd))
     result = subprocess.run(cmd, cwd=REPO_ROOT)
     if result.returncode != 0:
@@ -122,6 +122,15 @@ def log_todays_predictions() -> str:
 
     predictions = result.get("predictions") or []
     if resolved != "NBA":
+        # In season, this means the NBA scrape failed on every day it tried
+        # and the provider fell back to another league. Reporting that as
+        # "offseason" made opening night with a broken scraper a GREEN run
+        # with no picks logged, and those picks can never be logged later.
+        if _nba_games_expected():
+            logger.error(
+                "Odds provider resolved to %s during the NBA season. No NBA pick "
+                "was logged, and none can be after tip-off.", resolved)
+            return "failed"
         logger.info(
             "Odds provider resolved to %s (NBA offseason). Nothing logged - the track "
             "record covers NBA model predictions only.", resolved
@@ -181,16 +190,31 @@ def refresh_periodic_ingests() -> bool:
 
 
 def _nba_games_expected(today: Optional[date] = None) -> bool:
-    """Whether the NBA is in season today (October-June).
+    """Whether NBA games are expected today (opening night through June).
 
-    Used only to decide whether an empty prediction run is a failure worth
-    failing the task over, or just July.
+    Used to decide whether an empty or non-NBA prediction run is a failure
+    worth failing the task over.
+
+    This used to be `month >= 10`, which is true from 1 October -- three
+    weeks before the season starts. Every morning from the 1st to the 19th
+    would have gone red for having no NBA slate, which is how people learn
+    to ignore red, and on the 20th the one red that mattered would have
+    looked like the rest. October now waits for opening night, read from
+    the same constant the preflight uses so there is only one date to bump.
     """
     today = today or date.today()
-    return today.month >= 10 or today.month <= 6
+    if today.month in (7, 8, 9):
+        return False
+    if today.month == 10:
+        try:
+            from preflight_opening_night import OPENING_NIGHT
+            return today >= OPENING_NIGHT
+        except Exception:
+            return today.day >= 20   # the league opens in the third week
+    return True
 
 
-def grade_logged_predictions() -> None:
+def grade_logged_predictions() -> bool:
     """Fill in final scores for yesterday's logged predictions, then price them.
 
     Grading says whether the pick was right. CLV says whether the price was
@@ -199,16 +223,26 @@ def grade_logged_predictions() -> None:
     something after a few dozen. Both are post-hoc enrichment of a row that was
     frozen before tip-off, so they run together.
     """
+    # Both steps used to catch every exception, log it as a WARNING marked
+    # "non-fatal", and return None -- which main() never looked at. So NBA
+    # grading could fail every single morning with the task reporting success.
+    # They still do not stop the rest of the job (a broken grader must not
+    # prevent tonight's predictions being logged), but a failure now reaches
+    # the failures list and turns the run red.
+    ok = True
     try:
         from grade_predictions import grade
         grade()
     except Exception as exc:
-        logger.warning("Prediction grading failed (non-fatal): %s", exc)
+        logger.error("Prediction grading FAILED: %s", exc, exc_info=True)
+        ok = False
     try:
         from grade_predictions import price_clv
         price_clv()
     except Exception as exc:
-        logger.warning("Closing line value failed (non-fatal): %s", exc)
+        logger.error("Closing line value FAILED: %s", exc, exc_info=True)
+        ok = False
+    return ok
 
 
 def snapshot_odds_board() -> str:
@@ -286,8 +320,17 @@ def main() -> int:
     logger.info("=== Daily update starting for season %s ===", season)
 
     backfill_ok = run_backfill(season)
+    # Playoff box scores. backfill.py does one season type per run and this
+    # only ever asked for the regular season, so from the play-in onward no
+    # box score would land, grade() would find nothing, and every playoff
+    # pick would sit ungraded for good -- while log_predictions kept writing
+    # them, because the odds feed carries those games. The same shape as the
+    # NFL results gap fixed on 2026-09-21, one calendar season later.
+    # April-June only, so the rest of the year costs nothing.
+    if date.today().month in (4, 5, 6):
+        backfill_ok = run_backfill(season, "Playoffs") and backfill_ok
     stats_ok = refresh_team_stats_snapshot()
-    grade_logged_predictions()
+    grading_ok = grade_logged_predictions()
     prediction_status = log_todays_predictions()
     odds_status = snapshot_odds_board()
     ingests_ok = refresh_periodic_ingests()
@@ -296,6 +339,8 @@ def main() -> int:
     preflight_wrong = run_preflight()
 
     failures = []
+    if not grading_ok:
+        failures.append("grading / CLV")
     if not backfill_ok:
         failures.append("backfill")
     if not stats_ok:

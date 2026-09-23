@@ -397,6 +397,81 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
 # and are filtered again on the way out, in case any were written historically.
 SIMULATED_MODEL_TAG = "implied_probability_sim"
 
+# --- What a /predictions answer means ----------------------------------------
+# Every result from PredictionRunner.run_predictions() carries one of these in
+# `status`. Before 2026-09-23 a broken run and an empty slate looked the same:
+# HTTP 200, `predictions: []`, and an "error" string nobody's code read. The
+# picks board then said "no games on the board", which was a lie whenever the
+# real answer was "we could not compute the picks".
+#
+#   ok           model picks are in `predictions`.
+#   market_only  NBA games are on the board but the team-stats snapshot covers
+#                none of them, so `predictions` holds the market's own de-vigged
+#                probabilities tagged SIMULATED_MODEL_TAG. Never logged, never
+#                graded. Still HTTP 200 (see the note in run_predictions).
+#   no_games     there are no NBA games to predict (the odds feed fell back to
+#                another league, which it does in the NBA offseason). HTTP 200.
+#   no_odds      the odds feed produced nothing usable and, outside the regular
+#                season, we cannot tell an empty board from a failed scrape
+#                (sbrscrape swallows its own request errors into "no games").
+#                HTTP 200, with a `message` that says exactly that.
+#   failed       something that should have worked did not. The endpoint turns
+#                this into HTTP 503 with `error` as the detail.
+PRED_STATUS_OK = "ok"
+PRED_STATUS_MARKET_ONLY = "market_only"
+PRED_STATUS_NO_GAMES = "no_games"
+PRED_STATUS_NO_ODDS = "no_odds"
+PRED_STATUS_FAILED = "failed"
+# Ledger mode only (PREDICTIONS_SOURCE=ledger): nothing has been logged for
+# today yet. That is either no slate or a morning run that has not happened
+# or failed; the public server cannot tell which, and says so in `note`.
+PRED_STATUS_NOT_LOGGED = "not_logged"
+
+# /sportsbooks advertises these; anything else can only ever produce an empty
+# board, which is a plausible answer to a typo. Refuse it instead.
+SUPPORTED_SPORTSBOOKS = ("fanduel", "draftkings", "betmgm",
+                         "pointsbet", "caesars", "wynn", "bet_rivers_ny")
+
+# The last date of a regular season on which every seven-day window is certain
+# to contain NBA games. The league's regular season ends in the second week of
+# April; the 10th is a safe floor. Month and day only -- the year is the one
+# after OPENING_NIGHT.
+_REGULAR_SEASON_SAFE_END = (4, 10)
+
+
+def _nba_regular_season_under_way(today=None) -> bool:
+    """True only on dates when an empty NBA board cannot be genuine.
+
+    Opening night comes from preflight_opening_night.OPENING_NIGHT, the one
+    constant daily_update also reads, so there is still only one date to bump
+    each fall. If it cannot be read, or it has not been bumped and the window
+    has passed, this returns False: the endpoint then falls back to the
+    cautious "no_odds" answer rather than ever crying failure on a genuine
+    offseason day.
+    """
+    if today is None:
+        today = to_nba_date(datetime.now(timezone.utc)) or datetime.now().date()
+    try:
+        from preflight_opening_night import OPENING_NIGHT
+    except Exception:
+        return False
+    end = OPENING_NIGHT.replace(year=OPENING_NIGHT.year + 1,
+                                month=_REGULAR_SEASON_SAFE_END[0],
+                                day=_REGULAR_SEASON_SAFE_END[1])
+    return OPENING_NIGHT <= today <= end
+
+
+def _prediction_result(status: str, sportsbook: str, *, message: Optional[str] = None,
+                       error: Optional[str] = None, **extra) -> Dict[str, Any]:
+    """An empty-predictions result that says why it is empty."""
+    out: Dict[str, Any] = {"sportsbook": sportsbook, "status": status, "predictions": []}
+    if message:
+        out["message"] = message
+    if error:
+        out["error"] = error
+    out.update(extra)
+    return out
+
 
 #: The NBA prediction log, with the guarantees the NFL ledger has had from the
 #: start. Until 2026-09-19 this table enforced nothing: a prediction could be
@@ -809,7 +884,7 @@ class PredictionRunner:
             return df
         except Exception as e:
             logger.error(f"Failed to load team stats from database: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Server configuration error: Could not load team stats.")
+            raise HTTPException(status_code=503, detail="Server configuration error: Could not load team stats.")
 
     def _last_game_dates(self):
         """{team full name: [game dates]} from the archive, most recent first.
@@ -938,20 +1013,72 @@ class PredictionRunner:
             return xgb_ml, xgb_uo
         except xgb.core.XGBoostError as e:
             logger.error(f"Failed to load XGBoost models: {e}")
-            raise HTTPException(status_code=500, detail="Server configuration error: Could not load prediction models.")
+            raise HTTPException(status_code=503, detail="Server configuration error: Could not load prediction models.")
+
+    def _empty_board(self, resolved: str) -> Dict[str, Any]:
+        """The odds provider gave us nothing priced. Say what that means.
+
+        sbrscrape.Scoreboard catches every exception it hits (a timeout, a
+        503, SBR changing its page) and reports it as an empty list of games,
+        and SbrOddsProvider then looks seven days ahead and falls back to the
+        WNBA. So "no games" from this feed is EITHER a genuinely empty board
+        OR a failed scrape, and nothing in its output separates the two.
+
+        During the regular season the calendar separates them: there is no
+        seven-day stretch between opening night and mid-April without NBA
+        games, so an empty board is a failure. Outside it we say honestly
+        that we cannot tell.
+        """
+        scraped = len(getattr(self.odds_provider, "games", None) or [])
+        in_season = _nba_regular_season_under_way()
+        if scraped:
+            what = (f"{scraped} {resolved} game(s) are on the board, but {self.sportsbook} "
+                    f"has not posted a moneyline for any of them.")
+        else:
+            what = (f"The odds feed returned no {resolved} games for the next 7 days. "
+                    "The scraper reports a failed request the same way, so this is either "
+                    "an empty board or a failed scrape.")
+        if in_season:
+            logger.error("Prediction run FAILED during the NBA season: %s", what)
+            return _prediction_result(
+                PRED_STATUS_FAILED, self.sportsbook,
+                error=what + " The NBA regular season is under way, so it is a failure.")
+        return _prediction_result(PRED_STATUS_NO_ODDS, self.sportsbook, message=what,
+                                  resolved_sport=resolved)
 
     def run_predictions(self):
+        resolved = getattr(self, 'resolved_sport', None) or self.sport
         odds_data = self.odds_provider.get_odds()
         if not odds_data:
-            return {"error": f"No odds data found from {self.sportsbook}.", "predictions": []}
+            return self._empty_board(resolved)
         try:
-            snapshot_odds(odds_data, self.sportsbook, getattr(self, 'resolved_sport', self.sport) or self.sport)
+            snapshot_odds(odds_data, self.sportsbook, resolved)
         except Exception as exc:
             logger.warning(f"Odds snapshot failed (non-fatal): {exc}")
         games_list = create_todays_games_from_odds(odds_data)
         if not games_list:
-            return {"error": "No valid games processed from odds data.", "predictions": []}
-        
+            if (resolved or "").upper() != "NBA":
+                # The provider found no NBA games on any of the next seven days
+                # and fell back to another league. Out of season that is the
+                # offseason; in season it means the NBA scrape failed seven
+                # times in a row and the WNBA one did not.
+                if _nba_regular_season_under_way():
+                    msg = (f"The odds feed found no NBA games in the next 7 days and fell back to "
+                           f"{resolved}, during the NBA regular season. The NBA scrape failed.")
+                    logger.error(msg)
+                    return _prediction_result(PRED_STATUS_FAILED, self.sportsbook, error=msg)
+                return _prediction_result(
+                    PRED_STATUS_NO_GAMES, self.sportsbook, resolved_sport=resolved,
+                    message=(f"No NBA games in the next 7 days (the odds feed fell back to "
+                             f"{resolved}, which the model does not cover)."))
+            # NBA odds, but not one team name we recognise: the feed changed
+            # its spelling, which is a failure, not an empty slate.
+            names = sorted({t for key in odds_data for t in key.split(":")})[:6]
+            msg = (f"{len(odds_data)} NBA game(s) had odds, but none of their team names "
+                   f"matched the model's team list (e.g. {', '.join(names)}).")
+            logger.error(msg)
+            return _prediction_result(PRED_STATUS_FAILED, self.sportsbook, error=msg)
+
         # Check if we have database stats for the teams. If not, use bookmaker odds simulation.
         has_stats = False
         for home_team, away_team in games_list:
@@ -966,7 +1093,14 @@ class PredictionRunner:
                 break
 
         if not has_stats:
-            logger.info("No teams in today's games have stats in database. Using bookmaker implied probability simulation.")
+            # Every current NBA team is in every team-stats snapshot, so this
+            # branch means the snapshot is broken or renamed its teams. It is
+            # kept at HTTP 200 because the picks board already renders these
+            # rows as "on the slate, but not model picks" -- but it is logged
+            # as an error, and the result says market_only, not ok.
+            logger.error("No team in today's %d game(s) is in the team-stats table %s. Serving "
+                         "the market's own probabilities, tagged %s -- NOT model picks.",
+                         len(games_list), getattr(self, 'team_stats_table', '?'), SIMULATED_MODEL_TAG)
             predictions_list = []
             for home_team, away_team in games_list:
                 game_key = f"{home_team}:{away_team}"
@@ -1013,19 +1147,20 @@ class PredictionRunner:
                     else:
                         prob_home_norm = 0.5
                 
-                # Simulate a small model edge (e.g. adding 2% to favored team or a slight variation)
-                # to show a positive Expected Value and Kelly Criterion suggestion!
+                # The market's own favourite at the market's own probability.
+                # This used to add two points to the favourite "to show a
+                # positive Expected Value and Kelly Criterion suggestion" -- an
+                # edge invented from nothing, with a bet size attached, on a
+                # board whose copy says these numbers are "only the market's
+                # own implied probabilities". At the de-vigged price the EV is
+                # honest (about zero, less the vig) and Kelly says no bet.
                 if prob_home_norm >= 0.5:
-                    winner_confidence = min(0.99, prob_home_norm + 0.02)
+                    winner_confidence = prob_home_norm
                     winner_idx = 1
                 else:
-                    winner_confidence = min(0.99, (1 - prob_home_norm) + 0.02)
+                    winner_confidence = 1 - prob_home_norm
                     winner_idx = 0
-                
-                # Under/Over prediction: default to UNDER with a 51% simulated confidence
-                ou_idx = 0
-                ou_confidence = 0.51
-                
+
                 ev_home, ev_away, kelly_home, kelly_away = 0.0, 0.0, "No Bet", "No Bet"
                 try:
                     if home_odd is not None and away_odd is not None:
@@ -1086,19 +1221,31 @@ class PredictionRunner:
                     "home_team": home_team, "away_team": away_team, "home_odds": home_odd, "away_odds": away_odd,
                     "under_over_line": uo_line, "predicted_winner": home_team if winner_idx == 1 else away_team,
                     "winner_confidence": round(winner_confidence * 100, 2),
-                    "under_over_prediction": "OVER" if ou_idx == 1 else "UNDER",
-                    "under_over_confidence": round(ou_confidence * 100, 2), "model": SIMULATED_MODEL_TAG,
+                    # There was a hardcoded "UNDER at 51%" here. The over/under
+                    # pick is withdrawn everywhere, and this one was not even a
+                    # model's: it was a constant.
+                    "under_over_prediction": None,
+                    "under_over_confidence": None, "model": SIMULATED_MODEL_TAG,
                     "expected_value": {"home_team": ev_home, "away_team": ev_away},
                     "kelly_criterion": {"home_team": kelly_home, "away_team": kelly_away},
                     "game_start_time_utc": game_start_time_str
                 })
-            return self._attach_availability({"sportsbook": self.sportsbook, "predictions": predictions_list})
+            return self._attach_availability({
+                "sportsbook": self.sportsbook, "status": PRED_STATUS_MARKET_ONLY,
+                "message": ("The team-stats snapshot covers none of these teams, so the model "
+                            "could not price them. These are the market's own probabilities, "
+                            "not picks."),
+                "predictions": predictions_list})
 
         (data_for_model, todays_games_uo, frame_ml, home_team_odds, away_team_odds,
          game_start_times, processed_games, game_dates) = self._prepare_data_for_model(games_list, odds_data)
 
         if data_for_model.size == 0:
-            return {"error": "Could not prepare valid data for the prediction model.", "predictions": []}
+            msg = (f"Could not prepare valid data for the prediction model: none of the "
+                   f"{len(games_list)} game(s) had team stats for both sides in "
+                   f"{getattr(self, 'team_stats_table', 'the team-stats table')}.")
+            logger.error(msg)
+            return _prediction_result(PRED_STATUS_FAILED, self.sportsbook, error=msg)
 
         ml_predictions, ou_predictions = self._run_xgboost_models(data_for_model, frame_ml, todays_games_uo)
 
@@ -1148,9 +1295,16 @@ class PredictionRunner:
                                              calibrated_ml=calibrated_ml)
         if calibrated_ml and pick_explanations:
             _attach_why(formatted.get("predictions") or [], pick_explanations)
+        formatted["status"] = PRED_STATUS_OK
+        skipped = getattr(self, "games_without_stats", None) or []
+        if skipped:
+            formatted["games_without_stats"] = skipped
+            formatted["message"] = (f"{len(skipped)} game(s) on the board have no team-stats row "
+                                    f"and have no pick: {', '.join(skipped)}.")
         return self._attach_availability(formatted)
 
     def _prepare_data_for_model(self, games, odds):
+        self.games_without_stats = []
         game_data_list, home_odds_list, away_odds_list, uo_lines_list, game_start_times_list = [], [], [], [], []
         processed_games, game_dates_list = [], []
 
@@ -1174,6 +1328,9 @@ class PredictionRunner:
                 
             if home_stats_rows.empty or away_stats_rows.empty:
                 logger.warning(f"Skipping game {home_team} vs {away_team}: statistics row not found in database.")
+                # Recorded so the response can say a game is missing, rather
+                # than a 12-game slate quietly arriving as 11 picks.
+                self.games_without_stats.append(f"{away_team} @ {home_team}")
                 continue
 
             home_stats = home_stats_rows.iloc[0].copy()
@@ -1555,6 +1712,22 @@ predictions_cache = {}
 @app.get("/predictions")
 @limiter.limit(RATE_LIMIT_EXPENSIVE)
 def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kelly_criterion: bool = True, sport: str = 'NBA'):
+    """Today's picks, with `status` saying what an empty list means.
+
+    200 + status ok / market_only / no_games / no_odds (see PRED_STATUS_*).
+    503 when the run failed: a caller must never be able to mistake "we could
+    not compute the picks" for "there are no games".
+    400 for a sportsbook or sport we do not serve, which used to come back as
+    a perfectly plausible empty board.
+    """
+    sportsbook = (sportsbook or "").strip().lower()
+    if sportsbook not in SUPPORTED_SPORTSBOOKS:
+        raise HTTPException(status_code=400, detail=(
+            f"Unknown sportsbook '{sportsbook}'. Supported: {', '.join(SUPPORTED_SPORTSBOOKS)}."))
+    if (sport or "").strip().upper() != "NBA":
+        raise HTTPException(status_code=400, detail=(
+            f"sport='{sport}' is not served. The model and the prediction record cover the NBA only."))
+    sport = "NBA"
     if PREDICTIONS_SOURCE == "ledger":
         return _predictions_from_ledger(sportsbook, kelly_criterion, sport)
     cache_key = f"{sportsbook}_{kelly_criterion}_{sport}"
@@ -1575,18 +1748,24 @@ def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kell
     try:
         runner = PredictionRunner(sportsbook=sportsbook, kelly_criterion=kelly_criterion, sport=sport)
         res = runner.run_predictions()
-        predictions_cache[cache_key] = (res, now)
-        try:
-            # Log the sport the odds provider actually resolved (the NBA->WNBA
-            # offseason fallback means it is not always the requested one).
-            if LOG_PREDICTIONS_ON_REQUEST:
-                log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
-        except Exception as exc:
-            logger.warning(f"Prediction logging failed (non-fatal): {exc}")
-        return res
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in /predictions endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
+    if res.get("status") == PRED_STATUS_FAILED:
+        # Not cached: a failure should be retried on the next request rather
+        # than served for five minutes.
+        raise HTTPException(status_code=503, detail=res.get("error") or "The prediction run failed.")
+    predictions_cache[cache_key] = (res, now)
+    try:
+        # Log the sport the odds provider actually resolved (the NBA->WNBA
+        # offseason fallback means it is not always the requested one).
+        if LOG_PREDICTIONS_ON_REQUEST:
+            log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
+    except Exception as exc:
+        logger.warning(f"Prediction logging failed (non-fatal): {exc}")
+    return res
 
 # --- Parlay Evaluation ---
 class ParlayLeg(BaseModel):
@@ -3045,7 +3224,9 @@ def _predictions_from_ledger(sportsbook: str, kelly_criterion: bool, sport: str)
             "logged_at": r["logged_at"],
             "why": _why_from_row(r),
         })
-    out: Dict[str, Any] = {"sportsbook": sportsbook, "predictions": predictions,
+    out: Dict[str, Any] = {"sportsbook": sportsbook,
+                           "status": PRED_STATUS_OK if predictions else PRED_STATUS_NOT_LOGGED,
+                           "predictions": predictions,
                            "source": "ledger", "log_date": log_date}
     if not predictions:
         out["note"] = ("No picks have been logged for today yet. They appear here once the "

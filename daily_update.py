@@ -167,6 +167,18 @@ def log_todays_predictions() -> str:
         logger.error("Prediction run failed: %s", exc, exc_info=True)
         return "failed"
 
+    # The runner now says what kind of result this is (main_api PRED_STATUS_*).
+    # "failed" is a pipeline that should have worked; "market_only" means no
+    # team had a stats row, so every row is a market-implied placeholder the
+    # ledger refuses. Either way nothing real can be logged, and before this
+    # check a failed run in the offseason reported "offseason" and a
+    # market-only run reported "logged" with 0 rows written.
+    status = result.get("status")
+    if status in ("failed", "market_only"):
+        logger.error("Prediction run returned status=%s: %s", status,
+                     result.get("error") or result.get("message") or "no detail")
+        return "failed"
+
     predictions = result.get("predictions") or []
     if resolved != "NBA":
         # In season, this means the NBA scrape failed on every day it tried
@@ -205,10 +217,12 @@ def log_todays_predictions() -> str:
     already = counts.get("already_present", 0)
     no_tip = counts.get("no_tipoff", 0)
     late = counts.get("late", 0)
+    preseason = counts.get("preseason", 0)
     logger.info(
         "predictions_log: %d written, %d already logged earlier today, %d refused "
-        "(no tip-off time), %d refused (already under way) -- of %d produced.",
-        written, already, no_tip, late, len(predictions))
+        "(no tip-off time), %d refused (already under way), %d skipped (preseason) "
+        "-- of %d produced.",
+        written, already, no_tip, late, preseason, len(predictions))
 
     # A missing tip-off is always a defect in the feed, never a timing accident,
     # and those picks can never be logged later: the table's CHECK constraint

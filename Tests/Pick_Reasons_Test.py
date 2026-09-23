@@ -122,6 +122,12 @@ class LedgerTest(unittest.TestCase):
         self.db = os.path.join(self.dir, "OddsData.sqlite")
         self.patch = mock.patch.object(main_api, "ODDS_DB_PATH", self.db)
         self.patch.start()
+        # "Tomorrow" must be a regular-season date, or the preseason guard in
+        # log_predictions (correctly) refuses the pick whenever this runs in
+        # the weeks before opening night.
+        self.season = mock.patch("preflight_opening_night.OPENING_NIGHT",
+                                 (datetime.now(timezone.utc) - timedelta(days=30)).date())
+        self.season.start()
         tip = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0).isoformat()
         self.pick = {"home_team": "Boston Celtics", "away_team": "Utah Jazz", "home_odds": -300,
                      "away_odds": 240, "under_over_line": 221.5, "predicted_winner": "Boston Celtics",
@@ -131,6 +137,7 @@ class LedgerTest(unittest.TestCase):
         self.pick["why"] = pr.build_why(reasons(), "Boston Celtics", 71.4)
 
     def tearDown(self):
+        self.season.stop()
         self.patch.stop()
         shutil.rmtree(self.dir, ignore_errors=True)
 

@@ -606,6 +606,30 @@ def _ensure_prediction_log_schema(conn) -> None:
             SELECT RAISE(ABORT, 'a logged explanation is immutable');
         END""")
 
+#: How far before opening night the preseason can start. The NBA preseason
+#: runs about three weeks; 45 days leaves room without reaching back into the
+#: previous season (or into the ledger rehearsal, which replays real games from
+#: the season before).
+PRESEASON_WINDOW_DAYS = 45
+
+
+def _is_nba_preseason(tipoff_iso: Optional[str]) -> bool:
+    """True when a tip-off falls in the weeks before opening night.
+
+    Reads preflight_opening_night.OPENING_NIGHT, the one date bumped each fall.
+    If that constant is left stale, this stops protecting the next preseason;
+    preflight_opening_night.py is what flags a stale constant.
+    """
+    try:
+        from preflight_opening_night import OPENING_NIGHT
+    except Exception:
+        return False
+    d = to_nba_date(tipoff_iso)
+    if d is None:
+        return False
+    return OPENING_NIGHT - timedelta(days=PRESEASON_WINDOW_DAYS) <= d < OPENING_NIGHT
+
+
 def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict[str, int]:
     """
     Persist each model prediction (one row per game/book/day, FIRST wins).
@@ -624,7 +648,7 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
     """
     predictions = result.get("predictions") or []
     counts = {"produced": len(predictions), "written": 0, "already_present": 0,
-              "no_tipoff": 0, "late": 0, "simulated": 0}
+              "no_tipoff": 0, "late": 0, "simulated": 0, "preseason": 0}
     if not predictions:
         return counts
     conn = _odds_snapshot_conn()
@@ -635,6 +659,7 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
         skipped_sim = 0
         skipped_no_tipoff = 0
         skipped_late = 0
+        skipped_preseason = 0
         for p in predictions:
             home = p.get("home_team")
             away = p.get("away_team")
@@ -659,6 +684,14 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
                 logger.error(
                     "NOT LOGGING %s vs %s: tip-off was %s and it is now %s. A prediction made "
                     "after the game started is not a prediction.", away, home, tipoff, now_iso)
+                continue
+            if str(sport).upper() == "NBA" and _is_nba_preseason(tipoff):
+                # Preseason games are exhibitions: starters sit, nothing is at
+                # stake, and the model was never evaluated on them. The archive
+                # does not ingest them either, so a logged preseason pick could
+                # never be graded and would sit "pending" on the public record
+                # forever. Found 2026-09-23, ten days before preseason began.
+                skipped_preseason += 1
                 continue
             ev = p.get("expected_value") or {}
             cur = conn.execute(
@@ -727,7 +760,7 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
                 skipped_no_tipoff, skipped_late
             )
         conn.commit()
-        counts.update(no_tipoff=skipped_no_tipoff, late=skipped_late,
+        counts.update(no_tipoff=skipped_no_tipoff, late=skipped_late, preseason=skipped_preseason,
                       simulated=skipped_sim)
     finally:
         conn.close()

@@ -162,7 +162,10 @@ def main() -> int:
     logger.info("Done in %.1f min. %s team-rows across %s games. %d failure(s).",
                 (time.time() - started) / 60, format(stored, ","), format(games, ","), failures)
     conn.close()
-    return 0
+    # Non-zero when a season's request failed: the run logged the failure and
+    # carried on, which is right, but exiting 0 told any caller the archive
+    # was complete when a season was missing.
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -260,7 +260,7 @@ def grade(odds_db: str = None, team_db: str = None) -> int:
             return 0
 
         name_to_id = _team_name_to_id(team_conn)
-        unmatched_names, no_box_score = [], 0
+        unmatched_names, no_box_score, implausible = [], 0, []
         for row in ungraded:
             home_id = name_to_id.get(row["home_team"].strip().lower())
             away_id = name_to_id.get(row["away_team"].strip().lower())
@@ -283,6 +283,15 @@ def grade(odds_db: str = None, team_db: str = None) -> int:
                 continue  # box score not ingested yet
 
             home_pts, away_pts = result
+            # A tie, a zero or a missing score is a broken box score, not a
+            # result. `home_pts > away_pts` used to turn 0-0 (what the parser
+            # stores for a skeleton box score) into an AWAY win, and the
+            # no-regrade trigger makes that permanent. Refuse it and say so.
+            if (home_pts is None or away_pts is None or home_pts <= 0 or away_pts <= 0
+                    or home_pts == away_pts):
+                implausible.append(f"{row['away_team']} @ {row['home_team']} "
+                                   f"{game_date}: {away_pts}-{home_pts}")
+                continue
             winner = row["home_team"] if home_pts > away_pts else row["away_team"]
             odds_conn.execute(
                 "UPDATE predictions_log SET actual_winner = ?, actual_total = ? WHERE id = ?",
@@ -292,12 +301,20 @@ def grade(odds_db: str = None, team_db: str = None) -> int:
 
         odds_conn.commit()
         logger.info("Graded %d of %d ungraded predictions (%d still waiting on a box "
-                    "score, %d with a team name the archive does not know).",
-                    graded, len(ungraded), no_box_score, len(unmatched_names))
+                    "score, %d with a team name the archive does not know, %d refused "
+                    "because the archived score is not a result).",
+                    graded, len(ungraded), no_box_score, len(unmatched_names), len(implausible))
         if unmatched_names:
             logger.warning("Ungradeable team names (fine if these are WNBA; a real NBA "
                            "team here will never be graded): %s",
                            ", ".join(sorted(set(unmatched_names))[:10]))
+        if implausible:
+            # Raised after the commit, so every other game still grades; the
+            # daily job turns red, because this needs a person to fix the box
+            # score before the pick can be graded at all.
+            raise RuntimeError(
+                f"{len(implausible)} prediction(s) NOT graded: the archive's score is not "
+                f"a result (tie, zero or missing): " + "; ".join(implausible[:10]))
         return graded
     finally:
         odds_conn.close()

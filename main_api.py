@@ -4915,12 +4915,22 @@ def get_active_players():
         raise HTTPException(status_code=500, detail=str(e))
 
 player_shot_chart_cache = {}
+SHOT_CHART_SEASON_TYPES = ("Regular Season", "Playoffs")
+SHOT_CHART_CURRENT_TTL = timedelta(hours=6)
 
 @app.get("/api/player-shot-chart")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
-def get_player_shot_chart(request: Request, player_id: int, season: str = CURRENT_SEASON):
+def get_player_shot_chart(request: Request, player_id: int, season: str = CURRENT_SEASON,
+                          season_type: str = "Regular Season"):
     """
     Per-shot chart data for a player-season, plus league-average FG% by zone.
+
+    `season_type` is "Regular Season" (default) or "Playoffs"; anything else
+    is a 400. It reaches ShotChartDetail, and therefore the LeagueAverages
+    result set that comes back from the same call, so a playoff chart is
+    compared against the playoff league average. It is part of every cache
+    key and echoed in the response. Until 2026-09-23 this always asked for
+    the regular season, so a playoff run never appeared on a shot chart.
 
     Coordinate space (stats.nba.com shotchartdetail convention): shot x/y are
     LOC_X / LOC_Y in tenths of feet with the basket at the origin -
@@ -4930,22 +4940,32 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
     `league_averages` (additive field) carries the same rows as the legacy
     `averages` field, matching the shared shot-chart response contract.
     """
-    cache_key = f"{player_id}_{season}"
-    if cache_key in player_shot_chart_cache:
-        logger.info(f"Returning cached player shot chart for key: {cache_key}")
-        return player_shot_chart_cache[cache_key]
-        
+    if season_type not in SHOT_CHART_SEASON_TYPES:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(SHOT_CHART_SEASON_TYPES)}; got '{season_type}'."))
+    cache_key = f"{player_id}_{season}_{season_type}"
+    cached = player_shot_chart_cache.get(cache_key)
+    if cached is not None:
+        payload, cached_at = cached
+        # A finished season never changes. The current one gains shots every
+        # game night, and this cache used to keep the first answer until the
+        # process restarted.
+        if season != CURRENT_SEASON or datetime.now() - cached_at < SHOT_CHART_CURRENT_TTL:
+            logger.info(f"Returning cached player shot chart for key: {cache_key}")
+            return payload
+
     if not shotchartdetail:
         raise HTTPException(status_code=500, detail="nba_api library not imported")
         
     try:
-        logger.info(f"Fetching shot chart detail from NBA stats API for player: {player_id}, season: {season}")
+        logger.info(f"Fetching shot chart detail from NBA stats API for player: {player_id}, "
+                    f"season: {season}, season_type: {season_type}")
         shot_chart = shotchartdetail.ShotChartDetail(
             player_id=player_id,
             team_id=0,
             season_nullable=season,
             context_measure_simple="FGA",
-            season_type_all_star="Regular Season"
+            season_type_all_star=season_type
         )
         data = shot_chart.get_dict()
         
@@ -4953,6 +4973,13 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
         
         # 1. Parse individual shots
         shots_set = next((rs for rs in result_sets if rs.get("name") == "Shot_Chart_Detail"), None)
+        if shots_set is None:
+            # A player with no attempts still gets this result set, with an
+            # empty rowSet. Its absence means the answer was not a shot chart
+            # at all, and caching `shots: []` for it would show "no shots"
+            # until the next restart.
+            raise HTTPException(status_code=502, detail=(
+                "stats.nba.com answered without a Shot_Chart_Detail result set."))
         shots = []
         if shots_set:
             headers = shots_set.get("headers", [])
@@ -5023,15 +5050,18 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
         response_data = {
             "player_id": player_id,
             "season": season,
+            "season_type": season_type,
             "shots": shots,
             "averages": averages,
             # Additive alias: same zone rows under the contract field name.
             "league_averages": averages
         }
         
-        player_shot_chart_cache[cache_key] = response_data
+        player_shot_chart_cache[cache_key] = (response_data, datetime.now())
         return response_data
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in get_player_shot_chart API: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -24,5 +24,9 @@ services:
       # prediction request, which a gateway would time out first.
       - key: WARM_MODEL_ON_START
         value: "true"
+      # The laptop is the ledger's writer (DEPLOY.md section 3a). A visit to
+      # /predictions here must not start a second, ungraded ledger.
+      - key: LOG_PREDICTIONS_ON_REQUEST
+        value: "false"
       # Set CORS_ORIGINS to your Vercel URL in the Render dashboard after
       # the frontend deploys, e.g. https://bettingbuddy.vercel.app

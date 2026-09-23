@@ -136,6 +136,51 @@ generally cannot run on Railway. The working pipeline:
   at request time and usually work from cloud IPs; if sbrscrape gets
   blocked in practice, odds-dependent features degrade gracefully.
 
+## 3a. Where the prediction ledger lives (UNRESOLVED -- settle before deploy)
+
+Found 2026-09-22. The ledger is `predictions_log` in `OddsData.sqlite`, and as
+things stand a deploy creates TWO of them:
+
+| | Laptop | Production server |
+|---|---|---|
+| Writes predictions | 9am job (`daily_update.py`) and any `/predictions` visit | any `/predictions` visit |
+| Records closing lines | yes, every 15 minutes | no |
+| Grades results + CLV | yes, 9am job | no |
+| What `/track-record` shows | nothing (not public) | this copy |
+
+So on the live site the public record would be rows written whenever a
+visitor happened to load the picks, built on team stats only as fresh as the
+last snapshot, and never graded. The complete, graded record would sit on
+the laptop where nobody can see it.
+
+Two guards landed with this note; neither changes laptop behaviour:
+
+- `bootstrap_db.py` never overwrites an existing `OddsData.sqlite`. Before
+  this, the refresh in section 3 (delete TeamData, redeploy) re-extracted the
+  ledger from the snapshot and silently deleted every row production had
+  written since. The no-delete triggers cannot see a whole file being replaced.
+- `LOG_PREDICTIONS_ON_REQUEST=false` stops `/predictions` visits writing to the
+  ledger. Set it on every server that is not the ledger's single writer.
+
+The decision still needed is which machine is the single writer:
+
+- **A. Laptop writes, production mirrors (recommended).** Everything that
+  already works stays where it is. After the 9am job, the laptop pushes
+  `OddsData.sqlite` (about 5 MB) to production through a key-protected
+  upload that refuses any file missing or altering a row production already
+  has, so the public record can only grow. Production shows the picks that
+  were logged instead of recomputing them on older team stats: the pick a
+  visitor sees is the pick on the record. Cost: the upload route, the push
+  step and its checks, roughly a day. Risk: if the laptop is off, the record
+  is late; it is never wrong.
+- **B. Production writes.** Move the recorder, grader and logging to the
+  server. Blocked by the same thing as section 3: stats.nba.com refuses
+  cloud IPs, so the server's team stats (and so its picks) are only as fresh
+  as the last snapshot.
+- **C. The laptop IS the backend,** exposed through a tunnel. One copy, no
+  sync, but the whole site goes down whenever the laptop sleeps, restarts or
+  loses Wi-Fi.
+
 ## Env inventory
 
 The authoritative, annotated list now lives in `.env.example` in each repo —

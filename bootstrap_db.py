@@ -20,6 +20,7 @@ import urllib.request
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
 MAIN_DB = os.path.join(DATA_DIR, "TeamData.sqlite")
+LEDGER_FILES = {"OddsData.sqlite"}
 
 
 def main() -> int:
@@ -49,6 +50,20 @@ def main() -> int:
                 if not member.isfile() or not member.name.endswith(".sqlite"):
                     continue
                 member.name = os.path.basename(member.name)
+                # OddsData.sqlite holds the prediction ledger. The documented
+                # refresh (delete TeamData.sqlite, redeploy) lands here with
+                # the ledger still on the volume, and tar.extract overwrites
+                # silently: every row this server logged since the snapshot
+                # was taken would vanish, and the public track record would
+                # change after the fact. The database triggers that forbid
+                # deleting a ledger row cannot see a file being replaced, so
+                # the guard has to live here. First boot (no file) still
+                # extracts it.
+                if member.name in LEDGER_FILES and os.path.exists(
+                        os.path.join(DATA_DIR, member.name)):
+                    print(f"[bootstrap]   KEPT existing {member.name} (the ledger "
+                          "is never replaced by a snapshot)")
+                    continue
                 tar.extract(member, DATA_DIR)
                 print(f"[bootstrap]   extracted {member.name}")
         print("[bootstrap] Done.")

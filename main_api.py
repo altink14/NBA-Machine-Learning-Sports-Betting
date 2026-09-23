@@ -172,6 +172,18 @@ PROTECTED_PATH_PREFIXES = (
 # Never require a key here, whatever else is configured (uptime probes).
 ALWAYS_OPEN_PATHS = {"/", "/health"}
 
+# LOG_PREDICTIONS_ON_REQUEST: whether a visit to /predictions writes to the
+# ledger. Default on, which is how the laptop has always worked. Set it to
+# "false" on any server that is NOT the ledger's single writer. The ledger is
+# first-write-wins, so two machines writing their own copies each keep a
+# different "first" pick for the same game, built from different data, and
+# there is no honest way to merge them afterwards. A production server whose
+# TeamData only refreshes when a snapshot is republished would also be logging
+# picks made on stale team stats. The daily job calls log_predictions()
+# directly and is unaffected by this flag.
+LOG_PREDICTIONS_ON_REQUEST = (os.environ.get("LOG_PREDICTIONS_ON_REQUEST", "true")
+                              .strip().lower() not in ("0", "false", "no", "off"))
+
 
 def _is_protected_path(path: str) -> bool:
     """True when `path` needs the API key. Exact match or a genuine sub-path."""
@@ -1520,7 +1532,8 @@ def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kell
         try:
             # Log the sport the odds provider actually resolved (the NBA->WNBA
             # offseason fallback means it is not always the requested one).
-            log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
+            if LOG_PREDICTIONS_ON_REQUEST:
+                log_predictions(res, sportsbook, getattr(runner, 'resolved_sport', sport) or sport)
         except Exception as exc:
             logger.warning(f"Prediction logging failed (non-fatal): {exc}")
         return res

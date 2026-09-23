@@ -477,16 +477,27 @@ def _ensure_prediction_log_schema(conn) -> None:
                 "Leaving it as-is; migrate deliberately rather than from a request handler.", n)
     conn.executescript(_PREDICTION_LOG_SCHEMA)
 
-def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None:
+def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict[str, int]:
     """
-    Persist each model prediction (one row per game/book/day, latest wins).
+    Persist each model prediction (one row per game/book/day, FIRST wins).
+
+    Returns what actually happened: {produced, written, already_present,
+    no_tipoff, late, simulated}. It used to return None, and its caller
+    reported "Logged N prediction(s)" using the number the MODEL produced,
+    not the number this function wrote. On 2026-09-22 that turned out to
+    hide the whole product: the odds provider was supplying no tip-off time,
+    so every row was refused here, while the daily log stayed green and
+    announced a full slate. Callers should report `written`, and treat any
+    `no_tipoff` as a failure -- those games can never be logged later.
     This is the raw material for a public track-record page: predictions are
     recorded BEFORE games happen; actual_winner/actual_total get filled in
     later by a grading pass.
     """
     predictions = result.get("predictions") or []
+    counts = {"produced": len(predictions), "written": 0, "already_present": 0,
+              "no_tipoff": 0, "late": 0, "simulated": 0}
     if not predictions:
-        return
+        return counts
     conn = _odds_snapshot_conn()
     try:
         _ensure_prediction_log_schema(conn)
@@ -521,7 +532,7 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                     "after the game started is not a prediction.", away, home, tipoff, now_iso)
                 continue
             ev = p.get("expected_value") or {}
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO predictions_log (
                     logged_at, log_date, sport, sportsbook, game_key,
@@ -560,6 +571,12 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                     p.get("model"),
                 )
             )
+            # DO NOTHING on conflict leaves rowcount 0: the game was already
+            # logged earlier today, which is correct, not a loss.
+            if cur.rowcount == 1:
+                counts["written"] += 1
+            else:
+                counts["already_present"] += 1
         if skipped_sim:
             logger.info(
                 "Prediction log: skipped %d market-implied row(s) - '%s' output is not a "
@@ -573,8 +590,11 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> None
                 skipped_no_tipoff, skipped_late
             )
         conn.commit()
+        counts.update(no_tipoff=skipped_no_tipoff, late=skipped_late,
+                      simulated=skipped_sim)
     finally:
         conn.close()
+    return counts
 
 # --- Days-rest helpers -------------------------------------------------------
 # The schedule CSVs (Data/nba-*-UTC.csv) carry UTC timestamps, but an NBA "game date"
@@ -1275,7 +1295,13 @@ class PredictionRunner:
             
             ev_home, ev_away, kelly_home, kelly_away = 0.0, 0.0, "No Bet", "No Bet"
             game_datetime_obj = game_start_times[i]
-            game_start_time_str = game_datetime_obj.isoformat() if isinstance(game_datetime_obj, datetime) else None
+            # _utc_iso, not `.isoformat() if isinstance(..., datetime)`. The odds
+            # provider hands this over as an ISO STRING, and the old test turned
+            # every string into None -- so even with the provider fixed, every
+            # tip-off would have been dropped right here and log_predictions
+            # would have refused the whole slate. The simulation branch above
+            # already accepted strings; the real model path did not.
+            game_start_time_str = _utc_iso(game_datetime_obj)
 
             try:
                 if home_odd is not None and away_odd is not None:

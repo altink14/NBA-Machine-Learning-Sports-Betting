@@ -5,6 +5,29 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _tipoff(game):
+    """The game's start time, from whichever key the scraper actually uses.
+
+    This read `game.get('datetime')` and sbrscrape has never written that key.
+    Both 0.0.10 (installed) and 0.0.12 (current) put the start time in
+    `game['date']`, as an ISO string like '2026-09-22T23:30:00+00:00'. So every
+    game from this provider arrived with no tip-off time -- verified 2026-09-22
+    against the live feed, and in the archive: 76 of 76 WNBA rows and 23 of the
+    NBA rows this path ever wrote have a NULL start.
+
+    That was harmless for the odds snapshots and fatal for the product.
+    `log_predictions` rightly refuses any pick it cannot prove was made before
+    tip-off, so on opening night it would have refused EVERY game, the public
+    track record would have stayed empty, and the daily job would still have
+    logged "Logged 12 prediction(s)" because it counted the runner's output
+    rather than rows written.
+
+    'datetime' is still tried first in case a future release adds it.
+    """
+    return game.get('datetime') or game.get('date')
+
+
 class SbrOddsProvider:
     """
     An intelligent odds provider that fetches NBA games.
@@ -42,7 +65,7 @@ class SbrOddsProvider:
                     if hasattr(sb, 'games') and sb.games:
                         logger.info(f"Found {len(sb.games)} NBA games on {check_date.strftime('%Y-%m-%d')}.")
                         for game in sb.games:
-                            game['game_start_time_utc'] = game.get('datetime')
+                            game['game_start_time_utc'] = _tipoff(game)
                             game['sport'] = 'NBA'
                         self.resolved_sport = 'NBA'
                         return sb.games
@@ -63,7 +86,7 @@ class SbrOddsProvider:
                 if hasattr(sb, 'games') and sb.games:
                     logger.info(f"Found {len(sb.games)} {requested_sport} games on {check_date.strftime('%Y-%m-%d')}.")
                     for game in sb.games:
-                        game['game_start_time_utc'] = game.get('datetime')
+                        game['game_start_time_utc'] = _tipoff(game)
                         game['sport'] = requested_sport
                     self.resolved_sport = requested_sport
                     return sb.games

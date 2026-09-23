@@ -418,6 +418,27 @@ def check_feed(today: date, skip_network: bool) -> None:
         resolved = provider.get_resolved_sport() or "unknown"
     except Exception as e:
         return check("the prediction feed resolves to NBA", BAD, str(e)[:120])
+    # Every game must carry a tip-off time, or log_predictions refuses it and
+    # it can never be logged later. This check would have caught the defect
+    # found on 2026-09-22 months earlier: the provider read a key the scraper
+    # never writes, so 100% of games arrived with no start time. It passed
+    # every other check here, because resolving to the right sport and
+    # returning games are both things a broken feed can still do.
+    try:
+        slate = provider.get_odds() or {}
+        with_tip = sum(1 for g in slate.values() if g.get("game_start_time_utc"))
+        if not slate:
+            check("every game in the feed carries a tip-off time", PENDING,
+                  "no games on the board to inspect")
+        else:
+            check("every game in the feed carries a tip-off time",
+                  OK if with_tip == len(slate) else BAD,
+                  f"{with_tip}/{len(slate)} games"
+                  + ("" if with_tip == len(slate) else
+                     " — games without one are refused by the ledger and lost for good"))
+    except Exception as e:
+        check("every game in the feed carries a tip-off time", BAD, str(e)[:140])
+
     if resolved == "NBA":
         check("the prediction feed resolves to NBA", OK, resolved)
     elif today < OPENING_NIGHT:

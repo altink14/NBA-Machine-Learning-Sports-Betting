@@ -135,12 +135,33 @@ def log_todays_predictions() -> str:
         return "failed" if _nba_games_expected() else "offseason"
 
     try:
-        log_predictions(result, "fanduel", resolved)
+        counts = log_predictions(result, "fanduel", resolved) or {}
     except Exception as exc:
         logger.error("Writing predictions_log failed: %s", exc, exc_info=True)
         return "failed"
 
-    logger.info("Logged %d prediction(s) to predictions_log.", len(predictions))
+    # Report what was WRITTEN, not what the model produced. This line used to
+    # print len(predictions) -- so on 2026-09-22, with the odds provider
+    # supplying no tip-off time and the ledger correctly refusing every row,
+    # it would still have said "Logged 12 prediction(s)" on opening night
+    # while the public track record stayed empty.
+    written = counts.get("written", 0)
+    already = counts.get("already_present", 0)
+    no_tip = counts.get("no_tipoff", 0)
+    late = counts.get("late", 0)
+    logger.info(
+        "predictions_log: %d written, %d already logged earlier today, %d refused "
+        "(no tip-off time), %d refused (already under way) -- of %d produced.",
+        written, already, no_tip, late, len(predictions))
+
+    # A missing tip-off is always a defect in the feed, never a timing accident,
+    # and those picks can never be logged later: the table's CHECK constraint
+    # forbids a row written after tip-off. So any of them fails the run.
+    if no_tip:
+        logger.error(
+            "%d pick(s) had no tip-off time and were NOT logged. They are gone for "
+            "good. Check the odds provider's start-time field.", no_tip)
+        return "failed"
     return "logged"
 
 

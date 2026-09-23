@@ -64,6 +64,7 @@ from src.Utils.game_flow import build_game_flow
 from src.Predict import candidate_live
 from src.Utils import player_impact
 from src.Utils import ledger_sync as ledger_mirror
+from src.Utils import pick_reasons
 from src.Sports.ledger import ensure_ledger as _ensure_ledger
 from src.Utils import availability as availability_adjust
 from src.Utils import espn_injuries
@@ -506,6 +507,21 @@ def _ensure_prediction_log_schema(conn) -> None:
                 "predictions_log holds %d row(s) under the old unconstrained schema. "
                 "Leaving it as-is; migrate deliberately rather than from a request handler.", n)
     conn.executescript(_PREDICTION_LOG_SCHEMA)
+    # The pick's "why" (src/Utils/pick_reasons.py), recorded WITH the pick,
+    # before the game, so the explanation on the public record is the one
+    # that was shown at the time. Added by ALTER because the CHECK above
+    # cannot be, so an existing table keeps its rows and gains the column.
+    if "why_json" not in {r[1] for r in conn.execute("PRAGMA table_info(predictions_log)")}:
+        conn.execute("ALTER TABLE predictions_log ADD COLUMN why_json TEXT")
+    # Written once at insert, never afterwards: an explanation improved after
+    # the result is known is the same offence as an improved pick.
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS predictions_log_why_immutable
+        BEFORE UPDATE ON predictions_log
+        WHEN NEW.why_json IS NOT OLD.why_json
+        BEGIN
+            SELECT RAISE(ABORT, 'a logged explanation is immutable');
+        END""")
 
 def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict[str, int]:
     """
@@ -569,8 +585,8 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
                     home_team, away_team, game_start_time_utc,
                     home_ml, away_ml, ou_line,
                     predicted_winner, winner_confidence, ou_prediction, ou_confidence,
-                    ev_home, ev_away, model
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ev_home, ev_away, model, why_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 -- The FIRST prediction of the day stands. This used to be a
                 -- DO UPDATE that overwrote the pick, the confidence and the
                 -- timestamp on every later run, so a 9am call could be quietly
@@ -606,6 +622,7 @@ def log_predictions(result: Dict[str, Any], sportsbook: str, sport: str) -> Dict
                     ev.get("home_team"),
                     ev.get("away_team"),
                     p.get("model"),
+                    json.dumps(p["why"], separators=(",", ":")) if p.get("why") else None,
                 )
             )
             # DO NOTHING on conflict leaves rowcount 0: the game was already
@@ -1090,10 +1107,19 @@ class PredictionRunner:
         # power-rating blend below is skipped — serving must match what the
         # sealed evaluation measured). Any failure falls back to the old model.
         calibrated_ml = False
+        pick_explanations = None
         cand = candidate_live.get_candidate()
         if cand is not None:
             try:
-                p_home = cand.predict(frame_ml, processed_games, game_dates)
+                # predict_explained returns the SAME probabilities as predict()
+                # (same matrix, same code path) plus the booster's own reasons.
+                # If only the explaining part fails, the picks still go out;
+                # they just carry no "why".
+                try:
+                    p_home, pick_explanations = cand.predict_explained(frame_ml, processed_games, game_dates)
+                except Exception as exc:
+                    logger.warning(f"Pick explanations unavailable, serving picks without them: {exc}")
+                    p_home, pick_explanations = cand.predict(frame_ml, processed_games, game_dates), None
                 ml_predictions = np.column_stack([1.0 - p_home, p_home])
                 self.model_name = candidate_live.MODEL_TAG
                 calibrated_ml = True
@@ -1117,11 +1143,12 @@ class PredictionRunner:
                 "candidate, not these picks. Run preflight_opening_night.py.",
                 len(processed_games), candidate_live._instance_error or "predict() failed")
 
-        return self._attach_availability(
-            self._format_predictions(processed_games, ml_predictions, ou_predictions, home_team_odds,
-                                     away_team_odds, todays_games_uo, game_start_times,
-                                     calibrated_ml=calibrated_ml)
-        )
+        formatted = self._format_predictions(processed_games, ml_predictions, ou_predictions, home_team_odds,
+                                             away_team_odds, todays_games_uo, game_start_times,
+                                             calibrated_ml=calibrated_ml)
+        if calibrated_ml and pick_explanations:
+            _attach_why(formatted.get("predictions") or [], pick_explanations)
+        return self._attach_availability(formatted)
 
     def _prepare_data_for_model(self, games, odds):
         game_data_list, home_odds_list, away_odds_list, uo_lines_list, game_start_times_list = [], [], [], [], []
@@ -2949,6 +2976,26 @@ def get_line_movements(sportsbook: str = 'fanduel', sport: str = 'NBA', hours: i
     finally:
         conn.close()
 
+def _attach_why(predictions: List[Dict[str, Any]], explanations: List[Dict[str, Any]]) -> None:
+    """Give each pick its "why", matched by teams, never by position alone.
+
+    A pick whose teams do not match an explanation gets none rather than
+    someone else's: a wrong reason is worse than no reason.
+    """
+    by_teams = {}
+    for e in explanations:
+        by_teams[(e.get("home"), e.get("away"))] = e
+    for p in predictions:
+        e = by_teams.get((p.get("home_team"), p.get("away_team")))
+        winner, conf = p.get("predicted_winner"), p.get("winner_confidence")
+        if e is None or winner is None or conf is None:
+            continue
+        try:
+            p["why"] = pick_reasons.build_why(e, winner, float(conf))
+        except Exception as exc:
+            logger.warning(f"Could not word the explanation for {winner}: {exc}")
+
+
 def _predictions_from_ledger(sportsbook: str, kelly_criterion: bool, sport: str) -> Dict[str, Any]:
     """Today's picks as they were LOGGED, in the /predictions response shape.
 
@@ -2996,6 +3043,7 @@ def _predictions_from_ledger(sportsbook: str, kelly_criterion: bool, sport: str)
             "kelly_criterion": kelly,
             "game_start_time_utc": r["game_start_time_utc"],
             "logged_at": r["logged_at"],
+            "why": _why_from_row(r),
         })
     out: Dict[str, Any] = {"sportsbook": sportsbook, "predictions": predictions,
                            "source": "ledger", "log_date": log_date}
@@ -3003,6 +3051,20 @@ def _predictions_from_ledger(sportsbook: str, kelly_criterion: bool, sport: str)
         out["note"] = ("No picks have been logged for today yet. They appear here once the "
                        "morning run has recorded them, before any game starts.")
     return out
+
+
+def _why_from_row(r) -> Optional[Dict[str, Any]]:
+    """The explanation recorded with the pick, if this row has one."""
+    try:
+        raw = r["why_json"]
+    except (IndexError, KeyError):
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 _LEDGER_SYNC_LOCK = threading.Lock()

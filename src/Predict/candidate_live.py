@@ -237,50 +237,95 @@ class CandidateLive:
         """
         with self._lock:
             self._maybe_refresh()
+            X = self._build_matrix(frame_ml, games, game_dates)
+            return self._calibrated(X)
 
-            missing = [c for c in self.bm.FEATURE_ORDER if c not in frame_ml.columns]
-            assert not missing, f"base feature columns missing from live frame: {missing[:5]}"
-            base = frame_ml[self.bm.FEATURE_ORDER].astype(float).values
-            assert base.shape == (len(games), self.n_base)
+    def predict_explained(self, frame_ml: pd.DataFrame,
+                          games: List[Tuple[str, str]],
+                          game_dates: List[str]) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+        """predict(), plus what moved each prediction, from the booster itself.
 
-            stat_n = len(self.bm.roll_stat_cols(self.rf))
-            nan_block = np.full(stat_n, np.nan)
+        The probabilities are computed by exactly the same code as predict()
+        on exactly the same feature matrix, so asking for reasons cannot
+        change a pick. The reasons are XGBoost's own per-feature contributions
+        (pred_contribs) for the home-win class, summed into plain groups by
+        src/Utils/pick_reasons.py. They explain the RAW booster score; the
+        stored isotonic calibrator then maps that score to the published
+        probability, which the note on every explanation says.
+        """
+        from src.Utils import pick_reasons
+        with self._lock:
+            self._maybe_refresh()
+            X = self._build_matrix(frame_ml, games, game_dates)
+            p_cal = self._calibrated(X)
+            d = self.bm.xgb.DMatrix(X, feature_names=self.cols)
+            contribs = self.booster.predict(d, pred_contribs=True)
+            margin = self.booster.predict(d, output_margin=True)
+        if contribs.ndim == 3:
+            # Two-class softmax: p(home) = sigmoid(margin_home - margin_away),
+            # so a feature's push toward home is its class-1 minus class-0 part.
+            delta = contribs[:, 1, :] - contribs[:, 0, :]
+            logit = margin[:, 1] - margin[:, 0]
+        else:
+            delta, logit = contribs, margin
+        # The contributions must add up to the booster's own score, or they
+        # are not an explanation of it.
+        assert np.allclose(delta.sum(axis=1), logit, atol=1e-3), "contributions do not sum to the margin"
+        reasons = []
+        for i, (home_name, away_name) in enumerate(games):
+            reasons.append(pick_reasons.group_contributions(
+                self.cols, delta[i], X[i], self.n_base, home_name, away_name))
+        return p_cal, reasons
 
-            rows = []
-            for i, (home_name, away_name) in enumerate(games):
-                date = game_dates[i]
-                season = season_for_date(date)
-                home = self.rf.normalize_team(home_name)
-                away = self.rf.normalize_team(away_name)
-                assert home in self.inv_canon, f"unknown home team: {home_name!r} -> {home!r}"
-                assert away in self.inv_canon, f"unknown away team: {away_name!r} -> {away!r}"
-                hid, aid = self.inv_canon[home], self.inv_canon[away]
+    def _calibrated(self, X: np.ndarray) -> np.ndarray:
+        p_raw = self.bm.predict_candidate(self.booster, X, self.cols)
+        p_cal = self.bm.apply_isotonic(p_raw, self._iso)
+        # The isotonic can output exactly 0/1 at its extremes; clip a hair
+        # so EV / Kelly arithmetic downstream stays finite.
+        return np.clip(p_cal, 1e-3, 1.0 - 1e-3)
 
-                vec = [base[i]]
-                for k in self.bm.ROLLING_KS:
-                    for tid in (hid, aid):
-                        blocks = self._rolling_blocks(season, tid, date)
-                        vec.append(nan_block if blocks is None else blocks[k])
+    def _build_matrix(self, frame_ml: pd.DataFrame,
+                      games: List[Tuple[str, str]],
+                      game_dates: List[str]) -> np.ndarray:
+        """The 207-column feature matrix, one row per game. Caller holds the lock."""
+        missing = [c for c in self.bm.FEATURE_ORDER if c not in frame_ml.columns]
+        assert not missing, f"base feature columns missing from live frame: {missing[:5]}"
+        base = frame_ml[self.bm.FEATURE_ORDER].astype(float).values
+        assert base.shape == (len(games), self.n_base)
 
-                elo = self._current_elo(season)
-                h_elo = elo.get(home, self.rf.ELO_BASE)
-                a_elo = elo.get(away, self.rf.ELO_BASE)
-                vec.append(np.array([h_elo, a_elo, h_elo - a_elo,
-                                     self.rf._elo_expected_home(h_elo, a_elo)]))
+        stat_n = len(self.bm.roll_stat_cols(self.rf))
+        nan_block = np.full(stat_n, np.nan)
 
-                rest = self._rest_vectors(season, [(home, away)], date)
-                vec.append(np.array(rest[(home, away)], dtype=float))
+        rows = []
+        for i, (home_name, away_name) in enumerate(games):
+            date = game_dates[i]
+            season = season_for_date(date)
+            home = self.rf.normalize_team(home_name)
+            away = self.rf.normalize_team(away_name)
+            assert home in self.inv_canon, f"unknown home team: {home_name!r} -> {home!r}"
+            assert away in self.inv_canon, f"unknown away team: {away_name!r} -> {away!r}"
+            hid, aid = self.inv_canon[home], self.inv_canon[away]
 
-                row = np.concatenate(vec)
-                assert row.shape[0] == len(self.cols)
-                rows.append(row)
+            vec = [base[i]]
+            for k in self.bm.ROLLING_KS:
+                for tid in (hid, aid):
+                    blocks = self._rolling_blocks(season, tid, date)
+                    vec.append(nan_block if blocks is None else blocks[k])
 
-            X = np.vstack(rows)
-            p_raw = self.bm.predict_candidate(self.booster, X, self.cols)
-            p_cal = self.bm.apply_isotonic(p_raw, self._iso)
-            # The isotonic can output exactly 0/1 at its extremes; clip a hair
-            # so EV / Kelly arithmetic downstream stays finite.
-            return np.clip(p_cal, 1e-3, 1.0 - 1e-3)
+            elo = self._current_elo(season)
+            h_elo = elo.get(home, self.rf.ELO_BASE)
+            a_elo = elo.get(away, self.rf.ELO_BASE)
+            vec.append(np.array([h_elo, a_elo, h_elo - a_elo,
+                                 self.rf._elo_expected_home(h_elo, a_elo)]))
+
+            rest = self._rest_vectors(season, [(home, away)], date)
+            vec.append(np.array(rest[(home, away)], dtype=float))
+
+            row = np.concatenate(vec)
+            assert row.shape[0] == len(self.cols)
+            rows.append(row)
+
+        return np.vstack(rows)
 
 
 _instance: Optional[CandidateLive] = None

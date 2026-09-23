@@ -315,6 +315,37 @@ def run_preflight() -> int:
         return -1
 
 
+def publish_ledger() -> str:
+    """Mirror the ledger to the public server. 'published' | 'skipped' | 'failed'.
+
+    The home PC is the only machine that writes the record (DEPLOY.md 3a);
+    this is how the public page gets it. 'skipped' means no server is
+    configured yet, which is not an error. A refusal is: it means the public
+    copy and this one disagree about the past, and push_ledger.py prints why.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "push_ledger.py")],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=600,
+            encoding="utf-8", errors="replace")
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        last = lines[-1] if lines else (r.stderr or "").strip()[-300:]
+        if r.returncode == 0 and last.startswith("SKIPPED"):
+            logger.info("Ledger publish: %s", last)
+            return "skipped"
+        if r.returncode == 0:
+            logger.info("Ledger publish: %s", last)
+            return "published"
+        for ln in lines:
+            logger.error("Ledger publish: %s", ln)
+        if not lines:
+            logger.error("Ledger publish failed: %s", last)
+        return "failed"
+    except Exception as exc:
+        logger.error("Ledger publish could not run: %s", exc, exc_info=True)
+        return "failed"
+
+
 def main() -> int:
     season = current_season(date.today())
     logger.info("=== Daily update starting for season %s ===", season)
@@ -334,6 +365,9 @@ def main() -> int:
     prediction_status = log_todays_predictions()
     odds_status = snapshot_odds_board()
     ingests_ok = refresh_periodic_ingests()
+    # After everything that writes OddsData (grading, logging, the board
+    # snapshot), so the public copy gets this run's picks and grades.
+    ledger_status = publish_ledger()
     # Last, so it sees the state this run leaves behind rather than the state
     # it started from.
     preflight_wrong = run_preflight()
@@ -353,6 +387,8 @@ def main() -> int:
         failures.append("odds board snapshot")
     if not ingests_ok:
         failures.append("periodic ingests")
+    if ledger_status == "failed":
+        failures.append("ledger publish")
 
     if failures:
         logger.error("=== Daily update finished WITH ERRORS: %s ===", ", ".join(failures))

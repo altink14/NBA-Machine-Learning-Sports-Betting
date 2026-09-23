@@ -102,6 +102,9 @@ JOBS = {
     "hourly": [
         ("injury recorder (NFL)", ["src/Sports/nfl/poll_injuries.py"]),
         ("predictions (NFL)", ["src/Sports/nfl/predict.py"]),
+        # Last in the job, so the public copy gets this hour's picks. Says
+        # SKIPPED (exit 0) until a public server is configured.
+        ("publish ledger", ["push_ledger.py"]),
     ],
     "daily": [
         # FIRST, because everything below it grades, seals or prices against
@@ -146,6 +149,7 @@ JOBS = {
         ("odds seal (NFL)", ["src/Sports/odds_recorder.py", "--sport", "nfl", "--seal"]),
         # Last, because it reads the closing lines the two steps above produce.
         ("closing line value (NFL)", ["src/Sports/nfl/predict.py", "--clv"]),
+        ("publish ledger", ["push_ledger.py"]),
     ],
 }
 

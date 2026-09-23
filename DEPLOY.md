@@ -136,7 +136,7 @@ generally cannot run on Railway. The working pipeline:
   at request time and usually work from cloud IPs; if sbrscrape gets
   blocked in practice, odds-dependent features degrade gracefully.
 
-## 3a. Where the prediction ledger lives (UNRESOLVED -- settle before deploy)
+## 3a. Where the prediction ledger lives (DECIDED 2026-09-22: option A, built)
 
 Found 2026-09-22. The ledger is `predictions_log` in `OddsData.sqlite`, and as
 things stand a deploy creates TWO of them:
@@ -162,7 +162,9 @@ Two guards landed with this note; neither changes how the home PC behaves:
 - `LOG_PREDICTIONS_ON_REQUEST=false` stops `/predictions` visits writing to the
   ledger. Set it on every server that is not the ledger's single writer.
 
-The decision still needed is which machine is the single writer:
+**Decided 2026-09-22: option A.** The home PC is the only writer; the server
+is a mirror that can only grow. What was built, and how to switch it on, is at
+the end of this section. The options as they were weighed:
 
 - **A. Home PC writes, production mirrors (recommended).** Everything that
   already works stays where it is. After the 9am job, the home PC pushes
@@ -180,6 +182,41 @@ The decision still needed is which machine is the single writer:
 - **C. The home PC IS the backend,** exposed through a tunnel. One copy, no
   sync, but the whole site goes down whenever the home PC sleeps, restarts or
   loses Wi-Fi.
+
+### How the mirror works
+
+- `push_ledger.py` (home PC) takes a `VACUUM INTO` copy of `OddsData.sqlite`,
+  gzips it (~1 MB) and POSTs it to `/api/admin/ledger/sync` with the
+  `X-Ledger-Sync-Secret` header. It runs as the last step of the 9am
+  `daily_update.py`, the hourly job and the nightly grading job, and prints
+  `SKIPPED` (exit 0) while no server is configured.
+- The server does not swap files. `src/Utils/ledger_sync.py` merges the upload
+  row by row in one transaction into its own copy, whose triggers still forbid
+  a changed pick, a regrade or a delete. It also refuses an upload that is
+  missing a row the server has, or where one row id means a different game on
+  each side (two independent writers). Any refusal is a 409 and writes nothing.
+- The server answers with a SHA-256 fingerprint of what it now holds; the push
+  compares it with what it sent and says `PUBLISHED and verified` only if
+  they match.
+- With `PREDICTIONS_SOURCE=ledger` the server's `/predictions` serves today's
+  picks exactly as logged (plus Kelly, arithmetic on the logged numbers), so
+  the pick on the page is the pick being graded.
+- Covered by `Tests/Ledger_Sync_Test.py` (19 tests, each an attempt to change
+  the past) and an end-to-end run on 2026-09-22 that pushed the real ledger
+  (33 ledger rows, 373 snapshots) to a throwaway server twice and matched.
+
+### Switching it on (at deploy)
+
+1. Make a secret: `venv/Scripts/python.exe -c "import secrets; print(secrets.token_urlsafe(32))"`
+2. Server env: `LEDGER_SYNC_SECRET=<it>`, `PREDICTIONS_SOURCE=ledger`,
+   `LOG_PREDICTIONS_ON_REQUEST=false` (the last two are already in render.yaml).
+3. Home PC `.env`: `LEDGER_SYNC_URL=https://<backend host>` and the same
+   `LEDGER_SYNC_SECRET`.
+4. Run `venv/Scripts/python.exe push_ledger.py` once by hand and look for
+   `PUBLISHED and verified`. From then on the scheduled jobs do it.
+
+If a push is ever REFUSED, do not work around it. It means the two copies
+disagree about something that already happened; find out which one is wrong.
 
 ## Env inventory
 

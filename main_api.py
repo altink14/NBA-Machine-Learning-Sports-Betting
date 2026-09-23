@@ -63,6 +63,8 @@ from src.Utils.Dictionaries import team_index_current
 from src.Utils.game_flow import build_game_flow
 from src.Predict import candidate_live
 from src.Utils import player_impact
+from src.Utils import ledger_sync as ledger_mirror
+from src.Sports.ledger import ensure_ledger as _ensure_ledger
 from src.Utils import availability as availability_adjust
 from src.Utils import espn_injuries
 
@@ -183,6 +185,22 @@ ALWAYS_OPEN_PATHS = {"/", "/health"}
 # directly and is unaffected by this flag.
 LOG_PREDICTIONS_ON_REQUEST = (os.environ.get("LOG_PREDICTIONS_ON_REQUEST", "true")
                               .strip().lower() not in ("0", "false", "no", "off"))
+
+# PREDICTIONS_SOURCE: "live" (default) computes picks on request, which is
+# right on the home PC. "ledger" serves today's picks exactly as the home PC
+# logged them, which is right on the public server: its team stats are only as
+# fresh as the last snapshot, so a pick it computed itself could differ from
+# the one on the record. With "ledger", the pick a visitor sees IS the pick
+# that will be graded. (DEPLOY.md section 3a, option A.)
+PREDICTIONS_SOURCE = (os.environ.get("PREDICTIONS_SOURCE") or "live").strip().lower()
+
+# LEDGER_SYNC_SECRET: shared secret for POST /api/admin/ledger/sync, through
+# which the home PC's push_ledger.py mirrors its ledger here. Unset = the
+# route refuses everything, so a server that is not meant to receive the
+# record cannot be written to.
+LEDGER_SYNC_SECRET = (os.environ.get("LEDGER_SYNC_SECRET") or "").strip()
+LEDGER_SYNC_HEADER = "X-Ledger-Sync-Secret"
+LEDGER_SYNC_MAX_BYTES = 256 * 1024 * 1024  # decompressed; OddsData is ~5 MB today
 
 
 def _is_protected_path(path: str) -> bool:
@@ -1510,6 +1528,8 @@ predictions_cache = {}
 @app.get("/predictions")
 @limiter.limit(RATE_LIMIT_EXPENSIVE)
 def get_predictions_endpoint(request: Request, sportsbook: str = 'fanduel', kelly_criterion: bool = True, sport: str = 'NBA'):
+    if PREDICTIONS_SOURCE == "ledger":
+        return _predictions_from_ledger(sportsbook, kelly_criterion, sport)
     cache_key = f"{sportsbook}_{kelly_criterion}_{sport}"
     now = datetime.now()
     
@@ -2928,6 +2948,130 @@ def get_line_movements(sportsbook: str = 'fanduel', sport: str = 'NBA', hours: i
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+def _predictions_from_ledger(sportsbook: str, kelly_criterion: bool, sport: str) -> Dict[str, Any]:
+    """Today's picks as they were LOGGED, in the /predictions response shape.
+
+    Used when PREDICTIONS_SOURCE=ledger (the public server). Nothing is
+    computed here except Kelly, which is arithmetic on the logged price and
+    probability; the pick, its confidence, the price and the EV are the
+    ledger's own values. The withdrawn over/under pick is not served.
+    """
+    now = datetime.now(timezone.utc)
+    log_date = (to_nba_date(now) or now.date()).isoformat()
+    conn = _odds_snapshot_conn()
+    try:
+        _ensure_prediction_log_schema(conn)
+        rows = conn.execute(
+            "SELECT * FROM predictions_log WHERE log_date = ? AND sportsbook = ? "
+            "AND UPPER(sport) = UPPER(?) AND (model IS NULL OR model != ?) "
+            "ORDER BY game_start_time_utc, game_key",
+            (log_date, sportsbook, sport, SIMULATED_MODEL_TAG)).fetchall()
+    finally:
+        conn.close()
+
+    predictions = []
+    for r in rows:
+        kelly = None
+        conf = r["winner_confidence"]
+        if kelly_criterion and conf is not None and r["home_ml"] is not None and r["away_ml"] is not None:
+            p_winner = conf / 100.0
+            p_home = p_winner if r["predicted_winner"] == r["home_team"] else 1.0 - p_winner
+            try:
+                kelly = {"home_team": kc.calculate_kelly_criterion(int(r["home_ml"]), p_home),
+                         "away_team": kc.calculate_kelly_criterion(int(r["away_ml"]), 1.0 - p_home)}
+            except Exception:
+                kelly = None
+        predictions.append({
+            "game_id": None,
+            "game_identifier": f"{r['away_team'].replace(' ', '_')}_{r['home_team'].replace(' ', '_')}_{r['game_start_time_utc']}",
+            "home_team": r["home_team"], "away_team": r["away_team"],
+            "home_odds": r["home_ml"], "away_odds": r["away_ml"],
+            "under_over_line": r["ou_line"],
+            "predicted_winner": r["predicted_winner"],
+            "winner_confidence": conf,
+            "under_over_prediction": None, "under_over_confidence": None,
+            "model": r["model"],
+            "expected_value": {"home_team": r["ev_home"], "away_team": r["ev_away"]},
+            "kelly_criterion": kelly,
+            "game_start_time_utc": r["game_start_time_utc"],
+            "logged_at": r["logged_at"],
+        })
+    out: Dict[str, Any] = {"sportsbook": sportsbook, "predictions": predictions,
+                           "source": "ledger", "log_date": log_date}
+    if not predictions:
+        out["note"] = ("No picks have been logged for today yet. They appear here once the "
+                       "morning run has recorded them, before any game starts.")
+    return out
+
+
+_LEDGER_SYNC_LOCK = threading.Lock()
+
+
+@app.post("/api/admin/ledger/sync")
+async def ledger_sync_endpoint(request: Request):
+    """Receive the home PC's ledger and merge it under this server's own guards.
+
+    Body: OddsData.sqlite, optionally gzip-compressed. See
+    src/Utils/ledger_sync.py for what is checked; in short, the public record
+    can only grow, and a changed pick, a regrade or a missing row refuses the
+    whole upload (409) with nothing written.
+    """
+    import asyncio
+    import tempfile
+    import zlib
+
+    if not LEDGER_SYNC_SECRET:
+        raise HTTPException(status_code=503, detail="Ledger sync is not configured on this server.")
+    provided = request.headers.get(LEDGER_SYNC_HEADER) or ""
+    if not secrets.compare_digest(provided.encode("utf-8"), LEDGER_SYNC_SECRET.encode("utf-8")):
+        raise HTTPException(status_code=401, detail=f"Missing or invalid {LEDGER_SYNC_HEADER} header.")
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > LEDGER_SYNC_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Upload too large.")
+    body = await request.body()
+    if body[:2] == b"\x1f\x8b":
+        try:
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            body = d.decompress(body, LEDGER_SYNC_MAX_BYTES + 1)
+        except zlib.error as exc:
+            raise HTTPException(status_code=400, detail=f"Upload is not valid gzip: {exc}")
+        if len(body) > LEDGER_SYNC_MAX_BYTES or d.unconsumed_tail:
+            raise HTTPException(status_code=413, detail="Upload too large once decompressed.")
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    def _merge() -> Dict[str, Any]:
+        fd, tmp = tempfile.mkstemp(prefix=".ledger_sync_", suffix=".sqlite",
+                                   dir=os.path.dirname(ODDS_DB_PATH))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+            with _LEDGER_SYNC_LOCK:
+                conn = _odds_snapshot_conn()
+                try:
+                    _ensure_prediction_log_schema(conn)
+                    _ensure_ledger(conn)
+                    conn.commit()
+                    return ledger_mirror.merge(conn, tmp)
+                finally:
+                    conn.close()
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    try:
+        result = await asyncio.to_thread(_merge)
+    except ledger_mirror.SyncRefused as exc:
+        logger.error(f"LEDGER SYNC REFUSED: {exc}")
+        raise HTTPException(status_code=409, detail=str(exc))
+    predictions_cache.clear()
+    logger.info("Ledger sync applied: %s", result["tables"])
+    return {"ok": True, "received_bytes": len(body),
+            "synced_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(), **result}
+
 
 # --- Prediction track record endpoint ---
 @app.get("/api/prediction-log")

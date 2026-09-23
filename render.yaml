@@ -28,5 +28,13 @@ services:
       # /predictions here must not start a second, ungraded ledger.
       - key: LOG_PREDICTIONS_ON_REQUEST
         value: "false"
+      # Serve today's picks exactly as the home PC logged them, so the pick
+      # on the page is the pick on the record.
+      - key: PREDICTIONS_SOURCE
+        value: ledger
+      # Shared with the home PC's .env; push_ledger.py mirrors the ledger
+      # through it. Set the value in the dashboard, never here.
+      - key: LEDGER_SYNC_SECRET
+        sync: false
       # Set CORS_ORIGINS to your Vercel URL in the Render dashboard after
       # the frontend deploys, e.g. https://bettingbuddy.vercel.app

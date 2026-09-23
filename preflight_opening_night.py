@@ -531,6 +531,32 @@ def check_operations(today: date) -> None:
           f"last {last} ({age} day(s) ago)" + ("" if age <= 7 else "; run backup_to_drive.py"))
 
 
+def _write_report(today: date, bad, pending) -> None:
+    """Every result, every run, to logs/preflight_latest.txt (UTF-8).
+
+    daily_update logs only a summary of this script. On 2026-09-23 the
+    summary said "2 wrong" and the two lines naming them were lost (see the
+    PYTHONIOENCODING note in daily_update.py), and by the afternoon both had
+    recovered, so nobody could say what had failed. This file is overwritten
+    each run and appended to preflight_history.log, one line per failure.
+    """
+    try:
+        logs = os.path.join(REPO_ROOT, "logs")
+        os.makedirs(logs, exist_ok=True)
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with open(os.path.join(logs, "preflight_latest.txt"), "w", encoding="utf-8") as fh:
+            fh.write(f"preflight {stamp} (as of {today}): {len(results) - len(bad) - len(pending)} pass, "
+                     f"{len(pending)} not yet, {len(bad)} wrong\n")
+            for state, label, detail in results:
+                fh.write(f"{state:>7}  {label}" + (f" -- {detail}" if detail else "") + "\n")
+        if bad:
+            with open(os.path.join(logs, "preflight_history.log"), "a", encoding="utf-8") as fh:
+                for _, label, detail in bad:
+                    fh.write(f"{stamp} WRONG {label} -- {detail}\n")
+    except OSError as exc:
+        print(f"(could not write the preflight report: {exc})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Check everything opening night depends on.")
     ap.add_argument("--as-of", help="Pretend it is this date (YYYY-MM-DD).")
@@ -556,6 +582,7 @@ def main() -> int:
 
     bad = [r for r in results if r[0] == BAD]
     pending = [r for r in results if r[0] == PENDING]
+    _write_report(today, bad, pending)
     print("\n" + "=" * 72)
     print(f"{len(results) - len(bad) - len(pending)} pass, {len(pending)} not yet, "
           f"{len(bad)} wrong")

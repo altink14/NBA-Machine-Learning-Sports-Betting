@@ -72,6 +72,9 @@ from datetime import datetime, timezone
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 PY = os.path.join(REPO_ROOT, "venv", "Scripts", "python.exe")
+# Children write UTF-8, matching how their output is decoded below (see the
+# same line in daily_update.py for what happened without it).
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 LOG_DIR = os.path.join(REPO_ROOT, "logs")
 
 

@@ -36,12 +36,21 @@ import sys
 from datetime import date
 from typing import Optional
 
+# Every child process this job starts writes UTF-8. Scheduled tasks run
+# without PYTHONIOENCODING, so children printed in the console code page; the
+# capture below decoded that as UTF-8, a dash became U+FFFD, and the log file
+# (also code-page encoded) could not write it: the logging module dropped the
+# line. That is how the 2026-09-23 9am run logged "preflight: 2 WRONG" without
+# saying which two checks failed.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_update.log")),
+        logging.FileHandler(os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_update.log"),
+                            encoding="utf-8", errors="backslashreplace"),
     ],
 )
 logger = logging.getLogger("daily_update")

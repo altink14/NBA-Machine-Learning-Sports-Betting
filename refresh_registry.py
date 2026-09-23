@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
 """
 
 
+#: How much earlier than its interval a job may run. Less than a day, so a
+#: daily job still cannot run twice on one morning's retries.
+DUE_SLACK = timedelta(hours=3)
+
+
 @dataclass
 class Job:
     name: str
@@ -245,7 +250,12 @@ def due(job: Job, now: datetime, conn) -> bool:
     # leave the site stale for no reason.
     if row["last_status"] != "ok":
         return True
-    return now - last >= timedelta(days=job.interval_days)
+    # A few hours of slack. The daily task starts at 9:00 but each job is
+    # stamped when it FINISHES, a few minutes later; the next morning's check
+    # then came 7 minutes short of 24 hours and skipped. Found 2026-09-23:
+    # player_directory (every 1d) was running every other day, and every
+    # weekly job was slipping to 8 days.
+    return now - last >= timedelta(days=job.interval_days) - DUE_SLACK
 
 
 def run_due(force: Optional[str] = None) -> bool:

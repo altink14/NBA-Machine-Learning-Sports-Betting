@@ -329,7 +329,19 @@ def main() -> int:
         # to buy back.
         have = remaining_quota()
         need = estimate + QUOTA_FLOOR + UNATTENDED_RESERVE
-        if have is not None and have < need:
+        # An UNKNOWN balance is not permission to spend. This used to test
+        # `have is not None and have < need`, so whenever the balance could
+        # not be read -- a network blip, a 401, a renamed header -- the whole
+        # guard was skipped and the job spent anyway, unattended, with no
+        # line explaining why. The unattended path is the one with no human
+        # to notice, so it refuses; a manual run can still override.
+        if have is None:
+            logger.warning("skipping repair: could not read the remaining quota, and an "
+                           "unattended run does not spend credits it cannot account "
+                           "for. It will try again tomorrow.")
+            conn.close()
+            return 0
+        if have < need:
             logger.warning("skipping repair: %d credits remain, and spending %d would leave "
                            "less than the recorder's floor (%d) plus its reserve (%d). The "
                            "live capture matters more than the backfill.",

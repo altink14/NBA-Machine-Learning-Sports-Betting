@@ -1209,6 +1209,20 @@ class PredictionRunner:
             if not preds:
                 return result
             absences = espn_injuries.get_absences()
+            # If the injury feed could not be read, say so instead of reporting
+            # a healthy league. get_absences() returns a sentinel marked
+            # source="unavailable" on failure, and this path never looked at it:
+            # every game went out as "nobody out, 0.0 adjustment,
+            # impact-adjusted", indistinguishable from a night with no injuries.
+            if (absences or {}).get("source") == "unavailable":
+                logger.warning("Injury feed unavailable: availability NOT assessed "
+                               "for %d game(s).", len(preds))
+                for pred in preds:
+                    pred["availability"] = {
+                        "home_delta": None, "away_delta": None, "players_out": [],
+                        "note": "injury feed unavailable - not assessed",
+                    }
+                return result
             for pred in preds:
                 try:
                     home_abbr = espn_injuries.resolve_team_abbr(pred.get("home_team") or "")
@@ -4421,7 +4435,14 @@ def get_shot_chart(request: Request, game_date: str, home_team: str):
             player_id=0,
             game_id_nullable=game_id,
             context_measure_simple="FGA",
-            season_type_all_star="Regular Season"
+            # From the game id, not hardcoded. This was "Regular Season" for
+            # every game, and shotchartdetail filters by season type, so a
+            # playoff game id matched nothing: every playoff shot chart came
+            # back HTTP 200 with shots: [] and a full league-average block
+            # beside it, which looks like a healthy response with no shots.
+            season_type_all_star={"004": "Playoffs", "005": "PlayIn",
+                                  "001": "Pre Season"}.get(str(game_id)[:3],
+                                                         "Regular Season")
         )
         data = sc.get_dict()
         
@@ -5498,7 +5519,16 @@ def get_player_heat_calendar(id: int, season: Optional[str] = None):
             """,
             (id,),
         ).fetchall()
-        seasons = [f"20{r['yy']:02d}-{(r['yy'] + 1) % 100:02d}" for r in season_rows]
+        # The game id carries a two-digit season code (96 = 1996-97, 00 =
+        # 2000-01). This built every label as "20" + code, so 1996-97 came out
+        # as "2096-97" -- and because the query sorts on the two-digit code,
+        # 99/98/97 sorted AHEAD of 25/24, so for anyone whose career crossed
+        # 2000 the calendar opened on a late-90s season instead of the most
+        # recent one. The archive starts in 1996, so a code of 50+ is 19xx.
+        def _start_year(code: int) -> int:
+            return (1900 if code >= 50 else 2000) + code
+        ordered = sorted((r["yy"] for r in season_rows), key=_start_year, reverse=True)
+        seasons = [f"{_start_year(c)}-{(_start_year(c) + 1) % 100:02d}" for c in ordered]
 
         if not seasons:
             return {
@@ -7504,7 +7534,14 @@ def get_game_shot_chart(request: Request, game_id: str):
             player_id=0,
             game_id_nullable=game_id,
             context_measure_simple="FGA",
-            season_type_all_star="Regular Season"
+            # From the game id, not hardcoded. This was "Regular Season" for
+            # every game, and shotchartdetail filters by season type, so a
+            # playoff game id matched nothing: every playoff shot chart came
+            # back HTTP 200 with shots: [] and a full league-average block
+            # beside it, which looks like a healthy response with no shots.
+            season_type_all_star={"004": "Playoffs", "005": "PlayIn",
+                                  "001": "Pre Season"}.get(str(game_id)[:3],
+                                                         "Regular Season")
         )
         data = sc.get_dict()
         
@@ -8790,7 +8827,12 @@ def get_nba_cup(request: Request, season: str = "2026-27"):
     results to stand on, and inventing a table of zeroes would imply the section
     is live when it is not.
     """
-    sched = get_league_schedule(season=season, cup_only=True)
+    # `request` passed through: get_league_schedule is a rate-limited route
+    # handler and requires it. Calling it without one raised TypeError before
+    # any cup logic ran, so /api/cup had returned 500 on every request since
+    # it was written -- while /api/schedule?cup_only=true, the same data,
+    # worked fine.
+    sched = get_league_schedule(request, season=season, cup_only=True)
     games = [g for d in sched["dates"] for g in d["games"]]
     if not games:
         raise HTTPException(status_code=503, detail="No NBA Cup games in this season's feed.")

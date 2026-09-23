@@ -6,7 +6,9 @@ morning (e.g. 9 AM via Windows Task Scheduler):
 
 1. Works out the current NBA season from today's date.
 2. Runs the incremental backfill (already-processed games are cached and skip
-   instantly, so during the season this only ingests yesterday's games).
+   instantly, so during the season this only ingests yesterday's games), plus
+   the play-in in April-May and the playoffs in April-June. A game that fails
+   to land fails the task; the known permanent holes do not.
 3. Recomputes season aggregates, SRS, and player stats (inside backfill).
 4. Refreshes the team-stats snapshot the prediction model reads.
 5. Grades yesterday's logged predictions against final scores.
@@ -70,16 +72,61 @@ def current_season(today: date) -> str:
     return f"{start_year}-{str(start_year + 1)[2:]}"
 
 
-def run_backfill(season: str, season_type: str = "Regular Season") -> bool:
+#: What backfill.py's exit codes mean (see its module docstring).
+_BACKFILL_EXIT_MEANING = {
+    1: "a stage crashed",
+    2: "bad command line",
+    3: "one or more games failed to ingest -- the backfill's summary names them",
+    4: "the league game log listed no games while games were expected",
+}
+
+
+def _regular_season_games_expected(today: Optional[date] = None) -> bool:
+    """Whether the current season's regular-season game log must be non-empty.
+
+    True from two days after opening night through the following September
+    (the log of a finished season stays full all summer). False from
+    1 October until then, because the season label rolls over on 1 October
+    and the new season's log is legitimately empty until games are played --
+    a red run every morning for three weeks is how people learn to ignore red.
+    """
+    today = today or date.today()
+    if today.month != 10:
+        return True
+    try:
+        from preflight_opening_night import OPENING_NIGHT
+        opening = OPENING_NIGHT if OPENING_NIGHT.year == today.year else None
+    except Exception:
+        opening = None
+    if opening is None:
+        # A stale constant from a previous year must not turn every October
+        # morning red; the league opens in the third or fourth week.
+        return today.day >= 26
+    return (today - opening).days >= 2
+
+
+def run_backfill(season: str, season_type: str = "Regular Season",
+                 expect_games: bool = False) -> bool:
+    """Run backfill.py for one season type. False on any non-zero exit.
+
+    backfill.py used to exit 0 however many games failed, so this reported
+    "completed successfully" on mornings when games were missing. It now exits
+    non-zero when a game genuinely failed (known permanent holes do not count),
+    and main() puts "backfill" in the failures list.
+    """
     python = sys.executable
     script = os.path.join(REPO_ROOT, "src", "Process-Data", "backfill.py")
     cmd = [python, script, "--season", season, "--season-type", season_type]
+    if expect_games:
+        cmd.append("--expect-games")
     logger.info("Running backfill: %s", " ".join(cmd))
     result = subprocess.run(cmd, cwd=REPO_ROOT)
     if result.returncode != 0:
-        logger.error("Backfill exited with code %s", result.returncode)
+        logger.error("Backfill %s %s exited with code %s (%s)", season, season_type,
+                     result.returncode,
+                     _BACKFILL_EXIT_MEANING.get(result.returncode, "unexpected exit code"))
         return False
-    logger.info("Backfill completed successfully.")
+    logger.info("Backfill %s %s completed successfully.", season, season_type)
     return True
 
 
@@ -350,7 +397,16 @@ def main() -> int:
     season = current_season(date.today())
     logger.info("=== Daily update starting for season %s ===", season)
 
-    backfill_ok = run_backfill(season)
+    backfill_ok = run_backfill(season, expect_games=_regular_season_games_expected())
+    # Play-in box scores. The play-in (2020-21 on, game ids 005...) is its own
+    # season type on stats.nba.com, so neither the regular-season nor the
+    # playoff run ever fetched it: the odds feed carries those games, the
+    # ledger logs picks on them, and grade() would never find a box score.
+    # April AND May, because the calendar moves: the 2020-21 play-in was
+    # played 18-21 May 2021. Empty outside the tournament, which is not a
+    # failure (no --expect-games).
+    if date.today().month in (4, 5):
+        backfill_ok = run_backfill(season, "PlayIn") and backfill_ok
     # Playoff box scores. backfill.py does one season type per run and this
     # only ever asked for the regular season, so from the play-in onward no
     # box score would land, grade() would find nothing, and every playoff

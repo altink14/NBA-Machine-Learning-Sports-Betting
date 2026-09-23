@@ -7,14 +7,26 @@ CLI script to backfill historical and current season team/player metrics:
 3. Solve SRS/SoS iteratively for the entire season.
 4. Aggregate game advanced stats into team_season_advanced season averages.
 5. Fetch and store league-wide player statistics using LeagueDashPlayerStats.
+
+Season types: 'Regular Season', 'Playoffs', and 'PlayIn' (the play-in
+tournament, 2020-21 on). PlayIn is ingested game by game only; steps 3-5 are
+skipped for it (see SEASON_AGGREGATE_TYPES).
+
+Exit status, which daily_update.py reads:
+  0  every game in the log is stored, or is a known permanent hole
+  1  a stage crashed (uncaught exception)
+  3  at least one game failed to ingest, or was stored with a result that
+     disagrees with the league game log -- the summary names each one
+  4  --expect-games was passed and the league game log listed nothing
 """
 import os
 import sys
 import argparse
 import logging
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 # Resolve project root path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -31,40 +43,222 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+#: The season types this script knows how to ingest, as stats.nba.com spells
+#: them. 'PlayIn' is the play-in tournament (2020-21 on, game ids 005...): it
+#: is neither regular season nor playoffs, so it is stored under its own
+#: season_type and never folded into either.
+SEASON_TYPES = ("Regular Season", "PlayIn", "Playoffs")
+
+#: Game ids that are in the league game log but can never be ingested, and why.
+#: A run that meets one of these reports it by name and does NOT fail, because
+#: a job that goes red every time for a known, permanent, harmless reason
+#: teaches people to ignore red. Anything else that fails does fail the run.
+#:
+#: The four box-score holes: nba.com's own boxscoreadvancedv3 returns nothing
+#: for them on every retry (last re-checked 2026-08-23; the traditional box
+#: score exists, the advanced one does not). The fifth is not a hole in the
+#: data at all: the game was never played.
+KNOWN_PERMANENT_HOLES: Dict[str, str] = {
+    "0029600332": "nba.com boxscoreadvancedv3 returns nothing (SEA-GSW 1996-12-17)",
+    "0029600370": "nba.com boxscoreadvancedv3 returns nothing (SEA-DAL 1996-12-22)",
+    "0029800661": "nba.com boxscoreadvancedv3 returns nothing (DET-NJN 1999-04-28)",
+    "0020300778": "nba.com boxscoreadvancedv3 returns nothing (NOH-WAS 2004-02-18)",
+    "0021201214": "never played: BOS-IND 2013-04-16, cancelled after the Boston Marathon bombing",
+}
+
+#: Exit codes. 1 is Python's own code for an uncaught exception (a stage
+#: crashed); 2 is argparse's for a bad command line.
+EXIT_OK = 0
+EXIT_GAMES_FAILED = 3
+EXIT_EMPTY_GAME_LOG = 4
+
+
+@dataclass
+class BackfillSummary:
+    """What one backfill_games run actually did, game by game.
+
+    The script used to log "Errors: N" and exit 0 whatever N was, so the daily
+    job reported a green backfill on a morning when games failed to land --
+    and a game that never lands is a prediction that is never graded.
+    """
+    season: str
+    season_type: str
+    in_game_log: int = 0
+    ingested: List[str] = field(default_factory=list)
+    already_present: List[str] = field(default_factory=list)
+    known_holes: List[str] = field(default_factory=list)
+    not_final: List[str] = field(default_factory=list)
+    failed: Dict[str, str] = field(default_factory=dict)
+    #: Already-stored games whose game_date disagrees with the league game
+    #: log: {game_id: (stored, log)}. Reported loudly but NOT a failure -- the
+    #: rows predate this check and re-running the backfill cannot correct them
+    #: (see the note in find_date_disagreements).
+    date_disagreements: Dict[str, tuple] = field(default_factory=dict)
+
+    @property
+    def game_ids(self) -> List[str]:
+        return sorted(set(self.ingested) | set(self.already_present) | set(self.known_holes)
+                      | set(self.not_final) | set(self.failed))
+
+    def lines(self) -> List[str]:
+        out = [
+            f"BACKFILL SUMMARY {self.season} {self.season_type}: "
+            f"{self.in_game_log} game(s) in the league game log -- "
+            f"{len(self.ingested)} ingested, {len(self.already_present)} already present, "
+            f"{len(self.failed)} FAILED, {len(self.known_holes)} known permanent hole(s), "
+            f"{len(self.not_final)} not final yet."
+        ]
+        for gid in self.known_holes:
+            out.append(f"  known hole {gid}: {KNOWN_PERMANENT_HOLES.get(gid, '?')}")
+        for gid in self.not_final:
+            out.append(f"  not final  {gid}: the league game log has no result for it yet")
+        for gid, why in list(self.failed.items())[:25]:
+            out.append(f"  FAILED     {gid}: {why}")
+        if len(self.failed) > 25:
+            out.append(f"  ... and {len(self.failed) - 25} more failed game(s)")
+        if self.date_disagreements:
+            out.append(
+                f"  WARNING    {len(self.date_disagreements)} stored game(s) carry a game_date "
+                f"the league game log disagrees with (stored -> log): "
+                + ", ".join(f"{g} {s}->{l}" for g, (s, l) in
+                            sorted(self.date_disagreements.items())[:15]))
+        return out
+
+
+def _is_stored(db_path: str, game_id: str) -> bool:
+    conn = get_connection(db_path)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM team_game_advanced WHERE game_id = ?",
+                         (game_id,)).fetchone()[0]
+        return n >= 2
+    finally:
+        conn.close()
+
+
+def find_date_disagreements(db_path: str, season: str, season_type: str,
+                            log_dates: Dict[str, str]) -> Dict[str, tuple]:
+    """Stored games of this season/type whose game_date differs from the log.
+
+    Found 2026-09-23: eleven 2025-26 games (postponed and NBA Cup games,
+    ingested 2026-07-07) carry their ORIGINAL schedule date -- 0022500651
+    MEM-DEN is stored on 2026-01-25 but was played 2026-03-18 (the box
+    score's own gameCode says 20260318/DENMEM). A wrong date misplaces the
+    game on the date browser and in rest-day and Elo ordering, and a pick on a
+    rescheduled game would be looked up on the wrong day and never graded.
+    `process_game(overwrite=True)` would not fix it: team_game_advanced's
+    upsert does not update game_date. So this reports; repairing is a
+    separate, deliberate job.
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT game_id, MIN(game_date) AS d FROM team_game_advanced "
+            "WHERE season = ? AND season_type = ? GROUP BY game_id",
+            (season, season_type)).fetchall()
+    finally:
+        conn.close()
+    out = {}
+    for r in rows:
+        want = (log_dates.get(r["game_id"]) or "").split("T")[0]
+        have = (r["d"] or "").split("T")[0]
+        if want and have != want:
+            out[r["game_id"]] = (have, want)
+    return out
+
+
+def check_stored_score(db_path: str, game_id: str, log_points: Dict[int, int]) -> Optional[str]:
+    """Why the stored result for `game_id` cannot be trusted, or None if it can.
+
+    The box-score parser defaults every missing statistic to 0, so a skeleton
+    box score (a game nba.com has listed but not finalised) would be stored as
+    a 0-0 game rather than refused -- and grade_predictions would then grade a
+    pick against it, permanently. So each newly ingested game is checked
+    against the league game log the backfill already holds: two team rows,
+    no zero, no tie, and each team's points equal to what the log says.
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT team_id, pts, opp_pts FROM team_game_advanced WHERE game_id = ?",
+            (game_id,)).fetchall()
+    finally:
+        conn.close()
+    if len(rows) != 2:
+        return f"{len(rows)} team row(s) stored, expected 2"
+    for r in rows:
+        pts, opp = r["pts"], r["opp_pts"]
+        if not pts or not opp or pts <= 0 or opp <= 0:
+            return f"implausible score stored ({pts}-{opp})"
+        if pts == opp:
+            return f"a tie stored ({pts}-{opp}); NBA games cannot end level"
+        expected = log_points.get(int(r["team_id"]))
+        if expected is not None and int(expected) != int(pts):
+            return (f"team {r['team_id']} stored {pts} points but the league game log "
+                    f"says {expected}")
+    return None
+
+
 def backfill_games(
     season: str,
     season_type: str,
     db_path: str,
-    overwrite: bool = False
-) -> List[str]:
+    overwrite: bool = False,
+    retry_known_holes: bool = False,
+) -> BackfillSummary:
     """
     Fetch all team game logs for a given season and process each unique game
     to compute and store raw/advanced team stats.
+
+    Returns a BackfillSummary; the caller decides the exit code from it.
     """
+    summary = BackfillSummary(season=season, season_type=season_type)
     client = get_client(backfill_mode=True)
     logger.info("Fetching game log list for season: %s, type: %s", season, season_type)
-    
+
     # Fetch team game logs
     game_log_rows = client.league_game_log(season=season, season_type=season_type, player_or_team="T")
-    
+
     unique_game_ids: Set[str] = set()
     game_dates: Dict[str, str] = {}
+    has_result: Dict[str, bool] = {}
+    log_points: Dict[str, Dict[int, int]] = {}
     for row in game_log_rows:
-        if "GAME_ID" in row:
-            unique_game_ids.add(row["GAME_ID"])
-            if row.get("GAME_DATE"):
-                game_dates[row["GAME_ID"]] = row["GAME_DATE"]
+        gid = row.get("GAME_ID")
+        if not gid:
+            continue
+        unique_game_ids.add(gid)
+        if row.get("GAME_DATE"):
+            game_dates[gid] = row["GAME_DATE"]
+        if row.get("WL") in ("W", "L"):
+            has_result[gid] = True
+            if row.get("TEAM_ID") is not None and row.get("PTS") is not None:
+                log_points.setdefault(gid, {})[int(row["TEAM_ID"])] = int(row["PTS"])
 
-    game_ids = sorted(list(unique_game_ids))
-    logger.info("Found %d unique games to process for %s.", len(game_ids), season)
-    
-    processed_count = 0
-    cached_count = 0
-    error_count = 0
-    
+    game_ids = sorted(unique_game_ids)
+    summary.in_game_log = len(game_ids)
+    logger.info("Found %d unique games to process for %s %s.", len(game_ids), season, season_type)
+
     for idx, game_id in enumerate(game_ids, 1):
         if idx % 50 == 0 or idx == len(game_ids):
             logger.info("Processing games progress: %d/%d...", idx, len(game_ids))
+
+        if game_id in KNOWN_PERMANENT_HOLES and not overwrite:
+            if _is_stored(db_path, game_id):
+                summary.already_present.append(game_id)
+                continue
+            if not retry_known_holes:
+                # Not re-requested: every retry costs stats.nba.com three
+                # failing calls with backoff, for an answer that has been the
+                # same every time. --retry-known-holes asks again.
+                summary.known_holes.append(game_id)
+                continue
+
+        if not has_result.get(game_id) and game_id not in KNOWN_PERMANENT_HOLES:
+            # Listed without a W/L: not final. Ingesting it now would store
+            # whatever partial box score exists as if it were the result.
+            summary.not_final.append(game_id)
+            continue
+
         try:
             res = process_game(
                 game_id=game_id,
@@ -74,19 +268,42 @@ def backfill_games(
                 overwrite=overwrite,
                 game_date_hint=game_dates.get(game_id)
             )
-            if res.get("status") == "cached":
-                cached_count += 1
-            else:
-                processed_count += 1
         except Exception as exc:
-            logger.error("Failed to process game %s: %s", game_id, exc)
-            error_count += 1
-            
+            if game_id in KNOWN_PERMANENT_HOLES:
+                logger.info("Known permanent hole %s still unavailable: %s", game_id, exc)
+                summary.known_holes.append(game_id)
+            else:
+                logger.error("Failed to process game %s: %s", game_id, exc)
+                summary.failed[game_id] = f"{type(exc).__name__}: {exc}"[:300]
+            continue
+
+        if res.get("status") == "cached":
+            summary.already_present.append(game_id)
+            continue
+        problem = check_stored_score(db_path, game_id, log_points.get(game_id, {}))
+        if problem:
+            logger.error("Game %s was stored but its result is not trustworthy: %s", game_id, problem)
+            summary.failed[game_id] = problem
+        else:
+            summary.ingested.append(game_id)
+
+    disagreements = find_date_disagreements(db_path, season, season_type, game_dates)
+    for gid, (have, want) in disagreements.items():
+        if gid in summary.ingested:
+            # Written by this run from the log's own date, so a disagreement
+            # here is a defect in the write, not legacy data.
+            summary.ingested.remove(gid)
+            summary.failed[gid] = f"stored game_date {have} but the league game log says {want}"
+        else:
+            summary.date_disagreements[gid] = (have, want)
+
     logger.info(
-        "Finished game processing. Total: %d, Processed: %d, Cached: %d, Errors: %d",
-        len(game_ids), processed_count, cached_count, error_count
+        "Finished game processing. Total: %d, Ingested: %d, Already present: %d, "
+        "Failed: %d, Known holes: %d, Not final: %d",
+        summary.in_game_log, len(summary.ingested), len(summary.already_present),
+        len(summary.failed), len(summary.known_holes), len(summary.not_final),
     )
-    return game_ids
+    return summary
 
 
 def compute_and_save_season_stats(
@@ -806,27 +1023,61 @@ def compute_and_save_player_season_aggregates(
         conn.close()
 
 
-def main():
+#: Season types whose season-level aggregates (team_season_advanced with SRS,
+#: player_season_stats/totals/advanced/splits) this script computes. PlayIn is
+#: deliberately absent: a "season" of one or two games per team is not a
+#: season, SRS solved over six games is noise that the +/-0.5 league-average
+#: check can reject outright, and every new season_type row in those tables is
+#: one more row for a query that forgets to filter season_type to mix into
+#: regular-season numbers. Play-in games are still ingested game by game
+#: (box_scores, team_game_advanced, player_game_log) -- which is what grading,
+#: box-score pages and Elo read.
+SEASON_AGGREGATE_TYPES = ("Regular Season", "Playoffs")
+
+
+def exit_code_for(summary: Optional[BackfillSummary], expect_games: bool) -> int:
+    """The process exit code for a finished run. Pure, so it can be tested."""
+    if summary is None:
+        return EXIT_OK
+    if summary.failed:
+        return EXIT_GAMES_FAILED
+    if expect_games and summary.in_game_log == 0:
+        return EXIT_EMPTY_GAME_LOG
+    return EXIT_OK
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Backfill NBA Stats API team/player data pipeline.")
     parser.add_argument("--season", type=str, default="2024-25", help="Season in format YYYY-YY (e.g. 2024-25)")
-    parser.add_argument("--season-type", type=str, default="Regular Season", help="Regular Season | Playoffs")
+    parser.add_argument("--season-type", type=str, default="Regular Season", choices=SEASON_TYPES,
+                        help="Regular Season | PlayIn | Playoffs")
     parser.add_argument("--db", type=str, default="Data/TeamData.sqlite", help="SQLite database path")
     parser.add_argument("--overwrite", action="store_true", help="Reprocess game logs even if cached")
     parser.add_argument("--only-teams", action="store_true", help="Only backfill team game stats and aggregates")
     parser.add_argument("--only-players", action="store_true", help="Only backfill player aggregates")
-    
+    parser.add_argument("--expect-games", action="store_true",
+                        help="Fail (exit 4) if the league game log lists no games. The daily job "
+                             "passes this once the regular season is under way, when an empty log "
+                             "means the feed is broken rather than that no games exist yet.")
+    parser.add_argument("--retry-known-holes", action="store_true",
+                        help="Re-request the known permanent holes instead of skipping them.")
+
     args = parser.parse_args()
-    
+
     ensure_schema(args.db)
-    
+
     # 1. Backfill Metadata
     if not args.only_players:
         backfill_metadata(args.db)
-        
+
+    summary: Optional[BackfillSummary] = None
+    aggregate = args.season_type in SEASON_AGGREGATE_TYPES
+
     # 2. Backfill Game log & computed aggregates
     if not args.only_players:
-        backfill_games(args.season, args.season_type, args.db, args.overwrite)
-        
+        summary = backfill_games(args.season, args.season_type, args.db, args.overwrite,
+                                 retry_known_holes=args.retry_known_holes)
+
         # Enforce validation crash if error rate exceeds 5%
         from src.Utils.nba_validation import get_validation_failure_rate
         conn_check = get_connection(args.db)
@@ -846,15 +1097,33 @@ def main():
         finally:
             conn_check.close()
 
-        compute_and_save_season_stats(args.season, args.season_type, args.db)
-        
+        if aggregate:
+            compute_and_save_season_stats(args.season, args.season_type, args.db)
+        else:
+            logger.info("No season-level team aggregates for %s (see SEASON_AGGREGATE_TYPES).",
+                        args.season_type)
+
     # 3. Backfill Player statistics
-    if not args.only_teams:
+    if not args.only_teams and aggregate:
         backfill_players(args.season, args.season_type, args.db)
         compute_and_save_player_season_aggregates(args.season, args.season_type, args.db)
-        
-    logger.info("Backfill complete for season %s (%s).", args.season, args.season_type)
+
+    code = exit_code_for(summary, args.expect_games)
+    for line in (summary.lines() if summary else []):
+        head = line.lstrip()
+        (logger.error if head.startswith("FAILED")
+         else logger.warning if head.startswith("WARNING")
+         else logger.info)(line)
+    if code == EXIT_GAMES_FAILED:
+        logger.error("Backfill for %s (%s) FAILED: %d game(s) did not land. Exit %d.",
+                     args.season, args.season_type, len(summary.failed), code)
+    elif code == EXIT_EMPTY_GAME_LOG:
+        logger.error("Backfill for %s (%s) FAILED: the league game log listed no games while "
+                     "games were expected. Exit %d.", args.season, args.season_type, code)
+    else:
+        logger.info("Backfill complete for season %s (%s).", args.season, args.season_type)
+    return code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

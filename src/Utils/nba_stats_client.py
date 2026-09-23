@@ -28,6 +28,7 @@ from nba_api.stats.endpoints import (
     commonteamroster,
     leaguegamelog,
     boxscoresummaryv2,
+    boxscoresummaryv3,
     playercareerstats,
     playergamelog,
     playerdashptpass,
@@ -349,6 +350,37 @@ class NBAStatsClient:
         raw = self._fetch("boxscoresummaryv2", boxscoresummaryv2.BoxScoreSummaryV2, params,
                           ttl=0 if fresh else _COMPLETED_GAME_TTL)
         return self._parse_all_result_sets(raw)
+
+    def officials_v3(self, game_id: str, fresh: bool = False) -> List[Dict]:
+        """The crew from boxscoresummaryv3, in the v2 Officials row shape.
+
+        WHY. v2's Officials result set went empty for games after the
+        2025-04-10 cutoff the library warns about: all 1,212 remaining 2025-26
+        games came back crewless on 2026-08-30 and again on every retry. v3
+        has them. Checked 2026-09-22 against 0022500001, whose crew we already
+        had from v2: the same three officials with the same OFFICIAL_IDs,
+        names and numbers (v3 pads jersey numbers with spaces), so crews from
+        either endpoint land on the same people in `officials`.
+
+        Returns [] when v3 has no crew, and raises if v3 answers about a
+        different game than the one asked for: a crew attached to the wrong
+        game is worse than no crew.
+        """
+        params = {"game_id": game_id}
+        raw = self._fetch("boxscoresummaryv3", boxscoresummaryv3.BoxScoreSummaryV3, params,
+                          ttl=0 if fresh else _COMPLETED_GAME_TTL)
+        summary = (raw or {}).get("boxScoreSummary") or {}
+        echoed = summary.get("gameId")
+        if echoed and str(echoed) != str(game_id):
+            raise ValueError(f"boxscoresummaryv3 answered for {echoed}, not {game_id}")
+        return [
+            {"OFFICIAL_ID": o.get("personId"),
+             "FIRST_NAME": (o.get("firstName") or "").strip(),
+             "LAST_NAME": (o.get("familyName") or "").strip(),
+             "JERSEY_NUM": (str(o.get("jerseyNum") or "")).strip()}
+            for o in (summary.get("officials") or [])
+            if o.get("personId")
+        ]
 
     def player_career_stats(
         self, player_id: int, per_mode: str = "PerGame"

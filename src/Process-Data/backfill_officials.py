@@ -27,6 +27,13 @@ officials, bypassing the disk cache so a cached empty answer cannot satisfy
 the retry. Coverage as of 2026-09-15 before the historical run: 2022-23 to
 2024-25 complete, 2025-26 at 103 of 1,315, nothing before 2022-23.
 
+WHY THOSE 1,212 STAYED EMPTY, AND THE FIX (2026-09-22). It was not flakiness.
+v2's Officials result set is simply empty for those games, on every retry,
+while boxscoresummaryv3 returns the full crew (four officials in the Finals)
+with the same OFFICIAL_IDs v2 used. So an empty v2 answer now falls through
+to v3, and a game already recorded empty is asked of v3 first, since v2 has
+already said no. officials_fetch.source records which endpoint answered.
+
 MANNERS. One request per game through the shared stats client (disk cache,
 retries, rate limiting all come from there), newest season first so the most
 useful data lands earliest, and a commit every 25 games so a kill loses
@@ -78,6 +85,11 @@ CREATE TABLE IF NOT EXISTS officials_fetch (
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(officials_fetch)")}
+    if "source" not in cols:
+        # Which endpoint answered: 'v2', 'v3', or NULL for rows written before
+        # this column existed (all of those were v2).
+        conn.execute("ALTER TABLE officials_fetch ADD COLUMN source TEXT")
     conn.commit()
 
 
@@ -140,9 +152,16 @@ def main() -> int:
             # A game we asked about before and got nothing: ask the source again,
             # not the cache. A game never asked about: the cache is fine.
             fresh = row["prior_n"] is not None and row["prior_n"] == 0
+            crew, source = [], None
             try:
-                data = client.boxscore_summary(gid, fresh=fresh)
-                crew = data.get("Officials") or []
+                if not fresh:
+                    crew = client.boxscore_summary(gid).get("Officials") or []
+                    source = "v2"
+                if not crew:
+                    # v2 has nothing (or already told us so): ask v3, fresh when
+                    # this is a retry so a cached empty answer cannot stand in.
+                    crew = client.officials_v3(gid, fresh=fresh)
+                    source = "v3"
             except Exception as e:  # a single bad game must not end the run
                 errors += 1
                 logger.warning("game %s failed: %s", gid, str(e)[:90])
@@ -169,8 +188,9 @@ def main() -> int:
                     (gid, oid),
                 )
             conn.execute(
-                "INSERT OR REPLACE INTO officials_fetch (game_id, fetched_at, n_officials) VALUES (?, ?, ?)",
-                (gid, now, len(crew)),
+                "INSERT OR REPLACE INTO officials_fetch (game_id, fetched_at, n_officials, source) "
+                "VALUES (?, ?, ?, ?)",
+                (gid, now, len(crew), source),
             )
 
             fetched += 1

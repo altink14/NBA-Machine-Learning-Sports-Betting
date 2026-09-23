@@ -174,6 +174,39 @@ def _player_bios() -> str:
     return f"{withbio or 0} of {total} with a bio"
 
 
+def _officials() -> str:
+    """Officiating crews for the newest archived season.
+
+    Nothing ran this on a schedule until 2026-09-22; it had only ever been run
+    by hand, which is how 1,212 of 1,315 games in 2025-26 went a season with no
+    crew. Daily, because the season adds games daily. --retry-empty re-asks any
+    game still recorded crewless (the newest games can lag), and since that
+    goes to boxscoresummaryv3 it is one request per such game, a handful a day.
+    """
+    import subprocess
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        season = conn.execute("SELECT MAX(season) FROM box_scores").fetchone()[0]
+    finally:
+        conn.close()
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO_ROOT, "src", "Process-Data", "backfill_officials.py"),
+         "--seasons", season, "--retry-empty"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=3600,
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "backfill_officials failed")[-300:])
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with_crew, games = conn.execute(
+            "SELECT SUM(f.n_officials > 0), COUNT(*) FROM "
+            "(SELECT DISTINCT game_id FROM box_scores WHERE season = ?) b "
+            "LEFT JOIN officials_fetch f USING (game_id)", (season,)).fetchone()
+    finally:
+        conn.close()
+    return f"{with_crew or 0} of {games} {season} games with a crew"
+
+
 # Cadences are set by how fast the underlying truth moves, not by habit.
 # The Hall inducts once a year; weekly means a new class appears within days
 # without hammering a site that changes eleven times a decade.
@@ -184,6 +217,7 @@ JOBS: List[Job] = [
     Job("draft_history", 7, _draft_history, "New draft class each June, plus late pick corrections"),
     Job("draft_bios", 7, _draft_bios, "Bios for the newest picks appear over the weeks after the draft"),
     Job("player_bios", 7, _player_bios, "Current-season bios; historical buckets never change"),
+    Job("officials", 1, _officials, "New games need their crews; the newest can lag a day"),
 ]
 
 

@@ -26,7 +26,6 @@ Usage:
 
 import argparse
 import glob
-import json
 import logging
 import os
 import sqlite3
@@ -36,13 +35,43 @@ from datetime import datetime, timezone
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from src.Utils.nba_stats_client import NBAStatsClient  # noqa: E402
+from src.Utils.nba_stats_client import NBAStatsClient, cache_candidates, load_cache_file  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ingest_game_summaries")
 
 DB_PATH = os.path.join(REPO_ROOT, "Data", "TeamData.sqlite")
-CACHE_GLOB = os.path.join(REPO_ROOT, "Data", "nba_cache", "boxscoresummaryv2_game_id=*.json")
+CACHE_DIR = os.path.join(REPO_ROOT, "Data", "nba_cache")
+SUMMARY_PREFIX = "boxscoresummaryv2_game_id="
+
+
+def cached_summaries(cache_dir: str = CACHE_DIR):
+    """(game_id, plain .json path) for every cached summary, sorted by game id.
+
+    The cache holds each entry as `<key>.json` (older writes) or
+    `<key>.json.gz` (newer writes, and anything compact_nba_cache.py has
+    converted); a key can briefly have both. Each game appears once, under its
+    plain name - the reader picks the copy to open.
+    """
+    gids = set()
+    for pattern in ("*.json", "*.json.gz"):
+        for path in glob.glob(os.path.join(cache_dir, SUMMARY_PREFIX + pattern)):
+            name = os.path.basename(path)
+            if name.endswith(".gz"):
+                name = name[: -len(".gz")]
+            gids.add(name[len(SUMMARY_PREFIX):-len(".json")])
+    return [(g, os.path.join(cache_dir, f"{SUMMARY_PREFIX}{g}.json")) for g in sorted(gids)]
+
+
+def load_summary(plain: str):
+    """The newest readable copy of one cached summary; raises if none is."""
+    last = FileNotFoundError(plain)
+    for candidate, _ in cache_candidates(plain):
+        try:
+            return load_cache_file(candidate)
+        except Exception as exc:  # a corrupt .gz falls back to a plain copy, if any
+            last = exc
+    raise last
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS game_line_scores (
@@ -95,7 +124,7 @@ def main() -> int:
     p.add_argument("--db", default=DB_PATH)
     args = p.parse_args()
 
-    files = sorted(glob.glob(CACHE_GLOB))
+    files = cached_summaries()
     if args.limit:
         files = files[: args.limit]
     logger.info("%d cached summaries to read", len(files))
@@ -119,13 +148,12 @@ def main() -> int:
         conn.commit()
         batch_lines.clear(); batch_inact.clear(); batch_info.clear()
 
-    for path in files:
-        gid = os.path.basename(path)[len("boxscoresummaryv2_game_id="):-len(".json")]
+    for gid, path in files:
         if gid not in known:
             n_skipped += 1
             continue
         try:
-            raw = json.load(open(path, encoding="utf-8"))
+            raw = load_summary(path)
             parsed = NBAStatsClient._parse_all_result_sets(raw)
         except Exception as exc:  # a corrupt cache file must not end the run
             n_bad += 1

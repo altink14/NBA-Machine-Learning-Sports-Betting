@@ -8542,17 +8542,25 @@ def get_scoring_runs(
             )
         ]
 
-        # Games per team in scope, so runs can be expressed per game.
+        # Games per team in scope, so runs can be expressed per game. Without a
+        # season the scope is the seasons the run table covers: counting every
+        # archived game (1996-97 on) divided play-by-play runs by up to thirty
+        # seasons of games (NYK: 2,386), so per-game rates were several times
+        # too low.
+        season_filter = (
+            " AND t.season = ?" if season
+            else " AND t.season IN (SELECT DISTINCT season FROM scoring_runs WHERE season_type = ?)"
+        )
         games = {
             r["tri"]: r["n"] for r in conn.execute(
                 f"""
                 SELECT m.abbreviation AS tri, COUNT(DISTINCT t.game_id) AS n
                 FROM team_game_advanced t
                 JOIN team_metadata m ON m.team_id = t.team_id
-                WHERE t.season_type = ?{" AND t.season = ?" if season else ""}
+                WHERE t.season_type = ?{season_filter}
                 GROUP BY m.abbreviation
                 """,
-                [season_type] + ([season] if season else []),
+                [season_type, season if season else season_type],
             )
         }
 

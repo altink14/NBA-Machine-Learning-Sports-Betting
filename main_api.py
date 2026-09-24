@@ -1657,8 +1657,15 @@ class PredictionRunner:
                 "under_over_line": uo_lines[i], 
                 "predicted_winner": home_team if winner_idx == 1 else away_team,
                 "winner_confidence": round(winner_confidence * 100, 2),
-                "under_over_prediction": "OVER" if ou_idx == 1 else "UNDER",
-                "under_over_confidence": round(ou_confidence * 100, 2), 
+                # The over/under pick was WITHDRAWN on 2026-09-19 (its model
+                # never had a sealed evaluation). Until 2026-09-24 this path
+                # still computed it and sent it to every signed-in browser, to
+                # the chat, into the ledger, and into the parlay grader's
+                # totals legs; only prompts and components hid it. None here,
+                # at the source, as the market-only branch already does. The
+                # market's total (under_over_line) is still reported as a fact.
+                "under_over_prediction": None,
+                "under_over_confidence": None,
                 "model": self.model_name,
                 "expected_value": {"home_team": ev_home, "away_team": ev_away},
                 "kelly_criterion": {"home_team": kelly_home, "away_team": kelly_away},

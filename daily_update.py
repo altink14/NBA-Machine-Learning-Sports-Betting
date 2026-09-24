@@ -385,6 +385,38 @@ def run_preflight() -> int:
         return -1
 
 
+def run_integrity_audit(season: str) -> int:
+    """Check this season's archive against itself (audit_archive.py).
+
+    Added 2026-09-24. The bugs found the day before were each invisible table
+    by table and plain across tables: a team's points not equal to its
+    players', season totals not equal to the game log, placeholder zeros.
+    The daily backfill is what writes this season, so this is where a new one
+    would appear. Non-fatal for the same reason as the preflight: it reports,
+    the log says it loudly, and a night's grading is not held hostage to it.
+
+    Returns the number of failed checks, or -1 if the audit could not run.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "audit_archive.py"), "--season", season],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=900,
+            encoding="utf-8", errors="replace")
+        lines = [ln.rstrip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        if r.returncode == 0:
+            logger.info("Integrity audit (%s): all checks pass", season)
+            return 0
+        failed = [ln.strip() for ln in lines if ln.strip().startswith(("FAIL", "ERROR"))]
+        logger.error("Integrity audit (%s) found problems:", season)
+        for ln in lines:
+            if ln.strip().startswith(("FAIL", "ERROR")) or ln.startswith("           {"):
+                logger.error("  %s", ln.strip())
+        return len(failed) or 1
+    except Exception as exc:
+        logger.error("Integrity audit could not run: %s", exc, exc_info=True)
+        return -1
+
+
 def publish_ledger() -> str:
     """Mirror the ledger to the public server. 'published' | 'skipped' | 'failed'.
 
@@ -447,8 +479,9 @@ def main() -> int:
     # After everything that writes OddsData (grading, logging, the board
     # snapshot), so the public copy gets this run's picks and grades.
     ledger_status = publish_ledger()
-    # Last, so it sees the state this run leaves behind rather than the state
-    # it started from.
+    # Last, so they see the state this run leaves behind rather than the
+    # state it started from.
+    audit_failed = run_integrity_audit(season)
     preflight_wrong = run_preflight()
 
     failures = []
@@ -472,11 +505,14 @@ def main() -> int:
     if failures:
         logger.error("=== Daily update finished WITH ERRORS: %s ===", ", ".join(failures))
         return 1
-    logger.info("=== Daily update finished OK (predictions: %s, preflight: %s) ===",
+    logger.info("=== Daily update finished OK (predictions: %s, preflight: %s, audit: %s) ===",
                 prediction_status,
                 "clean" if preflight_wrong == 0
                 else "COULD NOT RUN" if preflight_wrong < 0
-                else f"{preflight_wrong} WRONG")
+                else f"{preflight_wrong} WRONG",
+                "clean" if audit_failed == 0
+                else "COULD NOT RUN" if audit_failed < 0
+                else f"{audit_failed} FAILED")
     return 0
 
 

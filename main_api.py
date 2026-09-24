@@ -6,6 +6,7 @@ import threading
 import time
 import glob
 import re
+import math
 import os
 import unicodedata
 import secrets
@@ -8874,85 +8875,183 @@ def get_daily_leaders(
         conn.close()
 
 
-@app.get("/api/stats/leaders")
-def get_stats_leaders(category: str = "pts", season: str = CURRENT_SEASON, season_type: str = "Regular Season", limit: int = 10):
-    """
-    Fetch league leaders for a specific stat category.
+# --- League leaders -------------------------------------------------------
+#
+# One implementation behind /api/stats/leaders (one board) and
+# /api/stats/leaders/board (several in one request). Found 2026-09-23:
+#   - counting stats came back as the top N by SEASON TOTAL and the pages
+#     re-ranked those N per game, so a per-game leader outside the top N by
+#     total vanished (Embiid 2023-24: 34.7 a game in 39 games, not in the
+#     top 10 by points) from a board labelled per game;
+#   - player_season_totals has a row per TEAM, so a player traded mid-season
+#     competed as two partial players;
+#   - the percentage minimums were written "per 82-game season" but never
+#     scaled, so lockout seasons had to clear a full season's bar;
+#   - a season page made nine requests for nine boards, and a visitor
+#     clicking through seasons hit the rate limit.
+# Now: one row per player (sums, percentages from makes and attempts, teams
+# in the order he played for them), per-game boards ranked per game among
+# players who appeared in 70% of their team's games, attempt minimums
+# scaled to the season's length, and a batch route.
 
-    Counting stats (pts, ast, ...) are returned as season totals ordered by
-    the total — clients divide by gp for per-game boards. Percentage stats
-    (fg_pct, fg3_pct, ft_pct) are ordered by the percentage itself with
-    basketball-reference-style qualification minimums so a 3-for-3 bench
-    stint can't lead the league.
-    """
-    counting_categories = ["pts", "ast", "reb", "stl", "blk", "min", "fg3m", "tov", "pf"]
-    # Fantasy points is the league's own scoring rule, not a house formula:
-    #   PTS + 1.2*REB + 1.5*AST + 3*STL + 3*BLK - TOV
-    # Verified against NBA_FANTASY_PTS on leaguedashplayerstats for all 582
-    # players in 2025-26 - zero difference to four decimal places - so the number
-    # here matches the one nba.com prints rather than approximating it.
-    FANTASY_SQL = ("(t.pts + 1.2 * t.reb + 1.5 * t.ast + 3.0 * t.stl "
-                   "+ 3.0 * t.blk - t.tov)")
-    # category -> (attempts column, minimum attempts to qualify, per 82-game season)
-    pct_categories = {
-        "fg_pct": ("fga", 300),
-        "fg3_pct": ("fg3a", 82),
-        "ft_pct": ("fta", 125),
-    }
-    cat = category.lower()
-    if cat not in counting_categories and cat not in pct_categories and cat != "fantasy":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Category must be one of {counting_categories + list(pct_categories) + ['fantasy']}"
+LEADER_COUNTING = ["pts", "ast", "reb", "stl", "blk", "min", "fg3m", "tov", "pf"]
+# Fantasy points is the league's own scoring rule, not a house formula:
+#   PTS + 1.2*REB + 1.5*AST + 3*STL + 3*BLK - TOV
+# Verified against NBA_FANTASY_PTS on leaguedashplayerstats for all 582
+# players in 2025-26 - zero difference to four decimal places - so the number
+# here matches the one nba.com prints rather than approximating it.
+_FANTASY_SQL = "(a.pts + 1.2 * a.reb + 1.5 * a.ast + 3.0 * a.stl + 3.0 * a.blk - a.tov)"
+# category -> (attempts column, minimum attempts per 82 team games)
+LEADER_PCT = {"fg_pct": ("fga", 300), "fg3_pct": ("fg3a", 82), "ft_pct": ("fta", 125)}
+LEADER_CATEGORIES = LEADER_COUNTING + list(LEADER_PCT) + ["fantasy"]
+LEADER_MIN_GAME_SHARE = 0.70   # appear in 70% of the team's games for a per-game board
+
+# One row per player: counting stats summed across his teams, percentages
+# recomputed from makes and attempts (never averaged across teams).
+_PLAYER_SEASON_SQL = """
+    SELECT player_id, SUM(gp) AS gp, SUM(gs) AS gs, SUM(min) AS min,
+           SUM(fgm) AS fgm, SUM(fga) AS fga, SUM(fg3m) AS fg3m, SUM(fg3a) AS fg3a,
+           SUM(ftm) AS ftm, SUM(fta) AS fta, SUM(oreb) AS oreb, SUM(dreb) AS dreb,
+           SUM(reb) AS reb, SUM(ast) AS ast, SUM(stl) AS stl, SUM(blk) AS blk,
+           SUM(tov) AS tov, SUM(pf) AS pf, SUM(pts) AS pts,
+           CASE WHEN SUM(fga) > 0 THEN 1.0 * SUM(fgm) / SUM(fga) END AS fg_pct,
+           CASE WHEN SUM(fg3a) > 0 THEN 1.0 * SUM(fg3m) / SUM(fg3a) END AS fg3_pct,
+           CASE WHEN SUM(fta) > 0 THEN 1.0 * SUM(ftm) / SUM(fta) END AS ft_pct,
+           COUNT(*) AS n_teams, MIN(team_id) AS team_id
+    FROM player_season_totals
+    WHERE season = ? AND season_type = ?
+    GROUP BY player_id
+"""
+
+
+def _team_games(conn, season: str, season_type: str) -> int:
+    """The most games any team has played in the season (so far)."""
+    row = conn.execute(
+        """
+        SELECT MAX(n) FROM (
+            SELECT team, COUNT(*) AS n FROM (
+                SELECT home_team_id AS team FROM box_scores WHERE season = ? AND season_type = ?
+                UNION ALL
+                SELECT away_team_id FROM box_scores WHERE season = ? AND season_type = ?
+            ) GROUP BY team
         )
+        """, (season, season_type, season, season_type)).fetchone()
+    return int(row[0] or 0) if row else 0
 
+
+def _leader_rules(conn, season: str, season_type: str) -> dict:
+    team_games = _team_games(conn, season, season_type)
+    scale = team_games / 82.0 if team_games else 0.0
+    return {
+        "team_games": team_games,
+        "min_games": math.ceil(LEADER_MIN_GAME_SHARE * team_games) if team_games else 0,
+        "min_attempts": {cat: math.ceil(base * scale) for cat, (_, base) in LEADER_PCT.items()},
+    }
+
+
+def _teams_in_order(conn, player_id: int, season: str, season_type: str):
+    rows = conn.execute(
+        """
+        SELECT m.abbreviation FROM player_game_log g
+        JOIN box_scores b ON b.game_id = g.game_id
+        JOIN team_metadata m ON m.team_id = g.team_id
+        WHERE g.player_id = ? AND b.season = ? AND b.season_type = ?
+        GROUP BY g.team_id ORDER BY MIN(g.game_date)
+        """, (player_id, season, season_type)).fetchall()
+    return "/".join(r[0] for r in rows) or None
+
+
+def _leader_board(conn, cat: str, season: str, season_type: str, limit: int, rank: str, rules: dict):
+    # Category names are validated against LEADER_CATEGORIES before this runs,
+    # so the f-string interpolation cannot inject SQL.
+    select = f"""
+        SELECT a.*, p.full_name,
+               (SELECT abbreviation FROM team_metadata WHERE team_id = a.team_id) AS team_abbr,
+               {_FANTASY_SQL} AS fantasy
+        FROM ({_PLAYER_SEASON_SQL}) a
+        JOIN players p ON a.player_id = p.player_id
+    """
+    params: list = [season, season_type]
+    if cat in LEADER_PCT:
+        attempts_col = LEADER_PCT[cat][0]
+        sql = select + f" WHERE a.{attempts_col} >= ? AND a.{cat} IS NOT NULL ORDER BY a.{cat} DESC LIMIT ?"
+        params += [rules["min_attempts"][cat], limit]
+    else:
+        value = _FANTASY_SQL if cat == "fantasy" else f"a.{cat}"
+        if rank == "per_game":
+            sql = select + f" WHERE a.gp >= ? AND a.gp > 0 ORDER BY 1.0 * {value} / a.gp DESC LIMIT ?"
+            params += [max(1, rules["min_games"]), limit]
+        else:
+            sql = select + f" ORDER BY {value} DESC LIMIT ?"
+            params += [limit]
+    out = []
+    for r in conn.execute(sql, params).fetchall():
+        row = dict(r)
+        if (row.pop("n_teams") or 0) > 1:
+            row["team_abbr"] = _teams_in_order(conn, row["player_id"], season, season_type) or row["team_abbr"]
+        out.append(row)
+    return out
+
+
+def _check_leader_args(categories, rank: str):
+    bad = [c for c in categories if c not in LEADER_CATEGORIES]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Category must be one of {LEADER_CATEGORIES}; got {bad}")
+    if rank not in ("per_game", "total"):
+        raise HTTPException(status_code=400, detail="rank must be 'per_game' or 'total'")
+
+
+@app.get("/api/stats/leaders")
+def get_stats_leaders(category: str = "pts", season: str = CURRENT_SEASON, season_type: str = "Regular Season",
+                      limit: int = 10, rank: str = "total"):
+    """
+    League leaders for one stat category, one row per player.
+
+    rank=total (the default, kept for existing callers) orders counting
+    stats by the season total; rank=per_game orders them per game among
+    players who appeared in 70% of their team's games. Percentage stats are
+    always ordered by the percentage, with attempt minimums scaled to the
+    season's length so a 3-for-3 bench stint can't lead the league.
+    """
+    cat = category.lower()
+    _check_leader_args([cat], rank)
     conn = get_db_conn()
     try:
-        cursor = conn.cursor()
-
-        # Category names are validated against the allowlists above, so the
-        # f-string interpolation cannot inject SQL.
-        if cat == "fantasy":
-            query = f"""
-                SELECT t.*, p.full_name,
-                       (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr,
-                       {FANTASY_SQL} AS fantasy
-                FROM player_season_totals t
-                JOIN players p ON t.player_id = p.player_id
-                WHERE t.season = ? AND t.season_type = ?
-                ORDER BY fantasy DESC
-                LIMIT ?
-            """
-            cursor.execute(query, (season, season_type, limit))
-        elif cat in pct_categories:
-            attempts_col, min_attempts = pct_categories[cat]
-            query = f"""
-                SELECT t.*, p.full_name,
-                       (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
-                FROM player_season_totals t
-                JOIN players p ON t.player_id = p.player_id
-                WHERE t.season = ? AND t.season_type = ?
-                  AND t.{attempts_col} >= ? AND t.{cat} IS NOT NULL
-                ORDER BY t.{cat} DESC
-                LIMIT ?
-            """
-            cursor.execute(query, (season, season_type, min_attempts, limit))
-        else:
-            query = f"""
-                SELECT t.*, p.full_name,
-                       (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
-                FROM player_season_totals t
-                JOIN players p ON t.player_id = p.player_id
-                WHERE t.season = ? AND t.season_type = ?
-                ORDER BY t.{cat} DESC
-                LIMIT ?
-            """
-            cursor.execute(query, (season, season_type, limit))
-        rows = cursor.fetchall()
-
-        return [dict(r) for r in rows]
+        return _leader_board(conn, cat, season, season_type, max(1, min(limit, 100)), rank,
+                             _leader_rules(conn, season, season_type))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching stats leaders: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/api/stats/leaders/board")
+def get_stats_leader_board(categories: str = "pts,ast,reb", season: str = CURRENT_SEASON,
+                           season_type: str = "Regular Season", limit: int = 10, rank: str = "per_game"):
+    """
+    Several leader boards in one request, with the qualification rules that
+    were applied, so a page can print them instead of hardcoding them:
+    {season, season_type, rules: {team_games, min_games, min_attempts}, boards: {cat: [rows]}}.
+    """
+    cats = [c.strip().lower() for c in categories.split(",") if c.strip()]
+    if not cats or len(cats) > len(LEADER_CATEGORIES):
+        raise HTTPException(status_code=400, detail="Pass between 1 and 13 comma-separated categories.")
+    _check_leader_args(cats, rank)
+    conn = get_db_conn()
+    try:
+        rules = _leader_rules(conn, season, season_type)
+        lim = max(1, min(limit, 100))
+        return {
+            "season": season, "season_type": season_type, "rank": rank, "rules": rules,
+            "boards": {c: _leader_board(conn, c, season, season_type, lim, rank, rules) for c in dict.fromkeys(cats)},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching leader board: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()

@@ -3440,6 +3440,10 @@ async def ledger_sync_endpoint(request: Request):
 
 
 # --- Prediction track record endpoint ---
+#: What a pending pick hides from the public record until its game starts.
+_SEALED_BEFORE_TIPOFF = ("predicted_winner", "winner_confidence", "ev_home", "ev_away", "why_json")
+
+
 @app.get("/api/prediction-log")
 def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
     """Model predictions recorded before games, newest first (transparency page source)."""
@@ -3480,6 +3484,23 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
         for p in predictions:
             p.pop("ou_prediction", None)
             p.pop("ou_confidence", None)
+
+        # Sealed until tip-off (2026-09-24, the owner's call: the model's picks
+        # are Pro). This endpoint is public, and it used to serve every pending
+        # pick with its confidence and edge hours before the game, which made
+        # the paywall a formality. Before tip-off a row now says only that a
+        # pick exists and when it was logged, which is what makes the record
+        # provable; the pick, confidence, edge and reasons appear once the game
+        # starts. Pro members get them in advance from /predictions.
+        now = _utc_iso(datetime.now(timezone.utc))
+        for p in predictions:
+            if now and (p.get("game_start_time_utc") or "") > now:
+                p["sealed_until_tipoff"] = True
+                for field in _SEALED_BEFORE_TIPOFF:
+                    if field in p:
+                        p[field] = None
+            else:
+                p["sealed_until_tipoff"] = False
 
         # Honest topline: only graded predictions count toward the record
         graded = [p for p in predictions if p.get("actual_winner")]

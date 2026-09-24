@@ -4253,63 +4253,260 @@ def get_player_awards(id: int):
         conn.close()
 
 
+# --- League-wide award winners and career leaders ---------------------------
+# Both read tables that backfill_reference.py fills for every player (before
+# it, only players someone had opened: 15 with awards, 75 with official
+# careers). Until that job has asked about every player, a list can be
+# missing names, so every answer carries its coverage and says so.
+
+# Short names people use -> nba.com's award descriptions.
+AWARD_ALIASES = {
+    "mvp": "NBA Most Valuable Player",
+    "most valuable player": "NBA Most Valuable Player",
+    "roy": "NBA Rookie of the Year",
+    "rookie of the year": "NBA Rookie of the Year",
+    "dpoy": "NBA Defensive Player of the Year",
+    "defensive player of the year": "NBA Defensive Player of the Year",
+    "6moy": "NBA Sixth Man of the Year",
+    "smoy": "NBA Sixth Man of the Year",
+    "sixth man": "NBA Sixth Man of the Year",
+    "sixth man of the year": "NBA Sixth Man of the Year",
+    "mip": "NBA Most Improved Player",
+    "most improved": "NBA Most Improved Player",
+    "most improved player": "NBA Most Improved Player",
+    "finals mvp": "NBA Finals Most Valuable Player",
+    "fmvp": "NBA Finals Most Valuable Player",
+    "clutch": "NBA Clutch Player of the Year",
+    "clutch player of the year": "NBA Clutch Player of the Year",
+    "all-star mvp": "NBA All-Star Most Valuable Player",
+    "cup mvp": "NBA Cup Most Valuable Player",
+    "all-nba": "All-NBA",
+    "all nba": "All-NBA",
+    "all-defensive": "All-Defensive Team",
+    "all defensive": "All-Defensive Team",
+    "all-rookie": "All-Rookie Team",
+    "all rookie": "All-Rookie Team",
+    "all-star": "NBA All-Star",
+    "all star": "NBA All-Star",
+    "champion": "NBA Champion",
+    "sportsmanship": "NBA Sportsmanship",
+    "citizenship": "J. Walter Kennedy Citizenship",
+}
+
+
+def _reference_coverage(conn, kind: str) -> Dict[str, Any]:
+    """How many players the backfill has asked about for this table."""
+    total = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+    try:
+        asked = conn.execute(
+            "SELECT COUNT(*) FROM reference_fetch WHERE kind = ? AND error IS NULL", (kind,)
+        ).fetchone()[0]
+    except sqlite3.OperationalError:  # backfill never run
+        asked = 0
+    return {
+        "players_checked": asked,
+        "players_total": total,
+        "complete": asked >= total,
+        "note": None if asked >= total else (
+            f"Only {asked} of {total} players have been checked so far (backfill_reference.py is "
+            "filling this); a name can be missing from this list until it finishes."
+        ),
+    }
+
+
+@app.get("/api/awards/winners")
+def get_award_winners(award: str, season: Optional[str] = None, limit: int = 100):
+    """Official winners of one award, by season (from every player's playerawards)."""
+    conn = get_db_conn()
+    try:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='player_awards'"
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=503, detail="No award data yet - run backfill_reference.py.")
+        key = award.strip().lower()
+        description = AWARD_ALIASES.get(key)
+        if description is None:
+            # Accept nba.com's own wording, case-insensitively.
+            row = conn.execute(
+                "SELECT description FROM player_awards WHERE LOWER(description) = ? LIMIT 1", (key,)
+            ).fetchone()
+            description = row[0] if row else None
+        if description is None:
+            known = [r[0] for r in conn.execute(
+                "SELECT description FROM player_awards GROUP BY description ORDER BY COUNT(*) DESC"
+            )]
+            raise HTTPException(status_code=404, detail={"error": f"Unknown award '{award}'", "known_awards": known})
+        where, params = ["a.description = ?"], [description]
+        if season:
+            where.append("a.season = ?")
+            params.append(season)
+        rows = conn.execute(
+            f"""
+            SELECT a.season, a.player_id, p.full_name, a.team,
+                   NULLIF(NULLIF(NULLIF(a.all_nba_team_number, ''), '(null)'), 'None') AS team_number
+            FROM player_awards a LEFT JOIN players p ON p.player_id = a.player_id
+            WHERE {' AND '.join(where)}
+            ORDER BY a.season DESC, team_number, p.full_name
+            LIMIT ?
+            """,
+            params + [max(1, min(limit, 1000))],
+        ).fetchall()
+        return {
+            "award": description,
+            "season": season,
+            "winners": [dict(r) for r in rows],
+            "coverage": _reference_coverage(conn, "awards"),
+            "source": "nba.com playerawards, per player",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching award winners for {award}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+CAREER_LEADER_STATS = ("pts", "reb", "ast", "stl", "blk", "fg3m", "ftm", "fgm", "gp", "min", "tov", "oreb", "dreb")
+
+
+@app.get("/api/stats/career-leaders")
+def get_career_leaders(
+    stat: str = "pts",
+    season_type: str = "Regular Season",
+    per_game: bool = False,
+    min_gp: int = 400,
+    active_only: bool = False,
+    limit: int = 25,
+):
+    """All-time career leaders from nba.com's official career totals.
+
+    Totals by default; per_game ranks among players with at least min_gp games
+    (400, basketball's usual bar), so a short career cannot top a rate list.
+    Steals, blocks and turnovers were not recorded before 1973-74 and 1977-78,
+    so those lists begin there, as the official record does.
+    """
+    stat = stat.lower()
+    if stat not in CAREER_LEADER_STATS:
+        raise HTTPException(status_code=422, detail=f"stat must be one of {', '.join(CAREER_LEADER_STATS)}")
+    if season_type not in ("Regular Season", "Playoffs"):
+        raise HTTPException(status_code=422, detail="season_type must be 'Regular Season' or 'Playoffs'")
+    conn = get_db_conn()
+    try:
+        _ensure_career_official_table(conn)
+        value = f"CAST(c.{stat} AS REAL) / NULLIF(c.gp, 0)" if per_game and stat != "gp" else f"c.{stat}"
+        where = ["c.is_career_total = 1", "c.season_type = ?", f"c.{stat} IS NOT NULL"]
+        params: List[Any] = [season_type]
+        if per_game:
+            where.append("c.gp >= ?")
+            params.append(min_gp)
+        if active_only:
+            where.append("p.is_active = 1")
+        rows = conn.execute(
+            f"""
+            SELECT c.player_id, p.full_name, p.is_active, p.from_year, p.to_year,
+                   c.gp, c.{stat} AS total, {value} AS value
+            FROM player_career_official c LEFT JOIN players p ON p.player_id = c.player_id
+            WHERE {' AND '.join(where)}
+            ORDER BY value DESC
+            LIMIT ?
+            """,
+            params + [max(1, min(limit, 200))],
+        ).fetchall()
+        leaders = []
+        for rank, r in enumerate(rows, 1):
+            d = dict(r)
+            d["rank"] = rank
+            d["value"] = round(d["value"], 1) if per_game and d["value"] is not None else d["value"]
+            leaders.append(d)
+        return {
+            "stat": stat,
+            "season_type": season_type,
+            "per_game": per_game,
+            "min_gp": min_gp if per_game else None,
+            "leaders": leaders,
+            "coverage": _reference_coverage(conn, "careers"),
+            "source": "nba.com playercareerstats career totals",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching career leaders for {stat}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 # --- Team coaching staff (cached per team+season) ---
+def _ensure_team_coaches_table(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_coaches (
+            team_id INTEGER, season TEXT, coach_id INTEGER,
+            coach_name TEXT, coach_type TEXT, sort_sequence INTEGER,
+            fetched_at TEXT,
+            PRIMARY KEY (team_id, season, coach_id)
+        )
+        """
+    )
+
+
+def _ensure_team_coaches(conn, team_id: int, season: str, max_age_days: int = 7) -> int:
+    """Fetch one team-season's staff from commonteamroster unless cached within
+    max_age_days. Returns the number of coaches stored (0 when nba.com lists
+    none). Shared by the endpoint and backfill_reference.py."""
+    _ensure_team_coaches_table(conn)
+    cached = conn.execute(
+        "SELECT MAX(fetched_at), COUNT(*) FROM team_coaches WHERE team_id = ? AND season = ?",
+        (team_id, season),
+    ).fetchone()
+    if cached and cached[0] and cached[0] > (datetime.utcnow() - timedelta(days=max_age_days)).isoformat():
+        return cached[1]
+    from nba_api.stats.endpoints import commonteamroster
+    with _nba_slot("commonteamroster"):
+        data = commonteamroster.CommonTeamRoster(team_id=team_id, season=season).get_dict()
+    coaches_rs = next((r for r in data["resultSets"] if r["name"] == "Coaches"), None)
+    if not coaches_rs:
+        return 0
+    idx = {h: i for i, h in enumerate(coaches_rs["headers"])}
+    now = datetime.utcnow().isoformat()
+    conn.execute("DELETE FROM team_coaches WHERE team_id = ? AND season = ?", (team_id, season))
+    for r in coaches_rs["rowSet"]:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO team_coaches
+            (team_id, season, coach_id, coach_name, coach_type, sort_sequence, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                team_id, season,
+                r[idx["COACH_ID"]],
+                r[idx["COACH_NAME"]],
+                r[idx["COACH_TYPE"]] if "COACH_TYPE" in idx else "",
+                r[idx["SORT_SEQUENCE"]] if "SORT_SEQUENCE" in idx else 0,
+                now,
+            ),
+        )
+    conn.commit()
+    return len(coaches_rs["rowSet"])
+
+
 @app.get("/api/teams/{abbr}/coaches")
 def get_team_coaches(abbr: str, season: str = CURRENT_SEASON):
     conn = get_db_conn()
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS team_coaches (
-                team_id INTEGER, season TEXT, coach_id INTEGER,
-                coach_name TEXT, coach_type TEXT, sort_sequence INTEGER,
-                fetched_at TEXT,
-                PRIMARY KEY (team_id, season, coach_id)
-            )
-            """
-        )
+        _ensure_team_coaches_table(conn)
         team_row = conn.execute(
             "SELECT team_id FROM team_metadata WHERE abbreviation = ?", (abbr.upper(),)
         ).fetchone()
         if not team_row:
             raise HTTPException(status_code=404, detail=f"Unknown team {abbr}")
         team_id = team_row[0]
-
-        cached = conn.execute(
-            "SELECT MAX(fetched_at) FROM team_coaches WHERE team_id = ? AND season = ?",
-            (team_id, season),
-        ).fetchone()
-        if not (cached and cached[0] and cached[0] > (datetime.utcnow() - timedelta(days=7)).isoformat()):
-            try:
-                from nba_api.stats.endpoints import commonteamroster
-                with _nba_slot("commonteamroster"):
-                    data = commonteamroster.CommonTeamRoster(team_id=team_id, season=season).get_dict()
-                coaches_rs = next((r for r in data["resultSets"] if r["name"] == "Coaches"), None)
-                if coaches_rs:
-                    idx = {h: i for i, h in enumerate(coaches_rs["headers"])}
-                    now = datetime.utcnow().isoformat()
-                    conn.execute(
-                        "DELETE FROM team_coaches WHERE team_id = ? AND season = ?", (team_id, season)
-                    )
-                    for r in coaches_rs["rowSet"]:
-                        conn.execute(
-                            """
-                            INSERT OR REPLACE INTO team_coaches
-                            (team_id, season, coach_id, coach_name, coach_type, sort_sequence, fetched_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                team_id, season,
-                                r[idx["COACH_ID"]],
-                                r[idx["COACH_NAME"]],
-                                r[idx["COACH_TYPE"]] if "COACH_TYPE" in idx else "",
-                                r[idx["SORT_SEQUENCE"]] if "SORT_SEQUENCE" in idx else 0,
-                                now,
-                            ),
-                        )
-                    conn.commit()
-            except Exception as exc:
-                logger.warning(f"Coach fetch failed for {abbr} {season} (serving cache): {exc}")
+        try:
+            _ensure_team_coaches(conn, team_id, season)
+        except Exception as exc:
+            logger.warning(f"Coach fetch failed for {abbr} {season} (serving cache): {exc}")
 
         rows = conn.execute(
             """

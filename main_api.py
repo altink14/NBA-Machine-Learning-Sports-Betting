@@ -280,6 +280,16 @@ app = FastAPI(
     version="1.1.1-stable-fixed",
     dependencies=[Depends(require_api_key)],
 )
+if SLOWAPI_AVAILABLE:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
+# CORS goes on LAST: Starlette makes the last-added middleware the outermost,
+# and CORS has to wrap everything, the rate limiter included. It used to be
+# added first, so a 429 left without CORS headers and the browser reported
+# "blocked by CORS policy" instead of a rate limit: the page could not tell
+# a busy backend from a misconfigured one (found in the 2026-09-23 sweep).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -287,11 +297,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-if SLOWAPI_AVAILABLE:
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
 
 # Make misconfiguration obvious in deploy logs.
 logger.info(f"CORS allowed origins: {CORS_ORIGINS}")
@@ -3541,17 +3546,47 @@ def get_rookies(season: str = CURRENT_SEASON, season_type: str = "Regular Season
                    d.overall_pick, d.round_number, d.team_abbreviation AS drafted_by,
                    d.organization,
                    t.gp, t.gs, t.min, t.pts, t.reb, t.ast, t.stl, t.blk, t.tov,
-                   t.fg_pct, t.fg3_pct, t.ft_pct,
+                   t.fg_pct, t.fg3_pct, t.ft_pct, t.n_teams,
                    (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) AS team_abbr
             FROM draft_history d
-            LEFT JOIN player_season_totals t
-                   ON t.player_id = d.person_id AND t.season = ? AND t.season_type = ?
+            LEFT JOIN (
+                -- One row per player: a rookie traded mid-season has a row per
+                -- team in player_season_totals, and joining those directly
+                -- listed him twice. Sum the counting stats and recompute the
+                -- percentages from makes and attempts (averaging two teams'
+                -- percentages would weight them wrongly).
+                SELECT player_id, SUM(gp) AS gp, SUM(gs) AS gs, SUM(min) AS min,
+                       SUM(pts) AS pts, SUM(reb) AS reb, SUM(ast) AS ast,
+                       SUM(stl) AS stl, SUM(blk) AS blk, SUM(tov) AS tov,
+                       CASE WHEN SUM(fga) > 0 THEN 1.0 * SUM(fgm) / SUM(fga) END AS fg_pct,
+                       CASE WHEN SUM(fg3a) > 0 THEN 1.0 * SUM(fg3m) / SUM(fg3a) END AS fg3_pct,
+                       CASE WHEN SUM(fta) > 0 THEN 1.0 * SUM(ftm) / SUM(fta) END AS ft_pct,
+                       COUNT(*) AS n_teams, MIN(team_id) AS team_id
+                FROM player_season_totals
+                WHERE season = ? AND season_type = ?
+                GROUP BY player_id
+            ) t ON t.player_id = d.person_id
             WHERE d.season = ?
             ORDER BY d.overall_pick ASC
             """,
             (season, season_type, draft_year),
         ).fetchall()
-        return {"season": season, "draft_year": draft_year, "rookies": [dict(r) for r in rows]}
+        rookies = []
+        for r in rows:
+            row = dict(r)
+            if (row.pop("n_teams") or 0) > 1:
+                # Teams in the order he played for them, e.g. "UTA/MEM".
+                teams = [t["abbreviation"] for t in conn.execute(
+                    """
+                    SELECT m.abbreviation FROM player_game_log g
+                    JOIN box_scores b ON b.game_id = g.game_id
+                    JOIN team_metadata m ON m.team_id = g.team_id
+                    WHERE g.player_id = ? AND b.season = ? AND b.season_type = ?
+                    GROUP BY g.team_id ORDER BY MIN(g.game_date)
+                    """, (row["player_id"], season, season_type))]
+                row["team_abbr"] = "/".join(teams) if teams else None
+            rookies.append(row)
+        return {"season": season, "draft_year": draft_year, "rookies": rookies}
     except Exception as e:
         logger.error(f"Error fetching rookies for {season}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

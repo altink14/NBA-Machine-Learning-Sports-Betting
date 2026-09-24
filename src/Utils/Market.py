@@ -24,9 +24,19 @@ game for that home team. Play-in games are missing from the dataset, so
 about 25 games in 2019-20 .. 2022-23 have no line. Coverage: 20,452 of
 20,477 rows land on an archived game (99.9%).
 
-Sign conventions in the dataset: Spread is the HOME side's expected margin
-(+3.5 = home favoured by 3.5, -2.5 = home a 2.5-point underdog). Win_Margin is
-home minus away. OU is the total. Moneylines are American.
+Sign conventions: we use spread_home = the HOME side's expected margin (+3.5 =
+home favoured by 3.5, -2.5 = home a 2.5-point underdog). The dataset's Spread
+column carries that sign ONLY in 2022-23 (SPREAD_SIGNED_SEASONS). Every
+earlier season stores the favourite's line UNSIGNED - never negative - so
+taken at face value every game reads as home-favoured and about a third of
+each season is graded against the wrong side. That is what this module did
+until 2026-09-24 (the Warriors' 2015-16 "average line" read -2.4). The sign is
+recovered from the moneyline, the rule key numbers already uses in main_api.py:
+whichever side is shorter was favoured. On the signed seasons that rule
+reproduces the dataset's own sign for 99.56% of games, every miss a pick'em.
+A game with equal moneylines and a non-zero line has no recoverable side and
+is left ungraded against the spread rather than guessed. Win_Margin is home
+minus away. OU is the total. Moneylines are American.
 """
 
 import datetime as dt
@@ -36,6 +46,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 FIRST_SEASON = "2007-08"
 LAST_SEASON = "2022-23"
+
+#: Seasons whose Spread column is signed (positive = home favoured). The key
+#: numbers endpoint reads the *_new tables, which add 2023-24; see
+#: KEY_NUMBERS_SIGNED_SEASONS in main_api.py.
+SPREAD_SIGNED_SEASONS = frozenset({"2022-23", "2023-24"})
+
+
+def signed_home_spread(season: str, spread: Optional[float], ml_home: Optional[float],
+                       ml_away: Optional[float]) -> Optional[float]:
+    """The home side's line, signed. None when the side cannot be known."""
+    if spread is None:
+        return None
+    if season in SPREAD_SIGNED_SEASONS:
+        return spread
+    if spread == 0:
+        return 0.0
+    if ml_home is None or ml_away is None or ml_home == ml_away:
+        return None
+    return abs(spread) if ml_home < ml_away else -abs(spread)
 
 # Odds-dataset spelling -> the modern franchise name used by team_metadata.
 _ALIASES = {
@@ -99,14 +128,16 @@ def _load(odds_conn: sqlite3.Connection) -> Dict[Tuple[str, str], Dict[str, Any]
                 if not d or not home:
                     continue
                 key = (_to_iso(d), _ALIASES.get(home, home))
+                ml_h, ml_a = _num(mlh), _num(mla)
                 out[key] = {
                     "season": season,
                     "home": _ALIASES.get(home, home),
                     "away": _ALIASES.get(away, away),
                     "total": _num(ou),
-                    "spread_home": _num(spread),
-                    "ml_home": _num(mlh),
-                    "ml_away": _num(mla),
+                    "spread_home": signed_home_spread(season, _num(spread), ml_h, ml_a),
+                    "spread_sign": ("dataset" if season in SPREAD_SIGNED_SEASONS else "moneyline"),
+                    "ml_home": ml_h,
+                    "ml_away": ml_a,
                     "dataset_points": _num(pts),
                     "dataset_margin": _num(margin),
                     "rest_home": _num(rest_h),
@@ -175,6 +206,9 @@ def _grade(row: Dict[str, Any], home_pts: Optional[int], away_pts: Optional[int]
     return {
         "closing": {
             "spread_home": spread,
+            # where the sign of spread_home came from: the dataset itself, or
+            # recovered from the moneyline (see the module docstring)
+            "spread_sign": row.get("spread_sign"),
             "total": total,
             "ml_home": mlh,
             "ml_away": mla,
@@ -267,7 +301,7 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
             "team": name, "abbr": abbr, "games": 0, "graded": 0,
             "su": [0, 0], "ats": [0, 0, 0], "ou": [0, 0, 0],
             "as_favorite": [0, 0], "as_underdog": [0, 0],
-            "spread_sum": 0.0, "cover_sum": 0.0, "total_sum": 0.0, "points_sum": 0.0,
+            "spread_sum": 0.0, "cover_sum": 0.0, "lined": 0, "total_sum": 0.0, "points_sum": 0.0,
             "biggest_upset": None,  # largest fair-prob deficit that still won
         }
 
@@ -307,6 +341,8 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
         if c["spread_home"] is not None:
             th["spread_sum"] += -float(c["spread_home"])   # the team's own line (negative = favoured)
             ta["spread_sum"] += float(c["spread_home"])
+            th["lined"] += 1
+            ta["lined"] += 1
         if r["cover_margin_home"] is not None:
             th["cover_sum"] += r["cover_margin_home"]
             ta["cover_sum"] -= r["cover_margin_home"]
@@ -346,8 +382,9 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
             "as_favorite": t["as_favorite"], "as_underdog": t["as_underdog"],
             "ats_pct": round(100 * t["ats"][0] / ats_dec, 1) if ats_dec else None,
             "over_pct": round(100 * t["ou"][0] / (t["ou"][0] + t["ou"][1]), 1) if (t["ou"][0] + t["ou"][1]) else None,
-            "avg_line": round(t["spread_sum"] / n, 1) if n else None,
-            "avg_cover_margin": round(t["cover_sum"] / n, 2) if n else None,
+            # averaged over games with a usable line, not every graded game
+            "avg_line": round(t["spread_sum"] / t["lined"], 1) if t["lined"] else None,
+            "avg_cover_margin": round(t["cover_sum"] / t["lined"], 2) if t["lined"] else None,
             "avg_total": round(t["total_sum"] / n, 1) if n else None,
             "avg_points": round(t["points_sum"] / n, 1) if n else None,
             "biggest_upset": t["biggest_upset"],

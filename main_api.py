@@ -2279,13 +2279,11 @@ def get_build_dna(player_id: int, season: str = CURRENT_SEASON):
         ).fetchone()
         if not player:
             raise HTTPException(status_code=404, detail="Unknown player id.")
-        rows = conn.execute(
-            "SELECT * FROM player_season_totals WHERE player_id = ? AND season = ? "
-            "AND season_type = 'Regular Season' ORDER BY min DESC", (player_id, season)
-        ).fetchall()
-        if not rows:
+        # The whole season (a traded player's stints summed). It used to take
+        # the stint with the most minutes, i.e. part of his season.
+        totals, _, _ = _player_season_line(conn, player_id, season)
+        if not totals:
             raise HTTPException(status_code=404, detail=f"No {season} regular-season row for this player.")
-        totals = dict(rows[0])  # traded players: the row where he logged the most minutes
     finally:
         conn.close()
 
@@ -2380,10 +2378,14 @@ def get_build_eras():
                 "FROM player_season_totals WHERE season = ? AND season_type = 'Regular Season'",
                 (season,),
             ).fetchone()
+            # Whole seasons: per team, a star traded mid-season could fall
+            # under the 50-game bar with both teams and vanish.
             scorers = conn.execute(
-                "SELECT p.full_name, t.pts*1.0/t.gp ppg FROM player_season_totals t "
+                "SELECT p.full_name, t.pts*1.0/t.gp ppg FROM "
+                "(SELECT player_id, SUM(pts) pts, SUM(gp) gp FROM player_season_totals "
+                " WHERE season = ? AND season_type = 'Regular Season' GROUP BY player_id) t "
                 "JOIN players p ON p.player_id = t.player_id "
-                "WHERE t.season = ? AND t.season_type = 'Regular Season' AND t.gp >= 50 "
+                "WHERE t.gp >= 50 "
                 "ORDER BY t.pts*1.0/t.gp DESC LIMIT 3",
                 (season,),
             ).fetchall()
@@ -3956,10 +3958,11 @@ def get_milestone_watch(limit: int = 25):
         # Seed pool: top current-season producers across categories.
         seed_rows = conn.execute(
             """
-            SELECT DISTINCT t.player_id, p.full_name
-            FROM player_season_totals t
+            SELECT t.player_id, p.full_name
+            FROM (SELECT player_id, SUM(pts) pts, SUM(gp) gp FROM player_season_totals
+                  WHERE season = ? AND season_type = 'Regular Season' GROUP BY player_id) t
             JOIN players p ON p.player_id = t.player_id
-            WHERE t.season = ? AND t.season_type = 'Regular Season' AND t.gp >= 30
+            WHERE t.gp >= 30
             ORDER BY t.pts DESC LIMIT 60
             """,
             (CURRENT_SEASON,),

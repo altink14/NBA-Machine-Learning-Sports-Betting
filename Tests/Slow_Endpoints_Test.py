@@ -150,6 +150,11 @@ class TestBuildDnaReadsRebounding(unittest.TestCase):
                   "fg3_pct REAL, ftm INTEGER, fta INTEGER, ft_pct REAL, oreb INTEGER, dreb INTEGER, pf INTEGER)")
         c.execute("INSERT INTO player_season_totals VALUES (9, '2024-25', 'Regular Season', 70, 2100, "
                   "1000, 900, 100, 50, 150, 80, 400, 700, 0.57, 5, 20, 0.25, 195, 300, 0.65, 300, 600, 180)")
+        # The season line is read through _player_season_line, which also
+        # looks up the team and the advanced row, as the real schema has them.
+        c.execute("ALTER TABLE player_season_totals ADD COLUMN team_id INTEGER")
+        c.execute("CREATE TABLE team_metadata (team_id INTEGER, abbreviation TEXT)")
+        c.execute("CREATE TABLE player_season_advanced (player_id INTEGER, season TEXT, season_type TEXT, team_id INTEGER, pace REAL)")
         reb = {"players": [{"player_id": 9, "reb": {"total": 900}, "oreb": {"total": 300}}]}
         with mock.patch.object(main_api, "get_db_conn", lambda: _KeepOpen(c)), \
              mock.patch.object(main_api, "get_shot_quality", return_value={"players": []}), \

@@ -831,6 +831,18 @@ def compute_and_save_player_season_aggregates(
             """,
             (season, season_type)
         )
+        # nba.com reports pace 0 and zero ratings for a player whose only
+        # appearance was a 0:00 check-in (a free-throw shooter); no player who
+        # played has a pace of 0, so those are unknown, not zero.
+        conn.execute(
+            """
+            UPDATE player_season_advanced
+            SET usg_pct = NULL, off_rating = NULL, def_rating = NULL, net_rating = NULL,
+                ast_pct = NULL, reb_pct = NULL, pace = NULL
+            WHERE season = ? AND season_type = ? AND pace = 0
+            """,
+            (season, season_type)
+        )
         # A traded player's stints: those fields are not known per team.
         conn.execute(
             """

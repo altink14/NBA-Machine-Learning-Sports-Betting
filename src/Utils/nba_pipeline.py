@@ -109,14 +109,19 @@ def save_players_and_game_log(
             (player_id, full_name, first_name, last_name)
         )
 
-        # Check if the player played
+        # Did he play? Minutes alone are not the test: nba.com records a
+        # player who came in to shoot a technical free throw, or checked in
+        # for a dead-ball second, as "0:00" with real points, fouls or
+        # rebounds. Skipping every 0:00 row dropped 14 such appearances from
+        # the archive (4 with points, so their team's players summed short of
+        # its score; found 2026-09-23 by audit_archive.py). A row is skipped
+        # only when he has no minutes AND no recorded stat.
         stats = p.get("statistics", {})
-        min_str = stats.get("minutes", "")
-        if not min_str or min_str.strip() == "":
-            continue
-
-        minutes = parse_minutes(min_str)
-        if minutes <= 0.0:
+        min_str = str(stats.get("minutes") or "").strip()
+        minutes = parse_minutes(min_str) if min_str else 0.0
+        counting = ("points", "reboundsTotal", "assists", "steals", "blocks", "turnovers",
+                    "foulsPersonal", "fieldGoalsAttempted", "freeThrowsAttempted")
+        if minutes <= 0.0 and not any(int(stats.get(k) or 0) for k in counting):
             continue
 
         fgm = int(stats.get("fieldGoalsMade", 0))

@@ -284,6 +284,53 @@ def _nba_games_expected(today: Optional[date] = None) -> bool:
     return True
 
 
+def refresh_play_by_play(season: str) -> bool:
+    """Fetch play-by-play for this season's new games, then rebuild the runs.
+
+    Added 2026-09-24. Play-by-play was in no scheduled job: every season was
+    backfilled by hand (backfill_pbp.py --season). The box-score backfill
+    does not ingest it, and on/off, clutch, comebacks, win probability, the
+    run detector and injury-impact pricing all read pbp_events, so from
+    opening night those pages would have stopped at the last game someone
+    remembered to fetch. backfill_pbp skips games it already holds, so this
+    costs one request per new game. It runs after the box-score backfill in
+    the same process: one stats.nba.com job at a time.
+
+    backfill_pbp exits 0 even when games fail, so its own summary line is
+    read. Outside the season there is nothing to fetch, which is not an error.
+    """
+    if not _nba_games_expected():
+        logger.info("Play-by-play: no NBA games expected; skipped.")
+        return True
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "backfill_pbp.py"), "--season", season],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=3600,
+            encoding="utf-8", errors="replace")
+        log = (r.stdout or "") + (r.stderr or "")
+        fetch = re.search(r"(\d+) to fetch", log)
+        fails = re.search(r"(\d+) failure\(s\)", log)
+        n_fetch = int(fetch.group(1)) if fetch else 0
+        n_fail = int(fails.group(1)) if fails else 0
+        if r.returncode != 0:
+            logger.error("Play-by-play backfill exited %s: %s", r.returncode, log.strip()[-500:])
+            return False
+        logger.info("Play-by-play %s: %d new game(s), %d failure(s).", season, n_fetch, n_fail)
+        if n_fetch > n_fail:
+            rr = subprocess.run(
+                [sys.executable, os.path.join(REPO_ROOT, "ingest_scoring_runs.py")],
+                cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800,
+                encoding="utf-8", errors="replace")
+            if rr.returncode != 0:
+                logger.error("Scoring-runs rebuild failed: %s", ((rr.stdout or "") + (rr.stderr or "")).strip()[-500:])
+                return False
+            logger.info("Scoring runs rebuilt.")
+        return n_fail == 0
+    except Exception as exc:
+        logger.error("Play-by-play refresh could not run: %s", exc, exc_info=True)
+        return False
+
+
 def grade_logged_predictions() -> bool:
     """Fill in final scores for yesterday's logged predictions, then price them.
 
@@ -471,6 +518,7 @@ def main() -> int:
     # April-June only, so the rest of the year costs nothing.
     if date.today().month in (4, 5, 6):
         backfill_ok = run_backfill(season, "Playoffs") and backfill_ok
+    pbp_ok = refresh_play_by_play(season)
     stats_ok = refresh_team_stats_snapshot()
     grading_ok = grade_logged_predictions()
     prediction_status = log_todays_predictions()
@@ -491,6 +539,8 @@ def main() -> int:
         failures.append("backfill")
     if not stats_ok:
         failures.append("team-stats refresh")
+    if not pbp_ok:
+        failures.append("play-by-play")
     if prediction_status == "failed":
         failures.append("prediction logging")
     # A failed snapshot only fails the task in season: July has no board, and

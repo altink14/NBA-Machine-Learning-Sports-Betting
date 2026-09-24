@@ -26,7 +26,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 # Resolve project root path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -369,11 +369,33 @@ def compute_and_save_season_stats(
         
         # 3. Aggregate metrics and save for each team
         timestamp = datetime.utcnow().isoformat()
-        
+
+        # The record comes from game_results (nba.com's league game log, one
+        # row per team per game) when it has the season: the box-score tables
+        # lack four games nba.com never serves an advanced box for, so counting
+        # wins from them put seven team-seasons a game or two short (the
+        # 1996-97 Sonics read 55-25; they went 57-25). The ratings below are
+        # still averaged over the games we hold.
+        true_records: Dict[int, Tuple[int, int]] = {}
+        try:
+            for r in conn.execute(
+                """
+                SELECT team_id, SUM(wl = 'W'), SUM(wl = 'L') FROM game_results
+                WHERE season = ? AND season_type = ? AND wl IN ('W', 'L')
+                GROUP BY team_id
+                """,
+                (season, season_type),
+            ):
+                true_records[r[0]] = (int(r[1]), int(r[2]))
+        except sqlite3.OperationalError:
+            pass  # no game_results table in this database: count the box scores
+
         for tid, games in team_games.items():
             # Calculate wins / losses
             wins = sum(1 for g in games if (g["pts"] or 0) > (g["opp_pts"] or 0))
             losses = sum(1 for g in games if (g["pts"] or 0) < (g["opp_pts"] or 0))
+            if tid in true_records:
+                wins, losses = true_records[tid]
             total_g = wins + losses
             win_pct = wins / total_g if total_g > 0 else 0.0
             

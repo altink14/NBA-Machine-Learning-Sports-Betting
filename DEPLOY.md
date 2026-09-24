@@ -225,7 +225,7 @@ disagree about something that already happened; find out which one is wrong.
 The authoritative, annotated list now lives in `.env.example` in each repo —
 those are kept in sync with the code. Summary:
 
-Backend: `DB_SNAPSHOT_URL`, `CORS_ORIGINS`, **`API_KEY`** (not optional once you
+Backend: `DB_SNAPSHOT_URL`, `CORS_ORIGINS`, **`INTERNAL_API_KEY`** (see the security notes), **`API_KEY`** (not optional once you
 charge for anything — unset, `/predictions` is served to anyone who finds the
 host, which is the product), `RATE_LIMIT_DEFAULT?`,
 `RATE_LIMIT_GLOBAL?`, `RATE_LIMIT_EXPENSIVE?`, `RATE_LIMIT_UPSTREAM?`,
@@ -251,7 +251,7 @@ Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `STRIPE_SECRET_KEY`,
 `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET`,
 `NEXT_PUBLIC_STRIPE_PRICE_*` (4x), `NEXT_PUBLIC_NBA_API_URL`,
-`NEXT_PUBLIC_SITE_URL`, `NBA_API_KEY?`, `ADMIN_SYNC_SECRET` (required once, see 2b — without it the first sale charges the card and grants nothing), `PREMIUM_BYPASS?` (local only).
+`NEXT_PUBLIC_SITE_URL`, `NBA_API_KEY?`, **`INTERNAL_API_KEY`** (same value as the backend's), `ADMIN_SYNC_SECRET` (required once, see 2b — without it the first sale charges the card and grants nothing), `PREMIUM_BYPASS?` (local only).
 
 ## Security notes — read before going live
 
@@ -264,6 +264,16 @@ Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
   are keyless by design — they're fetched directly from the browser. Set
   `NBA_API_KEY` on Vercel to the same value; the frontend attaches the header
   only from server-side route handlers.
+- **Set `INTERNAL_API_KEY` on BOTH services before the first deploy** (the
+  same long random string). The frontend renders most reference pages on its
+  server, so in production every visitor's page load reaches the API from a
+  few shared Vercel IPs, and the per-IP limits would be shared by all of them:
+  a crawler walking the ~41,000 sitemap URLs would be answered with 429s,
+  which is how pages drop out of a search index. Requests carrying the key are
+  the renderer and are not counted; browser traffic is limited per visitor as
+  before. nba.com stays safe because every outbound request is paced by one
+  lock in the backend. Checked locally 2026-09-24: 70 rapid requests with the
+  key all 200; without it, 429 after 60.
 - **Rate limits need real client IPs.** The Dockerfile passes
   `--forwarded-allow-ips="*"`; without it every request behind the platform
   proxy looks like one IP and `RATE_LIMIT_GLOBAL` becomes one shared bucket for

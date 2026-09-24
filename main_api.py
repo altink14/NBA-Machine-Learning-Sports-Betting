@@ -266,14 +266,47 @@ class _NoopLimiter:
         return func
 
 
+# INTERNAL_API_KEY: a secret shared with the Next.js server (never with the
+# browser: it is not a NEXT_PUBLIC_ variable). Added 2026-09-24, before the
+# first deploy. The frontend renders most reference pages on its server, so
+# in production every visitor's page load reaches this API from a handful of
+# Vercel IPs, and the per-IP limits below would be shared by ALL of them: a
+# crawler walking the ~41,000 sitemap URLs would be answered with 429s, which
+# is how pages vanish from a search index. A request carrying this key is our
+# own renderer and is not counted. That is safe for stats.nba.com because
+# every outbound request in this process now goes through one lock and one
+# minimum gap (_nba_slot / NBAStatsClient.outbound_slot), whatever the inbound
+# volume. Browser traffic is limited per visitor exactly as before. Unset =
+# no exemption (local dev, and a server that should not grant one).
+INTERNAL_API_KEY = (os.environ.get("INTERNAL_API_KEY") or "").strip()
+INTERNAL_KEY_HEADER = "X-Internal-Key"
+
+
+def _rate_limit_key(request: Request) -> str:
+    """Per-IP, except our own server-side renderer (INTERNAL_API_KEY)."""
+    supplied = request.headers.get(INTERNAL_KEY_HEADER) or ""
+    if INTERNAL_API_KEY and secrets.compare_digest(supplied, INTERNAL_API_KEY):
+        return f"internal:{secrets.token_hex(8)}"   # a fresh bucket: never fills
+    return get_remote_address(request)
+
+
 if SLOWAPI_AVAILABLE:
     limiter = Limiter(
-        key_func=get_remote_address,
+        key_func=_rate_limit_key,
         default_limits=[RATE_LIMIT_DEFAULT],
         application_limits=[RATE_LIMIT_GLOBAL],
     )
 else:
     limiter = _NoopLimiter()
+
+
+def _nba_slot(endpoint_name: str):
+    """One turn at stats.nba.com for a direct nba_api call (see
+    NBAStatsClient.outbound_slot): every outbound request in this process
+    shares one lock and one minimum gap, so no volume of inbound traffic can
+    turn into a burst against nba.com."""
+    from src.Utils.nba_stats_client import get_client
+    return get_client().outbound_slot(endpoint_name)
 
 # FastAPI App Setup
 app = FastAPI(
@@ -3817,7 +3850,8 @@ def _ensure_career_official(conn, player_id: int) -> None:
         return
 
     from nba_api.stats.endpoints import playercareerstats
-    data = playercareerstats.PlayerCareerStats(player_id=player_id, per_mode36="Totals").get_dict()
+    with _nba_slot("playercareerstats"):
+        data = playercareerstats.PlayerCareerStats(player_id=player_id, per_mode36="Totals").get_dict()
     sets = {rs["name"]: rs for rs in data["resultSets"]}
     now = datetime.utcnow().isoformat()
 
@@ -4137,7 +4171,8 @@ def _ensure_player_awards(conn, player_id: int) -> None:
     if row and row[0] and row[0] > (datetime.utcnow() - timedelta(days=7)).isoformat():
         return
     from nba_api.stats.endpoints import playerawards
-    data = playerawards.PlayerAwards(player_id=player_id).get_dict()
+    with _nba_slot("playerawards"):
+        data = playerawards.PlayerAwards(player_id=player_id).get_dict()
     rs = data["resultSets"][0]
     idx = {h: i for i, h in enumerate(rs["headers"])}
     now = datetime.utcnow().isoformat()
@@ -4226,7 +4261,8 @@ def get_team_coaches(abbr: str, season: str = CURRENT_SEASON):
         if not (cached and cached[0] and cached[0] > (datetime.utcnow() - timedelta(days=7)).isoformat()):
             try:
                 from nba_api.stats.endpoints import commonteamroster
-                data = commonteamroster.CommonTeamRoster(team_id=team_id, season=season).get_dict()
+                with _nba_slot("commonteamroster"):
+                    data = commonteamroster.CommonTeamRoster(team_id=team_id, season=season).get_dict()
                 coaches_rs = next((r for r in data["resultSets"] if r["name"] == "Coaches"), None)
                 if coaches_rs:
                     idx = {h: i for i, h in enumerate(coaches_rs["headers"])}
@@ -4351,7 +4387,8 @@ def _ensure_draft_history(conn) -> None:
         return
     logger.info("Fetching full NBA draft history from stats.nba.com (one-time)...")
     from nba_api.stats.endpoints import drafthistory
-    data = drafthistory.DraftHistory(league_id="00").get_dict()
+    with _nba_slot("drafthistory"):
+        data = drafthistory.DraftHistory(league_id="00").get_dict()
     rs = data["resultSets"][0]
     idx = {h: i for i, h in enumerate(rs["headers"])}
     now = datetime.utcnow().isoformat()
@@ -5041,20 +5078,21 @@ def get_shot_chart(request: Request, game_date: str, home_team: str):
             return shot_chart_cache[game_id]
             
         logger.info(f"Fetching shot chart detail from NBA Stats API for game: {game_id}")
-        sc = shotchartdetail.ShotChartDetail(
-            team_id=0,
-            player_id=0,
-            game_id_nullable=game_id,
-            context_measure_simple="FGA",
-            # From the game id, not hardcoded. This was "Regular Season" for
-            # every game, and shotchartdetail filters by season type, so a
-            # playoff game id matched nothing: every playoff shot chart came
-            # back HTTP 200 with shots: [] and a full league-average block
-            # beside it, which looks like a healthy response with no shots.
-            season_type_all_star={"004": "Playoffs", "005": "PlayIn",
-                                  "001": "Pre Season"}.get(str(game_id)[:3],
-                                                         "Regular Season")
-        )
+        with _nba_slot("shotchartdetail"):
+            sc = shotchartdetail.ShotChartDetail(
+                team_id=0,
+                player_id=0,
+                game_id_nullable=game_id,
+                context_measure_simple="FGA",
+                # From the game id, not hardcoded. This was "Regular Season" for
+                # every game, and shotchartdetail filters by season type, so a
+                # playoff game id matched nothing: every playoff shot chart came
+                # back HTTP 200 with shots: [] and a full league-average block
+                # beside it, which looks like a healthy response with no shots.
+                season_type_all_star={"004": "Playoffs", "005": "PlayIn",
+                                      "001": "Pre Season"}.get(str(game_id)[:3],
+                                                             "Regular Season")
+            )
         data = sc.get_dict()
         
         result_sets = data.get("resultSets", [])
@@ -5171,13 +5209,14 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
     try:
         logger.info(f"Fetching shot chart detail from NBA stats API for player: {player_id}, "
                     f"season: {season}, season_type: {season_type}")
-        shot_chart = shotchartdetail.ShotChartDetail(
-            player_id=player_id,
-            team_id=0,
-            season_nullable=season,
-            context_measure_simple="FGA",
-            season_type_all_star=season_type
-        )
+        with _nba_slot("shotchartdetail"):
+            shot_chart = shotchartdetail.ShotChartDetail(
+                player_id=player_id,
+                team_id=0,
+                season_nullable=season,
+                context_measure_simple="FGA",
+                season_type_all_star=season_type
+            )
         data = shot_chart.get_dict()
         
         result_sets = data.get("resultSets", [])
@@ -5334,19 +5373,21 @@ def get_player_stats(request: Request, season: str = "2025-26", per_mode: str = 
         logger.info(f"Fetching league-wide player stats for season: {season}, per_mode: {per_mode}")
         
         # 1. Fetch Base stats
-        base_endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
-            season=season,
-            per_mode_detailed=per_mode,
-            measure_type_detailed_defense="Base"
-        )
+        with _nba_slot("leaguedashplayerstats"):
+            base_endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
+                season=season,
+                per_mode_detailed=per_mode,
+                measure_type_detailed_defense="Base"
+            )
         base_df = base_endpoint.get_data_frames()[0]
         
         # 2. Fetch Advanced stats
-        adv_endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
-            season=season,
-            per_mode_detailed=per_mode,
-            measure_type_detailed_defense="Advanced"
-        )
+        with _nba_slot("leaguedashplayerstats"):
+            adv_endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
+                season=season,
+                per_mode_detailed=per_mode,
+                measure_type_detailed_defense="Advanced"
+            )
         adv_df = adv_endpoint.get_data_frames()[0]
         
         if base_df.empty or adv_df.empty:
@@ -5970,7 +6011,8 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                     try:
                         logger.info(f"Cache miss: Fetching player bio from NBA stats API for player ID {id}")
                         # Fetch from CommonPlayerInfo
-                        info = commonplayerinfo.CommonPlayerInfo(player_id=id)
+                        with _nba_slot("commonplayerinfo"):
+                            info = commonplayerinfo.CommonPlayerInfo(player_id=id)
                         df = info.get_data_frames()[0]
                         if not df.empty:
                             row_data = df.iloc[0].to_dict()
@@ -8300,20 +8342,21 @@ def get_game_shot_chart(request: Request, game_id: str):
 
     try:
         logger.info(f"Fetching shot chart detail from NBA Stats API for game: {game_id}")
-        sc = shotchartdetail.ShotChartDetail(
-            team_id=0,
-            player_id=0,
-            game_id_nullable=game_id,
-            context_measure_simple="FGA",
-            # From the game id, not hardcoded. This was "Regular Season" for
-            # every game, and shotchartdetail filters by season type, so a
-            # playoff game id matched nothing: every playoff shot chart came
-            # back HTTP 200 with shots: [] and a full league-average block
-            # beside it, which looks like a healthy response with no shots.
-            season_type_all_star={"004": "Playoffs", "005": "PlayIn",
-                                  "001": "Pre Season"}.get(str(game_id)[:3],
-                                                         "Regular Season")
-        )
+        with _nba_slot("shotchartdetail"):
+            sc = shotchartdetail.ShotChartDetail(
+                team_id=0,
+                player_id=0,
+                game_id_nullable=game_id,
+                context_measure_simple="FGA",
+                # From the game id, not hardcoded. This was "Regular Season" for
+                # every game, and shotchartdetail filters by season type, so a
+                # playoff game id matched nothing: every playoff shot chart came
+                # back HTTP 200 with shots: [] and a full league-average block
+                # beside it, which looks like a healthy response with no shots.
+                season_type_all_star={"004": "Playoffs", "005": "PlayIn",
+                                      "001": "Pre Season"}.get(str(game_id)[:3],
+                                                             "Regular Season")
+            )
         data = sc.get_dict()
         
         result_sets = data.get("resultSets", [])

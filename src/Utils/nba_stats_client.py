@@ -14,6 +14,7 @@ import logging
 import os
 import tempfile
 import time
+import contextlib
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -184,6 +185,31 @@ class NBAStatsClient:
         self._lock = threading.Lock()
         self._last_request_time: float = 0.0
         self._rate_delay = _BACKFILL_RATE_DELAY if backfill_mode else rate_delay
+
+    @contextlib.contextmanager
+    def outbound_slot(self, endpoint_name: str):
+        """Take this process's one turn at stats.nba.com for a call made elsewhere.
+
+        Added 2026-09-24. main_api.py calls several nba_api endpoints directly
+        (career stats, awards, rosters, draft history, shot charts, the
+        league dashboard, player info) instead of through _fetch, so those
+        calls skipped this client's spacing and the only thing protecting
+        stats.nba.com from a burst was the per-visitor route limit. Wrapping
+        each one in this slot puts every outbound request in the process on
+        the same lock and the same minimum gap, whoever asked for it:
+
+            with get_client().outbound_slot("playercareerstats"):
+                data = playercareerstats.PlayerCareerStats(...).get_dict()
+        """
+        with self._lock:
+            wait = self._rate_delay - (time.time() - self._last_request_time)
+            if wait > 0:
+                time.sleep(wait)
+            logger.info("Outbound request to stats.nba.com for %s (direct)", endpoint_name)
+            try:
+                yield
+            finally:
+                self._last_request_time = time.time()
 
     def _fetch(
         self,

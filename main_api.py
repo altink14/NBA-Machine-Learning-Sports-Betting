@@ -5841,6 +5841,86 @@ def _bio_lock(player_id: int) -> threading.Lock:
             lock = _BIO_FETCH_LOCKS[player_id] = threading.Lock()
         return lock
 
+
+# --- A player's season, whole ---------------------------------------------
+#
+# player_season_totals and player_season_advanced hold one row per TEAM. For
+# a player traded mid-season (about 80 a season) that caused, found
+# 2026-09-23:
+#   - /api/players/{id} took "LIMIT 1" with no order, so the player page's
+#     season line was an arbitrary one of his partial stints;
+#   - the backfill creates every advanced row with 0.0 placeholders for usage,
+#     the ratings, AST%/REB% and pace, then fills them from nba.com's
+#     leaguedashplayerstats, matched on team. nba.com gives a traded player ONE
+#     row for his whole season, filed under his latest team, so that stint row
+#     got whole-season numbers and his other stints kept the zeros (1,988 rows
+#     over 30 seasons that read as real 0.0s).
+# The season line is now built from all his stints: counting stats summed,
+# shooting rates recomputed from makes and attempts, and usage, ratings and
+# pace taken from nba.com's whole-season row. A stint's usage, ratings and
+# pace are not known (nba.com was never asked per team), so they are None,
+# never 0.0; its TS%, eFG% and TOV% are exact from the stint's own totals.
+
+_SEASON_ONLY_ADV = ("usg_pct", "off_rating", "def_rating", "net_rating", "ast_pct", "reb_pct", "pace")
+_TOTAL_COLS = ("gp", "gs", "min", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "oreb", "dreb",
+               "reb", "ast", "stl", "blk", "tov", "pf", "pts")
+
+
+def _shooting_rates(t: dict) -> dict:
+    fga, fta, fgm, fg3m = t.get("fga") or 0, t.get("fta") or 0, t.get("fgm") or 0, t.get("fg3m") or 0
+    pts, tov = t.get("pts") or 0, t.get("tov") or 0
+    ts_den = 2.0 * (fga + 0.44 * fta)
+    tov_den = fga + 0.44 * fta + tov
+    return {
+        "ts_pct": pts / ts_den if ts_den > 0 else None,
+        "efg_pct": (fgm + 0.5 * fg3m) / fga if fga > 0 else None,
+        "tov_pct": tov / tov_den if tov_den > 0 else None,
+    }
+
+
+def _placeholder_free(adv: dict) -> dict:
+    """The backfill's 0.0 placeholders (never filled) become None. Pace is
+    never really 0 for a player who played, so pace == 0 marks an unfilled row."""
+    out = dict(adv)
+    if not out.get("pace"):
+        for k in _SEASON_ONLY_ADV:
+            out[k] = None
+    return out
+
+
+def _nba_season_rates(conn, player_id: int, season: str, season_type: str) -> dict:
+    row = conn.execute(
+        "SELECT usg_pct, off_rating, def_rating, net_rating, ast_pct, reb_pct, pace "
+        "FROM player_season_stats WHERE player_id = ? AND season = ? AND season_type = ? "
+        "ORDER BY gp DESC LIMIT 1", (player_id, season, season_type)).fetchone()
+    return dict(row) if row else {k: None for k in _SEASON_ONLY_ADV}
+
+
+def _player_season_line(conn, player_id: int, season: str, season_type: str = "Regular Season"):
+    """(totals, advanced, n_teams) for a player's whole season; ({}, {}, 0) if none."""
+    stints = [dict(r) for r in conn.execute(
+        "SELECT t.*, (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) AS team_abbr "
+        "FROM player_season_totals t WHERE t.player_id = ? AND t.season = ? AND t.season_type = ?",
+        (player_id, season, season_type)).fetchall()]
+    if not stints:
+        return {}, {}, 0
+    if len(stints) == 1:
+        totals = stints[0]
+        adv_row = conn.execute(
+            "SELECT * FROM player_season_advanced WHERE player_id = ? AND season = ? AND season_type = ? AND team_id = ?",
+            (player_id, season, season_type, totals["team_id"])).fetchone()
+        return totals, _placeholder_free(dict(adv_row)) if adv_row else {}, 1
+    totals = {k: sum((st.get(k) or 0) for st in stints) for k in _TOTAL_COLS}
+    totals.update(player_id=player_id, season=season, season_type=season_type, team_id=None)
+    for pct, made, att in (("fg_pct", "fgm", "fga"), ("fg3_pct", "fg3m", "fg3a"), ("ft_pct", "ftm", "fta")):
+        totals[pct] = totals[made] / totals[att] if totals[att] else None
+    totals["team_abbr"] = (_teams_in_order(conn, player_id, season, season_type)
+                           or "/".join(st["team_abbr"] or "?" for st in stints))
+    advanced = {"player_id": player_id, "season": season, "season_type": season_type, "team_id": None,
+                **_nba_season_rates(conn, player_id, season, season_type), **_shooting_rates(totals)}
+    return totals, advanced, len(stints)
+
+
 @app.get("/api/players/{id}")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
@@ -5975,31 +6055,10 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                     except Exception as e:
                         logger.error(f"Error fetching CommonPlayerInfo for player ID {id}: {e}", exc_info=True)
         
-        # 2. Fetch current season totals
-        cursor.execute(
-            """
-            SELECT t.*,
-                   (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
-            FROM player_season_totals t
-            WHERE t.player_id = ? AND t.season = ? AND t.season_type = 'Regular Season'
-            LIMIT 1
-            """,
-            (id, season)
-        )
-        totals_row = cursor.fetchone()
-        totals = dict(totals_row) if totals_row else {}
-        
-        # 3. Fetch current season advanced stats
-        cursor.execute(
-            """
-            SELECT * FROM player_season_advanced
-            WHERE player_id = ? AND season = ? AND season_type = 'Regular Season'
-            LIMIT 1
-            """,
-            (id, season)
-        )
-        adv_row = cursor.fetchone()
-        advanced = dict(adv_row) if adv_row else {}
+        # 2-3. The season, whole: every stint for a traded player, and real
+        # advanced figures (see _player_season_line; this was "LIMIT 1" with
+        # no order, an arbitrary partial stint).
+        totals, advanced, _ = _player_season_line(conn, id, season)
         
         # 4. Construct response
         team_abbr = totals.get("team_abbr") or bio_data.get("team_abbr") or "N/A"
@@ -6316,29 +6375,41 @@ def get_player_splits_api(id: int, season: str = CURRENT_SEASON, season_type: st
 @app.get("/api/players/{id}/career")
 def get_player_career(id: int):
     """
-    Fetch player career aggregates (season-by-season totals and advanced statistics).
+    Season-by-season totals and advanced stats. A season with more than one
+    team has a TOT row first (is_total, the whole season) and then a row per
+    stint in the order he played for them, as basketball-reference shows it.
+    A stint's usage, ratings and pace are None: nba.com reports those per
+    season, not per team. Its TS%, eFG% and TOV% come from its own totals.
     """
     conn = get_db_conn()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
+        rows = [dict(r) for r in conn.execute(
             """
-            SELECT t.*, a.ts_pct, a.usg_pct, a.off_rating, a.def_rating, a.net_rating, a.pace,
+            SELECT t.*, a.ts_pct, a.efg_pct, a.tov_pct, a.usg_pct, a.off_rating, a.def_rating,
+                   a.net_rating, a.ast_pct, a.reb_pct, a.pace,
                    (SELECT abbreviation FROM team_metadata WHERE team_id = t.team_id) as team_abbr
             FROM player_season_totals t
             LEFT JOIN player_season_advanced a ON t.player_id = a.player_id AND t.season = a.season AND t.season_type = a.season_type AND t.team_id = a.team_id
             WHERE t.player_id = ?
-            ORDER BY t.season DESC
+            ORDER BY t.season DESC, t.season_type DESC
             """,
-            (id,)
-        )
-        rows = cursor.fetchall()
-        
-        results = []
+            (id,)).fetchall()]
+        groups: dict = {}
         for r in rows:
-            rec = dict(r)
-            results.append(rec)
-            
+            groups.setdefault((r["season"], r["season_type"]), []).append(r)
+        results = []
+        for (season, season_type), stints in groups.items():
+            if len(stints) == 1:
+                results.append(_placeholder_free(stints[0]))
+                continue
+            totals, advanced, _ = _player_season_line(conn, id, season, season_type)
+            results.append({**totals, **{k: advanced.get(k) for k in
+                            ("ts_pct", "efg_pct", "tov_pct") + _SEASON_ONLY_ADV},
+                            "team_abbr": "TOT", "teams": totals.get("team_abbr"), "is_total": True})
+            order = (totals.get("team_abbr") or "").split("/")
+            stints.sort(key=lambda st: order.index(st["team_abbr"]) if st["team_abbr"] in order else 99)
+            for st in stints:
+                results.append({**st, **_shooting_rates(st), **{k: None for k in _SEASON_ONLY_ADV}})
         return results
     except Exception as e:
         logger.error(f"Error fetching player career stats: {e}", exc_info=True)

@@ -766,6 +766,16 @@ def compute_and_save_player_season_aggregates(
         logger.info("Computed player_season_totals successfully.")
 
         # 2. Compute and save player_season_advanced (step 1: base stats; step 2: merge from stats cache)
+        #
+        # Unknown is NULL, never 0.0 (fixed 2026-09-23). This used to insert
+        # 0.0 placeholders for usage, the ratings, AST%/REB% and pace and rely
+        # on step 2 to fill them; step 2 matches nba.com's rows on team, and
+        # nba.com gives a traded player ONE row for his whole season under his
+        # latest team, so his other stints kept zeros that read as real 0.0s
+        # (1,988 rows) and his latest stint was given whole-season numbers.
+        # Those fields are season figures from nba.com, so they are filled
+        # only for a player with a single team that season; a traded
+        # player's season line is assembled by the API (_player_season_line).
         conn.execute(
             """
             INSERT INTO player_season_advanced (
@@ -775,16 +785,16 @@ def compute_and_save_player_season_aggregates(
             )
             SELECT 
                 player_id, season, season_type, team_id,
-                CASE WHEN (fga + 0.44 * fta) > 0 THEN CAST(pts as REAL) / (2.0 * (fga + 0.44 * fta)) ELSE 0.0 END as ts_pct,
-                0.0 as usg_pct,
-                0.0 as off_rating,
-                0.0 as def_rating,
-                0.0 as net_rating,
-                0.0 as ast_pct,
-                0.0 as reb_pct,
-                CASE WHEN fga > 0 THEN CAST(fgm + 0.5 * fg3m as REAL) / fga ELSE 0.0 END as efg_pct,
-                CASE WHEN (fga + 0.44 * fta + tov) > 0 THEN CAST(tov as REAL) / (fga + 0.44 * fta + tov) ELSE 0.0 END as tov_pct,
-                0.0 as pace
+                CASE WHEN (fga + 0.44 * fta) > 0 THEN CAST(pts as REAL) / (2.0 * (fga + 0.44 * fta)) END as ts_pct,
+                NULL as usg_pct,
+                NULL as off_rating,
+                NULL as def_rating,
+                NULL as net_rating,
+                NULL as ast_pct,
+                NULL as reb_pct,
+                CASE WHEN fga > 0 THEN CAST(fgm + 0.5 * fg3m as REAL) / fga END as efg_pct,
+                CASE WHEN (fga + 0.44 * fta + tov) > 0 THEN CAST(tov as REAL) / (fga + 0.44 * fta + tov) END as tov_pct,
+                NULL as pace
             FROM player_season_totals
             WHERE season = ? AND season_type = ?
             ON CONFLICT(player_id, season, season_type, team_id) DO UPDATE SET
@@ -814,6 +824,24 @@ def compute_and_save_player_season_aggregates(
                     AND s.season_type = player_season_advanced.season_type 
                     AND s.team_id = player_season_advanced.team_id
               )
+              AND (SELECT COUNT(*) FROM player_season_totals t
+                   WHERE t.player_id = player_season_advanced.player_id
+                     AND t.season = player_season_advanced.season
+                     AND t.season_type = player_season_advanced.season_type) = 1
+            """,
+            (season, season_type)
+        )
+        # A traded player's stints: those fields are not known per team.
+        conn.execute(
+            """
+            UPDATE player_season_advanced
+            SET usg_pct = NULL, off_rating = NULL, def_rating = NULL, net_rating = NULL,
+                ast_pct = NULL, reb_pct = NULL, pace = NULL
+            WHERE season = ? AND season_type = ?
+              AND (SELECT COUNT(*) FROM player_season_totals t
+                   WHERE t.player_id = player_season_advanced.player_id
+                     AND t.season = player_season_advanced.season
+                     AND t.season_type = player_season_advanced.season_type) > 1
             """,
             (season, season_type)
         )

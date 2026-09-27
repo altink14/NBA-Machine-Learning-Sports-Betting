@@ -98,11 +98,11 @@ def main() -> int:
 
         rows = conn.execute(
             """
-            SELECT game_id, period, elapsed_seconds, action_number,
+            SELECT game_id, period, elapsed_seconds, action_id,
                    score_home, score_away
             FROM pbp_events
             WHERE score_home IS NOT NULL AND score_away IS NOT NULL
-            ORDER BY game_id, period, elapsed_seconds, action_number
+            ORDER BY game_id, period, elapsed_seconds, action_id
             """
         ).fetchall()
         logger.info("Scoring-capable events: %d", len(rows))

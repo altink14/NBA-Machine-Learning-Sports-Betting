@@ -3,7 +3,8 @@
 Found 2026-09-23. The boards were the top N by season TOTAL re-ranked per
 game on the page, so a per-game leader outside the top N vanished; a traded
 player was two partial players; and the attempt minimums were never scaled
-to a short season. Temp database only.
+to a short season. Fixed 2026-09-27: the percentage minimums count MAKES, as
+the NBA's rule does, not attempts. Temp database only.
 """
 import math
 import sqlite3
@@ -85,12 +86,33 @@ class LeagueLeadersTest(unittest.TestCase):
         self.assertEqual((pts[0]["gp"], pts[0]["pts"], pts[0]["team_abbr"]), (70, 1500, "CCC/BBB"))
         self.assertAlmostEqual(out["boards"]["fg_pct"][0]["fg_pct"], 590 / 1000)
 
-    def test_attempt_minimums_scale_with_a_short_season(self):
+    def test_shooting_minimums_scale_with_a_short_season(self):
         c = _db(team_games=50)
         rules = self.board(c, "fg_pct")["rules"]
         self.assertEqual(rules["team_games"], 50)
         self.assertEqual(rules["min_games"], 35)
-        self.assertEqual(rules["min_attempts"]["fg_pct"], math.ceil(300 * 50 / 82))
+        self.assertEqual(rules["min_makes"]["fg_pct"], math.ceil(300 * 50 / 82))
+
+    def test_percentage_minimums_count_makes_not_attempts(self):
+        # 2025-26 as it happened: Poeltl shot 217-310 (70.0%) and cleared a
+        # 300-ATTEMPT bar, but the NBA's rule is 300 MADE, which he missed;
+        # Gobert (335-491) is the league's FG% leader.
+        c = _db()
+        _player(c, 1, "Poeltl", 1, gp=46, fgm=217, fga=310)
+        _player(c, 2, "Gobert", 1, gp=76, fgm=335, fga=491)
+        out = self.board(c, "fg_pct")
+        self.assertEqual(out["rules"]["min_makes"], {"fg_pct": 300, "fg3_pct": 82, "ft_pct": 125})
+        self.assertNotIn("min_attempts", out["rules"])
+        self.assertEqual([r["full_name"] for r in out["boards"]["fg_pct"]], ["Gobert"])
+
+    def test_percentage_boards_have_no_games_floor(self):
+        # The NBA sets no games-played minimum for FG/3P/FT%: Curry's 204 made
+        # free throws in 43 games (under 70% of 82) qualify him.
+        c = _db()
+        _player(c, 30, "Curry", 1, gp=43, ftm=204, fta=221)
+        _player(c, 31, "Short Of Makes", 1, gp=82, ftm=124, fta=125)
+        rows = self.board(c, "ft_pct")["boards"]["ft_pct"]
+        self.assertEqual([r["full_name"] for r in rows], ["Curry"])
 
     def test_single_board_default_is_still_by_total(self):
         c = _db()

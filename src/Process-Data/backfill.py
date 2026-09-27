@@ -736,7 +736,7 @@ def compute_and_save_player_season_aggregates(
                 tga.season_type,
                 pgl.team_id,
                 COUNT(pgl.id) as gp,
-                SUM(pgl.starter) as gs,
+                CASE WHEN COUNT(pgl.starter) = COUNT(pgl.id) THEN SUM(pgl.starter) END as gs,  -- unknown if any game is
                 SUM(pgl.min) as min,
                 SUM(pgl.fgm) as fgm,
                 SUM(pgl.fga) as fga,
@@ -895,7 +895,7 @@ def compute_and_save_player_season_aggregates(
                 'Location' as split_type,
                 CASE WHEN pgl.team_id = bs.home_team_id THEN 'Home' ELSE 'Road' END as split_value,
                 COUNT(pgl.id) as gp,
-                SUM(pgl.starter) as gs,
+                CASE WHEN COUNT(pgl.starter) = COUNT(pgl.id) THEN SUM(pgl.starter) END as gs,  -- unknown if any game is
                 SUM(pgl.min) as min,
                 SUM(pgl.pts) as pts,
                 SUM(pgl.reb) as reb,
@@ -956,7 +956,7 @@ def compute_and_save_player_season_aggregates(
                 'Wins/Losses' as split_type,
                 CASE WHEN tga.pts > tga.opp_pts THEN 'Wins' ELSE 'Losses' END as split_value,
                 COUNT(pgl.id) as gp,
-                SUM(pgl.starter) as gs,
+                CASE WHEN COUNT(pgl.starter) = COUNT(pgl.id) THEN SUM(pgl.starter) END as gs,  -- unknown if any game is
                 SUM(pgl.min) as min,
                 SUM(pgl.pts) as pts,
                 SUM(pgl.reb) as reb,
@@ -1030,7 +1030,7 @@ def compute_and_save_player_season_aggregates(
                     ELSE 'Unknown'
                 END as split_value,
                 COUNT(pgl.id) as gp,
-                SUM(pgl.starter) as gs,
+                CASE WHEN COUNT(pgl.starter) = COUNT(pgl.id) THEN SUM(pgl.starter) END as gs,  -- unknown if any game is
                 SUM(pgl.min) as min,
                 SUM(pgl.pts) as pts,
                 SUM(pgl.reb) as reb,

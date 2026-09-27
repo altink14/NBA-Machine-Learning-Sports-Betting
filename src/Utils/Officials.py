@@ -60,7 +60,7 @@ def compute_officials(
 ) -> Dict[str, Any]:
     """Per-official profiles. When odds_conn is given, two market facts join
     the box-score facts for games that have a closing line on file (2007-08 to
-    2022-23, see Market.py): whether the game went OVER the closing total and
+    2023-24, see Market.py): whether the game went OVER the closing total and
     whether the HOME side covered the closing spread. Both are counts against
     a season-matched baseline, exactly like home win rate; pushes are skipped.
     They describe the games an official was assigned, not how he called them."""
@@ -263,7 +263,7 @@ def compute_officials(
         },
         "market_note": (
             "Over % and Home ATS % use closing lines from the historical odds dataset "
-            "(2007-08 to 2022-23) for the games that have one; pushes are skipped and "
+            f"({_market.FIRST_SEASON} to {_market.LAST_SEASON}) for the games that have one; pushes are skipped and "
             "the baseline is the league rate over the same seasons. A crew is not "
             "assigned at random, so these describe the games an official was given, "
             "not how he called them, and they are not a betting edge. With eighty-odd "

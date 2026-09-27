@@ -320,9 +320,12 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
         names.update(roster["names"])
 
         events = conn.execute(
-            "SELECT action_number, period, clock_seconds, team_tricode, person_id, "
+            "SELECT action_id, period, clock_seconds, team_tricode, person_id, "
             "action_type, sub_type, description, score_home, score_away "
-            "FROM pbp_events WHERE game_id = ? ORDER BY action_number",
+            # action_id is the feed's sequence; action_number is not time
+            # order and put substitutions out of place (OKC 2025-26 dropped
+            # 31 of 335 periods that way, 5 in feed order).
+            "FROM pbp_events WHERE game_id = ? ORDER BY action_id",
             (game_id,),
         ).fetchall()
         if not events:

@@ -90,7 +90,7 @@ def save_players_and_game_log(
     team_id: int
 ) -> None:
     """Save player records and player game logs to the database."""
-    for p in players_list:
+    for list_index, p in enumerate(players_list):
         player_id = int(p["personId"])
         first_name = p.get("firstName", "")
         last_name = p.get("familyName", "")
@@ -143,7 +143,12 @@ def save_players_and_game_log(
         pf = int(stats.get("foulsPersonal", 0))
         pts = int(stats.get("points", 0))
         plus_minus = float(stats.get("plusMinusPoints", 0.0))
-        starter = 1 if p.get("position") else 0
+        # nba.com lists each team's five starters first. `position` is NOT the
+        # test: before 2017-18 the feed gives every player who played his
+        # roster position, which flagged every appearance a start and made GS
+        # a copy of GP (repair_starters.py). From 2017-18 the two rules agree
+        # on every player-game.
+        starter = 1 if list_index < 5 else 0
 
         db_conn.execute(
             """

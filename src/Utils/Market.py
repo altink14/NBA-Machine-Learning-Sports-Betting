@@ -6,7 +6,10 @@ What the betting market said before an archived game, next to what happened.
 THE LINES are the closing spread, total and moneylines from the historical
 odds dataset this project has always trained on (Data/OddsData.sqlite,
 tables odds_2007-08 .. odds_2022-23, one row per regular-season or playoff
-game, 20,477 games). They are the market's final word before tip-off; we did
+game, 20,477 games), plus odds_2023-24_new, the one season that exists only
+in the *_new copy (1,195 games; key numbers has always read it; added here
+2026-09-27). The *_new copies of the earlier seasons hold the same lines with
+ISO dates, so they are not read twice. They are the market's final word before tip-off; we did
 not set them and we do not adjust them. Nothing here is a Betting Buddy
 prediction and nothing here says the model would have beaten these lines -
 profitability has never been measured, and this module does not measure it.
@@ -45,7 +48,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 FIRST_SEASON = "2007-08"
-LAST_SEASON = "2022-23"
+LAST_SEASON = "2023-24"
 
 #: Seasons whose Spread column is signed (positive = home favoured). The key
 #: numbers endpoint reads the *_new tables, which add 2023-24; see
@@ -78,7 +81,10 @@ _lines: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None  # (date, home_fu
 
 
 def _to_iso(date_key: str) -> str:
-    """'2015-16-1027' -> '2015-10-27'. Months 10-12 belong to the first year."""
+    """'2015-16-1027' -> '2015-10-27'. Months 10-12 belong to the first year.
+    The *_new tables already store '2023-10-24'; those pass through."""
+    if len(date_key) == 10 and date_key[4] == "-" and date_key[7] == "-":
+        return date_key
     season, mmdd = date_key.rsplit("-", 1)
     y1 = int(season[:4])
     month = int(mmdd[:2])
@@ -111,15 +117,20 @@ def _load(odds_conn: sqlite3.Connection) -> Dict[Tuple[str, str], Dict[str, Any]
         if _lines is not None:
             return _lines
         out: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        tables = [
+        names = {
             r[0]
             for r in odds_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name LIKE 'odds_2%' AND name NOT LIKE '%_new' ORDER BY name"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'odds_2%'"
             )
-        ]
+        }
+        # One table per season: the original where it exists, otherwise the
+        # *_new copy (2023-24 exists only there).
+        tables = sorted(
+            {n for n in names if not n.endswith("_new")}
+            | {n for n in names if n.endswith("_new") and n[: -len("_new")] not in names}
+        )
         for tb in tables:
-            season = tb[len("odds_"):]
+            season = tb[len("odds_"):].replace("_new", "")
             cur = odds_conn.execute(
                 f'SELECT Date, Home, Away, OU, Spread, ML_Home, ML_Away, Points, Win_Margin, '
                 f'Days_Rest_Home, Days_Rest_Away FROM "{tb}"'
@@ -280,6 +291,22 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
         return {"season": season, "season_type": season_type, "available": False,
                 "coverage": {"first_season": FIRST_SEASON, "last_season": LAST_SEASON}, "teams": []}
     lines = _load(odds_conn)
+    # Straight-up records come from the league game log, every game the team
+    # played, not only the games that have a closing line: counting SU inside
+    # the graded loop showed the 2022-23 76ers 54-27 (their record is 54-28)
+    # and Boston 56-25 (57-25). ATS, O/U and favourite/underdog keep their
+    # own n - the games with a line.
+    su_by_abbr: Dict[str, List[int]] = {}
+    for abbr, w, l in team_conn.execute(
+        """
+        SELECT m.abbreviation, SUM(g.wl = 'W'), SUM(g.wl = 'L')
+        FROM game_results g JOIN team_metadata m ON m.team_id = g.team_id
+        WHERE g.season = ? AND g.season_type = ?
+        GROUP BY m.abbreviation
+        """,
+        (season, season_type),
+    ):
+        su_by_abbr[abbr] = [int(w or 0), int(l or 0)]
     rows = team_conn.execute(
         """
         SELECT b.game_id, b.game_date, b.home_team_id, b.away_team_id,
@@ -299,7 +326,7 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
     def blank(name: str, abbr: str) -> Dict[str, Any]:
         return {
             "team": name, "abbr": abbr, "games": 0, "graded": 0,
-            "su": [0, 0], "ats": [0, 0, 0], "ou": [0, 0, 0],
+            "su_lined": [0, 0], "ats": [0, 0, 0], "ou": [0, 0, 0],
             "as_favorite": [0, 0], "as_underdog": [0, 0],
             "spread_sum": 0.0, "cover_sum": 0.0, "lined": 0, "total_sum": 0.0, "points_sum": 0.0,
             "biggest_upset": None,  # largest fair-prob deficit that still won
@@ -325,10 +352,11 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
         th["graded"] += 1
         ta["graded"] += 1
 
-        # straight up
+        # straight up, lined games only: the league strip compares home
+        # teams' SU with their ATS over the same games. Team SU is below.
         hw = r["winner"] == "home"
-        th["su"][0 if hw else 1] += 1
-        ta["su"][1 if hw else 0] += 1
+        th["su_lined"][0 if hw else 1] += 1
+        ta["su_lined"][1 if hw else 0] += 1
         league["home_su"][0 if hw else 1] += 1
 
         # against the spread
@@ -378,7 +406,10 @@ def season_market(team_conn: sqlite3.Connection, odds_conn: sqlite3.Connection, 
         ats_dec = t["ats"][0] + t["ats"][1]
         out_teams.append({
             "team": t["team"], "abbr": t["abbr"], "games": t["games"], "graded": n,
-            "su": t["su"], "ats": t["ats"], "ou": t["ou"],
+            # su: the team's full record (game log); su_lined: the same over
+            # the `graded` games that had a closing line.
+            "su": su_by_abbr.get(t["abbr"]),
+            "su_lined": t["su_lined"], "ats": t["ats"], "ou": t["ou"],
             "as_favorite": t["as_favorite"], "as_underdog": t["as_underdog"],
             "ats_pct": round(100 * t["ats"][0] / ats_dec, 1) if ats_dec else None,
             "over_pct": round(100 * t["ou"][0] / (t["ou"][0] + t["ou"][1]), 1) if (t["ou"][0] + t["ou"][1]) else None,

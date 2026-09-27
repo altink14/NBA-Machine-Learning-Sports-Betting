@@ -59,6 +59,7 @@ from src.Utils import BuildLab as build_lab
 _buildlab_era_cache: dict = {}
 from src.Utils import ClutchLedger as clutch_ledger
 from src.Utils import devig
+from src.Utils import odds_board
 from src.Utils import elo as elo_engine
 from src.Utils import nba_live
 from src.Utils.tools import create_todays_games_from_odds
@@ -1994,130 +1995,37 @@ def _parlay_correlation_matrix() -> Dict[str, Any]:
 
 
 # --- Line shop -------------------------------------------------------------------
-# The latest quote per (game, book) from the odds archive, with a Shin no-vig
-# fair price column. The fair price is the hook: it is the number that says
-# whether ANY of the quoted prices is actually good.
-
-def _american(decimal_odds: float) -> int:
-    if decimal_odds >= 2.0:
-        return round((decimal_odds - 1) * 100)
-    return round(-100 / (decimal_odds - 1))
-
+# Every book's current quote on every upcoming game, with a Shin no-vig fair
+# price column (the number that says whether ANY quoted price is good) and each
+# book's movement from its first capture. The logic lives in
+# src/Utils/odds_board.py; read its docstring before changing what drops.
+#
+# Until 2026-09-27 this kept only quotes CAPTURED in the last 7 days. The
+# recorders write a row only when a price changes, so a line that sat still
+# for a week disappeared (opening night included) and "as of" meant "last
+# changed". A book's latest row is its price until a newer row replaces it.
 
 @app.get("/api/lineshop")
-def get_lineshop(sport: str = "NBA", max_age_hours: int = 168):
+def get_lineshop(sport: str = "NBA"):
     """
-    Multi-book board: for every upcoming game, each book's latest archived
-    moneylines, spread and total, plus the market's de-vigged fair moneyline
-    (median of per-book Shin de-vigs). Every game carries the timestamp of its
-    freshest quote - staleness is shown, never hidden.
+    Multi-book board: for every upcoming game, each book's current moneyline,
+    spread and total with the date each was first seen unchanged, its first
+    captured price per market (open), the de-vigged fair moneyline (median of
+    per-book Shin de-vigs) and the best price per side.
     """
     conn = _odds_snapshot_conn()
     try:
-        since = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
-        rows = conn.execute(
-            """
-            SELECT s.* FROM odds_snapshots s
-            JOIN (
-                SELECT game_key, sportsbook, MAX(captured_at) mc
-                FROM odds_snapshots
-                WHERE sport = ? AND captured_at >= ?
-                GROUP BY game_key, sportsbook
-            ) t ON s.game_key = t.game_key AND s.sportsbook = t.sportsbook
-               AND s.captured_at = t.mc
-            WHERE s.sport = ?
-            """,
-            (sport, since, sport),
-        ).fetchall()
+        board = odds_board.build_board(conn, sport=sport)
     finally:
         conn.close()
-
-    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    games: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        start = r["game_start_time_utc"]
-        # No start time = a legacy row from the old scraper; games already
-        # started are history, not a shopping board.
-        if not start or start < now_iso:
-            continue
-        g = games.setdefault(r["game_key"], {
-            "game_key": r["game_key"],
-            "home_team": r["home_team"],
-            "away_team": r["away_team"],
-            "start": start,
-            "books": {},
-            "as_of": r["captured_at"],
-        })
-        keys = r.keys()
-        g["books"][r["sportsbook"]] = {
-            "captured_at": r["captured_at"],
-            "home_ml": r["home_ml"],
-            "away_ml": r["away_ml"],
-            "spread_home": r["spread_home"] if "spread_home" in keys else None,
-            "spread_home_price": r["spread_home_price"] if "spread_home_price" in keys else None,
-            "spread_away_price": r["spread_away_price"] if "spread_away_price" in keys else None,
-            "ou_line": r["ou_line"],
-            "ou_over_price": r["ou_over_price"] if "ou_over_price" in keys else None,
-            "ou_under_price": r["ou_under_price"] if "ou_under_price" in keys else None,
-        }
-        g["as_of"] = max(g["as_of"], r["captured_at"])
-
-    out = []
-    for g in games.values():
-        fair_home_probs = []
-        for b in g["books"].values():
-            hm, am = b["home_ml"], b["away_ml"]
-            if hm is None or am is None:
-                continue
-            try:
-                dec = [parlay.american_to_true_decimal(float(hm)),
-                       parlay.american_to_true_decimal(float(am))]
-                fair_home_probs.append(devig.fair_probs(dec)[0])
-            except (ValueError, TypeError):
-                continue
-        fair = None
-        if fair_home_probs:
-            fair_home_probs.sort()
-            n = len(fair_home_probs)
-            median = (fair_home_probs[n // 2] if n % 2
-                      else (fair_home_probs[n // 2 - 1] + fair_home_probs[n // 2]) / 2)
-            fair = {
-                "home_prob": round(median, 4),
-                "away_prob": round(1 - median, 4),
-                "home_ml_fair": _american(1 / median),
-                "away_ml_fair": _american(1 / (1 - median)),
-                "books_used": n,
-            }
-
-        def best(side: str):
-            candidates = [(book, b[side]) for book, b in g["books"].items() if b[side] is not None]
-            if not candidates:
-                return None
-            book, price = max(candidates, key=lambda x: x[1])  # higher American = better payout
-            entry: Dict[str, Any] = {"book": book, "price": price}
-            if fair:
-                prob = fair["home_prob"] if side == "home_ml" else fair["away_prob"]
-                dec = parlay.american_to_true_decimal(float(price))
-                entry["ev_pct_at_fair"] = round((prob * dec - 1) * 100, 2)
-            return entry
-
-        g["fair"] = fair
-        g["best"] = {"home_ml": best("home_ml"), "away_ml": best("away_ml")}
-        out.append(g)
-
-    out.sort(key=lambda x: x["start"])
-    return {
-        "sport": sport,
-        "games": out,
-        "books": sorted({bk for g in out for bk in g["books"]}),
-        "devig_method": devig.ACTIVE_METHOD,
-        "note": (
-            "Latest archived quote per book; the 'as of' stamp is each game's freshest "
-            "capture. Fair price = median of per-book de-vigged moneylines - the market's "
-            "opinion with the margin removed. EV at the best price is measured against "
-            "that consensus, not against our model."
-        ),
-    }
+    board["note"] = (
+        "Each book's latest recorded price per market. The recorder saves a row only "
+        "when a number changes, so 'since' is when that price first appeared and has "
+        "not moved since. Fair price = median of per-book de-vigged moneylines - the "
+        "market's opinion with the margin removed. EV at the best price is measured "
+        "against that consensus, not against our model."
+    )
+    return board
 
 
 # --- Defensive matchups ----------------------------------------------------------
@@ -2621,7 +2529,7 @@ def sitemap_seasons():
 
 
 # --- The closing market (historical odds dataset joined to our archive) ---
-# Closing spread / total / moneylines for 2007-08 .. 2022-23, graded against
+# Closing spread / total / moneylines for 2007-08 .. 2023-24, graded against
 # what OUR box scores say happened. Descriptive: the market's final word next
 # to the result. Nothing here is a model pick and nothing measures ROI - see
 # Market.py. Both endpoints only read SQLite, so no upstream rate limit.
@@ -2636,7 +2544,7 @@ def _odds_read_conn():
 
 @app.get("/api/games/{game_id}/market")
 def get_game_market(game_id: str):
-    """Closing line and graded result for one archived game (available=False outside 2007-08..2022-23)."""
+    """Closing line and graded result for one archived game (available=False outside 2007-08..2023-24)."""
     key = ("game", game_id)
     if key in _market_cache:
         return _market_cache[key]
@@ -2707,11 +2615,18 @@ def get_game_line_score(game_id: str):
             official = None  # table not created yet on this machine
         if official and len(official) == 2:
             by_side = {r["side"]: r for r in official}
-            if "home" in by_side and "away" in by_side:
-                h, a = by_side["home"], by_side["away"]
+            h, a = by_side.get("home"), by_side.get("away")
+            # Since the v2 summary feed died (2025-04-10) nba.com answers with an
+            # empty shell: the rows exist but every quarter and the total are NULL.
+            # NULL is "unknown", never 0, so such a row is skipped and the
+            # play-by-play below supplies the quarters instead.
+            usable = h is not None and a is not None and all(
+                r[c] is not None for r in (h, a) for c in ("q1", "q2", "q3", "q4", "pts")
+            )
+            if usable:
                 periods = []
                 for i, col in enumerate(["q1", "q2", "q3", "q4"], start=1):
-                    periods.append({"period": i, "label": f"Q{i}", "home": h[col] or 0, "away": a[col] or 0})
+                    periods.append({"period": i, "label": f"Q{i}", "home": h[col], "away": a[col]})
                 for i in range(1, 11):
                     col = f"ot{i}"
                     if (h[col] or 0) > 0 or (a[col] or 0) > 0:
@@ -2728,6 +2643,16 @@ def get_game_line_score(game_id: str):
             """,
             (game_id,),
         ).fetchall()
+        # The box score's own team points: the play-by-play line is shown only
+        # when its last period-end score agrees with them exactly.
+        box = conn.execute(
+            """
+            SELECT json_extract(traditional_json, '$.boxScoreTraditional.homeTeam.statistics.points') AS home,
+                   json_extract(traditional_json, '$.boxScoreTraditional.awayTeam.statistics.points') AS away
+            FROM box_scores WHERE game_id = ?
+            """,
+            (game_id,),
+        ).fetchone()
     finally:
         conn.close()
     if not rows:
@@ -2736,7 +2661,10 @@ def get_game_line_score(game_id: str):
     prev_h = prev_a = 0
     for r in rows:
         p = int(r["period"])
-        h, a = int(r["home"] or 0), int(r["away"] or 0)
+        # Scores only ever rise, so a period's MAX is its closing score; a side
+        # that did not score in a period keeps the previous period's total.
+        h = max(int(r["home"]), prev_h) if r["home"] is not None else prev_h
+        a = max(int(r["away"]), prev_a) if r["away"] is not None else prev_a
         periods.append({
             "period": p,
             "label": f"Q{p}" if p <= 4 else f"OT{p - 4}",
@@ -2744,6 +2672,10 @@ def get_game_line_score(game_id: str):
             "away": a - prev_a,
         })
         prev_h, prev_a = h, a
+    if box is None or box["home"] != prev_h or box["away"] != prev_a:
+        # A partial or disagreeing play-by-play would print a plausible but
+        # wrong line; say "no line score" instead.
+        return {"game_id": game_id, "available": False, "reason": "play-by-play total disagrees with the box score"}
     result = {"game_id": game_id, "available": True, "periods": periods,
               "final": {"home": prev_h, "away": prev_a}, "source": "play-by-play period-end scores"}
     _market_cache[key] = result
@@ -2778,6 +2710,7 @@ def get_game_info(game_id: str):
         conn.close()
     if info is None:
         return {"game_id": game_id, "available": False}
+    shell = info["game_time"] in (None, "", "0:00")
     by_team: Dict[str, Any] = {}
     for r in inact:
         t = by_team.setdefault(r["team_abbr"] or str(r["team_id"]), {"team_id": r["team_id"], "abbr": r["team_abbr"], "players": []})
@@ -2786,13 +2719,17 @@ def get_game_info(game_id: str):
     result = {
         "game_id": game_id, "available": True,
         "attendance": info["attendance"],
-        "game_time": info["game_time"],
+        # "0:00" is what the dead v2 summary feed returns for every game since
+        # 2025-04-10 (1,212 of 2025-26's games): unknown, not a zero-minute game.
+        "game_time": None if shell else info["game_time"],
         "natl_tv": info["natl_tv"],
         "inactives": list(by_team.values()),
         # The feed lists inactives from 2005-06 (1,215 of 1,230 games that
         # season); 2003-04 and 2004-05 have a few dozen games each, so an
-        # empty list there is "unknown", not "everyone played".
-        "inactives_known": game_id[3:5] >= "05" if len(game_id) >= 5 and game_id[3:5].isdigit() else True,
+        # empty list there is "unknown", not "everyone played". An empty
+        # shell summary (above) with no inactive rows is unknown too.
+        "inactives_known": (game_id[3:5] >= "05" if len(game_id) >= 5 and game_id[3:5].isdigit() else True)
+                           and not (shell and not inact),
         "source": "nba.com game summary",
     }
     _market_cache[key] = result
@@ -3219,64 +3156,45 @@ def get_parlay_correlation():
 
 # --- Line movements (from real odds snapshots) ---
 @app.get("/api/line-movements")
-def get_line_movements(sportsbook: str = 'fanduel', sport: str = 'NBA', hours: int = 48):
+def get_line_movements(sportsbook: Optional[str] = None, sport: str = 'NBA'):
     """
-    Real line movement per upcoming game, computed from stored odds snapshots.
-    A game appears once at least one snapshot exists; movement is meaningful
-    once the lines have changed at least once.
+    Open -> now per upcoming game and book, from src/Utils/odds_board.py.
+    "Open" is the book's FIRST capture of each market for that game over the
+    whole archive; spreads are the book's posted spread, never one inferred
+    from the moneyline. No sportsbook = every book.
+
+    Until 2026-09-27 this read a 48-hour capture window for one book
+    (FanDuel by default), so "open" was the first change inside the window
+    and a line that had not moved in two days was not listed at all.
     """
     conn = _odds_snapshot_conn()
     try:
-        since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-        rows = conn.execute(
-            """
-            SELECT * FROM odds_snapshots
-            WHERE sportsbook = ? AND sport = ? AND captured_at >= ?
-            ORDER BY game_key, captured_at ASC
-            """,
-            (sportsbook, sport, since)
-        ).fetchall()
-
-        games: Dict[str, List[sqlite3.Row]] = {}
-        for r in rows:
-            games.setdefault(r["game_key"], []).append(r)
-
-        movements = []
-        for game_key, snaps in games.items():
-            first, last = snaps[0], snaps[-1]
-            movements.append({
-                "game_key": game_key,
-                "home_team": last["home_team"],
-                "away_team": last["away_team"],
-                "game_start_time_utc": last["game_start_time_utc"],
-                "opening": {
-                    "captured_at": first["captured_at"],
-                    "home_ml": first["home_ml"],
-                    "away_ml": first["away_ml"],
-                    "ou_line": first["ou_line"],
-                },
-                "current": {
-                    "captured_at": last["captured_at"],
-                    "home_ml": last["home_ml"],
-                    "away_ml": last["away_ml"],
-                    "ou_line": last["ou_line"],
-                },
-                "snapshots": [
-                    {
-                        "captured_at": s["captured_at"],
-                        "home_ml": s["home_ml"],
-                        "away_ml": s["away_ml"],
-                        "ou_line": s["ou_line"],
-                    }
-                    for s in snaps
-                ],
-            })
-        return {"sportsbook": sportsbook, "sport": sport, "window_hours": hours, "movements": movements}
+        board = odds_board.build_board(conn, sport=sport, sportsbook=sportsbook)
     except Exception as e:
         logger.error(f"Error in /api/line-movements: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+    movements = []
+    for g in board["games"]:
+        for book, q in g["books"].items():
+            movements.append({
+                "game_key": g["game_key"],
+                "sportsbook": book,
+                "home_team": g["home_team"],
+                "away_team": g["away_team"],
+                "game_start_time_utc": g["start"],
+                "open": q["open"],
+                "since": q["since"],
+                "changes": q["changes"],
+                "current": {m: {f: q[f] for f in odds_board.MARKETS[m]} for m in odds_board.MARKETS},
+            })
+    return {
+        "sportsbook": sportsbook,
+        "sport": sport,
+        "archive_since": board["archive_since"],
+        "movements": movements,
+    }
 
 def _attach_why(predictions: List[Dict[str, Any]], explanations: List[Dict[str, Any]]) -> None:
     """Give each pick its "why", matched by teams, never by position alone.
@@ -4114,6 +4032,13 @@ def finder_player_games(
     Find individual player games matching stat thresholds across the whole
     archive. Example: min_pts=40&season_type=Playoffs -> every 40-point
     playoff game we have.
+
+    Returns {count, total, limit, truncated, results}: `total` is every game
+    that matches, `count` only the rows sent back (at most `limit`). Until
+    2026-09-27 only `count` existed, so a page printed "100 games found" for
+    a search the archive answers 2,761 times. Each row carries `is_home`
+    (null when unknown): every row used to read "vs", and Luka Doncic's 73
+    was at Atlanta.
     """
     sortable = {"pts", "reb", "ast", "stl", "blk", "fg3m", "game_date"}
     if sort not in sortable:
@@ -4128,10 +4053,10 @@ def finder_player_games(
             where.append(f"g.{col} >= ?")
             params.append(int(val))
     if season:
-        where.append("t.season = ?")
+        where.append("b.season = ?")
         params.append(season)
     if season_type:
-        where.append("t.season_type = ?")
+        where.append("b.season_type = ?")
         params.append(season_type)
     if player:
         where.append("p.full_name LIKE ?")
@@ -4142,27 +4067,48 @@ def finder_player_games(
 
     conn = get_db_conn()
     try:
+        # Teams, venue and season come from box_scores (one row per archived
+        # game). The result comes from the league game log, falling back to
+        # our own team totals for play-in games, which the log does not
+        # carry. This used to INNER JOIN team_game_advanced, which lacks the
+        # few games whose advanced box nba.com never served, so their
+        # player lines silently dropped out of every search.
+        joins = """
+            FROM player_game_log g
+            JOIN players p ON p.player_id = g.player_id
+            JOIN box_scores b ON b.game_id = g.game_id
+            LEFT JOIN game_results r ON r.game_id = g.game_id AND r.team_id = g.team_id
+            LEFT JOIN team_game_advanced t ON t.game_id = g.game_id AND t.team_id = g.team_id
+            JOIN team_metadata m ON m.team_id = g.team_id
+            LEFT JOIN team_metadata om ON om.team_id = CASE WHEN g.team_id = b.home_team_id
+                                                            THEN b.away_team_id ELSE b.home_team_id END
+        """
+        where_sql = " AND ".join(where)
         query = f"""
             SELECT g.game_id, g.game_date, g.player_id, p.full_name,
                    g.min, g.pts, g.reb, g.ast, g.stl, g.blk, g.fg3m, g.fgm, g.fga,
-                   t.season, t.season_type, t.pts AS team_pts, t.opp_pts,
+                   b.season, b.season_type,
+                   CASE WHEN b.home_team_id IS NULL THEN NULL
+                        WHEN g.team_id = b.home_team_id THEN 1 ELSE 0 END AS is_home,
+                   CASE WHEN r.wl IS NOT NULL THEN (r.wl = 'W')
+                        WHEN t.pts IS NOT NULL AND t.opp_pts IS NOT NULL THEN (t.pts > t.opp_pts)
+                   END AS won,
                    m.abbreviation AS team_abbr, om.abbreviation AS opp_abbr
-            FROM player_game_log g
-            JOIN players p ON p.player_id = g.player_id
-            JOIN team_game_advanced t ON t.game_id = g.game_id AND t.team_id = g.team_id
-            JOIN team_metadata m ON m.team_id = g.team_id
-            JOIN team_metadata om ON om.team_id = t.opp_team_id
-            WHERE {" AND ".join(where)}
+            {joins}
+            WHERE {where_sql}
             ORDER BY g.{sort} DESC, g.game_date DESC
             LIMIT ?
         """
         rows = conn.execute(query, params + [limit]).fetchall()
+        total = conn.execute(f"SELECT COUNT(*) {joins} WHERE {where_sql}", params).fetchone()[0]
         results = []
         for r in rows:
             d = dict(r)
-            d["won"] = (d.pop("team_pts") or 0) > (d.pop("opp_pts") or 0)
+            d["won"] = None if d["won"] is None else bool(d["won"])
+            d["is_home"] = None if d["is_home"] is None else bool(d["is_home"])
             results.append(d)
-        return {"count": len(results), "limit": limit, "results": results}
+        return {"count": len(results), "total": total, "limit": limit,
+                "truncated": total > len(results), "results": results}
     except Exception as e:
         logger.error(f"Error in game finder: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -6180,6 +6126,8 @@ def _player_season_line(conn, player_id: int, season: str, season_type: str = "R
             (player_id, season, season_type, totals["team_id"])).fetchone()
         return totals, _placeholder_free(dict(adv_row)) if adv_row else {}, 1
     totals = {k: sum((st.get(k) or 0) for st in stints) for k in _TOTAL_COLS}
+    if any(st.get("gs") is None for st in stints):
+        totals["gs"] = None   # a stint's starts unknown: the season's are too, not a partial sum
     totals.update(player_id=player_id, season=season, season_type=season_type, team_id=None)
     for pct, made, att in (("fg_pct", "fgm", "fga"), ("fg3_pct", "fg3m", "fg3a"), ("ft_pct", "ftm", "fta")):
         totals[pct] = totals[made] / totals[att] if totals[att] else None
@@ -6610,6 +6558,17 @@ def get_player_game_log(id: int, season: str = CURRENT_SEASON, season_type: str 
     finally:
         conn.close()
 
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"]
+
+
+def _season_month_rank(name: Optional[str]) -> int:
+    """October = 0 ... September = 11; anything unrecognised sorts last."""
+    if name not in _MONTHS:
+        return 99
+    return (_MONTHS.index(name) - 9) % 12
+
+
 @app.get("/api/players/{id}/splits")
 def get_player_splits_api(id: int, season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
@@ -6634,7 +6593,10 @@ def get_player_splits_api(id: int, season: str = CURRENT_SEASON, season_type: st
             stype = rec.get("split_type")
             if stype in splits:
                 splits[stype].append(rec)
-                
+        # Months in the order the season is played (October first; the 2019-20
+        # bubble's July and August land after March). The table's row order is
+        # alphabetical, which printed April, December, February... on profiles.
+        splits["Month"].sort(key=lambda rec: _season_month_rank(rec.get("split_value")))
         return splits
     except Exception as e:
         logger.error(f"Error fetching player splits: {e}", exc_info=True)
@@ -7024,10 +6986,15 @@ _WP_FINALS: Dict[str, tuple] = {}
 
 
 def _pbp_finals(conn) -> Dict[str, tuple]:
+    # pbp_events readers walk games in action_id order (the feed's own
+    # sequence). action_number is not time order - a late-entered play keeps
+    # its high number - and ordering by it read the wrong final score in 133
+    # of 8,885 games (4 remain, where nba.com's own end-of-period row carries
+    # a stale score). See backfill_pbp.py.
     finals: Dict[str, tuple] = {}
     for gid, sh, sa in conn.execute(
         "SELECT game_id, score_home, score_away FROM pbp_events "
-        "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
+        "WHERE score_home IS NOT NULL ORDER BY game_id, action_id"
     ):
         finals[gid] = (sh, sa)
     return finals
@@ -7044,7 +7011,7 @@ def _build_wp_table(conn) -> Dict[tuple, List[int]]:
 
     for gid, es, sh, sa in conn.execute(
         "SELECT game_id, elapsed_seconds, score_home, score_away FROM pbp_events "
-        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_number"
+        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_id"
     ):
         if gid != cur:
             cur, last, idx = gid, (0, 0), 0
@@ -7131,7 +7098,7 @@ def get_win_probability(game_id: str):
         events = conn.execute(
             "SELECT elapsed_seconds, period, score_home, score_away, description, "
             "       action_type, player_name, team_tricode "
-            "FROM pbp_events WHERE game_id = ? ORDER BY action_number",
+            "FROM pbp_events WHERE game_id = ? ORDER BY action_id",
             (game_id,),
         ).fetchall()
         if not events:
@@ -7287,7 +7254,7 @@ def get_game_passing(game_id: str):
     try:
         events = conn.execute(
             "SELECT person_id, player_name, team_id, team_tricode, assist_hint, shot_value "
-            "FROM pbp_events WHERE game_id = ? ORDER BY action_number",
+            "FROM pbp_events WHERE game_id = ? ORDER BY action_id",
             (game_id,),
         ).fetchall()
         if not events:
@@ -7515,7 +7482,7 @@ def _build_excitement(conn) -> List[Dict[str, Any]]:
     for gid, es, sh, sa in conn.execute(
         "SELECT game_id, elapsed_seconds, score_home, score_away FROM pbp_events "
         "WHERE elapsed_seconds IS NOT NULL AND score_home IS NOT NULL "
-        "AND score_away IS NOT NULL ORDER BY game_id, action_number"
+        "AND score_away IS NOT NULL ORDER BY game_id, action_id"
     ):
         if gid != cur:
             flush(cur)
@@ -7559,6 +7526,17 @@ def _get_excitement(conn) -> List[Dict[str, Any]]:
     return _EXCITEMENT_CACHE
 
 
+EXCITEMENT_BLOWOUT_MARGIN = 30
+
+
+def _blowout_reference(allg: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    scores = sorted(g["score"] for g in allg if g["margin"] >= EXCITEMENT_BLOWOUT_MARGIN)
+    if not scores:
+        return None
+    return {"margin": EXCITEMENT_BLOWOUT_MARGIN, "games": len(scores),
+            "median_score": round(scores[len(scores) // 2], 3)}
+
+
 @app.get("/api/stats/exciting-games")
 def get_exciting_games(
     season: Optional[str] = None,
@@ -7595,6 +7573,11 @@ def get_exciting_games(
             "median_score": round(
                 sorted(g["score"] for g in allg)[len(allg) // 2], 3
             ) if allg else None,
+            # What a blowout scores, measured rather than asserted: the page
+            # used to say "a 40-point blowout scores under 1", but on
+            # 2026-09-27 the median 40-point game scored 1.84 and only 9 of
+            # 122 were under 1.
+            "blowout": _blowout_reference(allg),
             "games": rows[: max(1, min(limit, 250))],
         }
     except HTTPException:
@@ -7653,7 +7636,7 @@ def _build_comeback_grid(conn) -> Dict[str, Any]:
     finals: Dict[str, tuple] = {}
     for gid, sh, sa in conn.execute(
         "SELECT game_id, score_home, score_away FROM pbp_events "
-        "WHERE score_home IS NOT NULL ORDER BY game_id, action_number"
+        "WHERE score_home IS NOT NULL ORDER BY game_id, action_id"
     ):
         finals[gid] = (sh, sa)
 
@@ -7668,7 +7651,7 @@ def _build_comeback_grid(conn) -> Dict[str, Any]:
 
     for gid, es, sh, sa in conn.execute(
         "SELECT game_id, elapsed_seconds, score_home, score_away FROM pbp_events "
-        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_number"
+        "WHERE elapsed_seconds IS NOT NULL ORDER BY game_id, action_id"
     ):
         if gid != cur:
             cur, last, idx = gid, (0, 0), 0
@@ -8637,6 +8620,16 @@ def get_game_shot_chart(request: Request, game_id: str):
 # "Active" needs care as well. The last game on record is the 2026 Finals, so a
 # streak unbroken when a team's season ended is active in the only sense
 # available: nobody has ended it. It is reported as of each team's last game.
+#
+# Regular season and playoffs are separate boards (fixed 2026-09-27). The two
+# used to be chained into one sequence, which is not how the league counts:
+# LeBron's 10-point streak is 1,297 REGULAR-SEASON games, and chaining the
+# playoffs in cut it to 868 (a sub-10 playoff night broke it); Curry's
+# made-three streak is 157 regular-season games, and chaining made it 196.
+# A regular-season streak runs across the playoffs and the offseason untouched,
+# the way the 2015-16 Warriors' 28 straight wins began in April 2015. Play-in
+# games belong to neither board, as in the league's own records.
+STREAK_SEASON_TYPES = ("Regular Season", "Playoffs")
 STREAK_DEFS = [
     {"key": "team_win", "label": "Team wins", "scope": "team"},
     {"key": "team_loss", "label": "Team losses", "scope": "team"},
@@ -8672,7 +8665,8 @@ def _qualifies(row, key: str) -> bool:
     return False
 
 
-_streak_cache: Dict[str, Any] = {"key": None, "payload": None}
+# One cached board per season type: {season_type: {"key": stamp, "payload": ...}}.
+_streak_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def _slice_streaks(payload: Dict[str, Any], kind: Optional[str], mode: str, limit: int):
@@ -8917,7 +8911,8 @@ def get_hustle_stats(request: Request, season: str = CURRENT_SEASON, season_type
 
 
 @app.get("/api/stats/streaks")
-def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "active"):
+def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "active",
+                     season_type: str = "Regular Season"):
     """
     Every unbroken streak in the archive, ranked by how rare its length is.
 
@@ -8932,7 +8927,14 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
     games) while losing streaks are inflated by playoff eliminations. `mode=active`
     is the live-season board; `mode=longest` is the rarest streaks in the archive
     however they ended, which is the one worth reading in the offseason.
+
+    `season_type` is "Regular Season" (the default, and the league's convention
+    for streak records) or "Playoffs"; each is its own unbroken sequence.
     """
+    if season_type not in STREAK_SEASON_TYPES:
+        raise HTTPException(status_code=400, detail=(
+            f"season_type must be one of {', '.join(STREAK_SEASON_TYPES)}."))
+    prefix = GAME_ID_PREFIX_BY_SEASON_TYPE[season_type]
     conn = get_db_conn()
     try:
         # The whole board is computed at once and cached against the archive's
@@ -8941,17 +8943,27 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
         stamp = conn.execute(
             "SELECT MAX(DATE(game_date)) || ':' || COUNT(*) FROM player_game_log"
         ).fetchone()[0]
-        if _streak_cache["key"] == stamp and _streak_cache["payload"]:
-            return _slice_streaks(_streak_cache["payload"], kind, mode, limit)
+        cached = _streak_cache.get(season_type)
+        if cached and cached["key"] == stamp and cached["payload"]:
+            return _slice_streaks(cached["payload"], kind, mode, limit)
+        # Team results come from game_results (the league game log), not our
+        # box-score table: the handful of games whose box score nba.com never
+        # served are missing from team_game_advanced, and a missing loss would
+        # silently join two win streaks into one. Held to the box-score
+        # archive's seasons so rarity is measured over the same span as the
+        # player streaks.
+        first_season = conn.execute(
+            "SELECT MIN(season) FROM box_scores WHERE season_type = ?", (season_type,)
+        ).fetchone()[0]
         team_rows = conn.execute(
             """
-            SELECT t.team_id, DATE(t.game_date) AS date, t.pts, t.opp_pts,
+            SELECT r.team_id, DATE(r.game_date) AS date, r.wl, r.season,
                    m.abbreviation AS team, m.full_name AS team_name
-            FROM team_game_advanced t
-            LEFT JOIN team_metadata m ON m.team_id = t.team_id
-            WHERE t.pts IS NOT NULL AND t.opp_pts IS NOT NULL
-            ORDER BY t.team_id, DATE(t.game_date)
-            """
+            FROM game_results r
+            LEFT JOIN team_metadata m ON m.team_id = r.team_id
+            WHERE r.season_type = ? AND r.season >= ? AND r.wl IN ('W', 'L')
+            ORDER BY r.team_id, DATE(r.game_date), r.game_id
+            """, (season_type, first_season or "")
         ).fetchall()
 
         player_rows = conn.execute(
@@ -8961,8 +8973,9 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
                    (SELECT abbreviation FROM team_metadata WHERE team_id = g.team_id) AS team
             FROM player_game_log g
             JOIN players p ON p.player_id = g.player_id
-            ORDER BY g.player_id, DATE(g.game_date)
-            """
+            WHERE SUBSTR(g.game_id, 1, 3) = ?
+            ORDER BY g.player_id, DATE(g.game_date), g.game_id
+            """, (prefix,)
         ).fetchall()
 
         lengths: Dict[str, List[int]] = {d["key"]: [] for d in STREAK_DEFS}
@@ -9016,8 +9029,8 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
         walk(
             team_rows, "team_id",
             {
-                "team_win": lambda r: (r["pts"] or 0) > (r["opp_pts"] or 0),
-                "team_loss": lambda r: (r["pts"] or 0) < (r["opp_pts"] or 0),
+                "team_win": lambda r: r["wl"] == "W",
+                "team_loss": lambda r: r["wl"] == "L",
             },
             lambda r, n, st: {
                 "name": r["team_name"] or r["team"], "team": r["team"],
@@ -9081,9 +9094,11 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
         longest.sort(key=rank)
 
         span = conn.execute(
-            "SELECT MIN(season), MAX(season), MAX(DATE(game_date)) FROM team_game_advanced"
+            "SELECT MIN(season), MAX(season), MAX(DATE(game_date)) FROM box_scores WHERE season_type = ?",
+            (season_type,),
         ).fetchone()
         payload = {
+            "season_type": season_type,
             "archive": {"first_season": span[0], "last_season": span[1], "last_game": span[2]},
             "kinds": [
                 {
@@ -9110,14 +9125,78 @@ def get_streak_board(limit: int = 40, kind: Optional[str] = None, mode: str = "a
                 ),
             },
         }
-        _streak_cache["key"] = stamp
-        _streak_cache["payload"] = payload
+        _streak_cache[season_type] = {"key": stamp, "payload": payload}
         return _slice_streaks(payload, kind, mode, limit)
     except Exception as e:
         logger.error(f"Error building streak board: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not build the streak board.")
     finally:
         conn.close()
+
+
+PLAYOFF_ROUND_NAMES = {1: "First round", 2: "Conference semifinals", 3: "Conference finals", 4: "NBA Finals"}
+
+
+def _night_games(conn, day: str, game_ids: List[str]) -> List[Dict[str, Any]]:
+    """Each game on a night with its stage ("NBA Finals, Game 5"), teams and score.
+
+    A board of one night's leaders reads differently on a Finals night than on a
+    Tuesday in January, so the page names the game. The round and game number
+    come from the league game log, not the game id: playoff ids before 2001-02
+    are plain sequence numbers (0049600088 was 1997 Finals Game 6) and carry
+    neither. A series is the n-th distinct opponent a team met that postseason;
+    both teams are asked and the later round kept, so a hole in one team's log
+    cannot demote a Finals game to a first-round one.
+    """
+    out = []
+    for gid in game_ids:
+        teams = conn.execute(
+            """
+            SELECT g.team_id, m.abbreviation AS abbr, SUM(g.pts) AS pts,
+                   CASE WHEN g.team_id = b.home_team_id THEN 1 ELSE 0 END AS is_home
+            FROM player_game_log g
+            LEFT JOIN box_scores b ON b.game_id = g.game_id
+            LEFT JOIN team_metadata m ON m.team_id = g.team_id
+            WHERE g.game_id = ?
+            GROUP BY g.team_id ORDER BY is_home
+            """, (gid,)).fetchall()
+        prefix = gid[:3]
+        stage = {"002": "Regular season", "005": "Play-in"}.get(prefix, "Playoffs")
+        if prefix == "004" and teams:
+            season = conn.execute("SELECT season FROM game_results WHERE game_id = ? LIMIT 1", (gid,)).fetchone()
+            a, b = teams[0]["team_id"], teams[-1]["team_id"]
+            rnd, game_no = 0, 0
+            for me, opp in ((a, b), (b, a)) if season and a != b else ():
+                seq = conn.execute(
+                    """
+                    SELECT r.game_id, o.team_id AS opp
+                    FROM game_results r
+                    JOIN game_results o ON o.game_id = r.game_id AND o.team_id != r.team_id
+                    WHERE r.team_id = ? AND r.season = ? AND r.season_type = 'Playoffs'
+                    ORDER BY DATE(r.game_date), r.game_id
+                    """, (me, season[0])).fetchall()
+                opponents: List[int] = []
+                for s in seq:
+                    if s["opp"] not in opponents:
+                        opponents.append(s["opp"])
+                if opp in opponents:
+                    rnd = max(rnd, opponents.index(opp) + 1)
+                    ids = [s["game_id"] for s in seq if s["opp"] == opp]
+                    if gid in ids:
+                        game_no = ids.index(gid) + 1
+            if rnd and game_no:
+                stage = f"{PLAYOFF_ROUND_NAMES.get(rnd, 'Playoffs')}, Game {game_no}"
+        away = next((t for t in teams if not t["is_home"]), None)
+        home = next((t for t in teams if t["is_home"]), None)
+        out.append({
+            "game_id": gid,
+            "stage": stage,
+            "away": away["abbr"] if away else None,
+            "home": home["abbr"] if home else None,
+            "away_pts": away["pts"] if away else None,
+            "home_pts": home["pts"] if home else None,
+        })
+    return out
 
 
 @app.get("/api/stats/daily-leaders")
@@ -9187,11 +9266,12 @@ def get_daily_leaders(
             (day, *type_params, max(1, min(limit, 50))),
         ).fetchall()
 
-        games = conn.execute(
-            "SELECT COUNT(DISTINCT g.game_id) FROM player_game_log g WHERE DATE(g.game_date) = ?"
-            + type_sql,
+        game_ids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT g.game_id FROM player_game_log g WHERE DATE(g.game_date) = ?"
+            + type_sql + " ORDER BY g.game_id",
             (day, *type_params),
-        ).fetchone()[0]
+        ).fetchall()]
+        games = len(game_ids)
 
         # Neighbouring dates, so a page can step night by night without guessing
         # which dates exist - the archive has gaps between seasons.
@@ -9213,6 +9293,9 @@ def get_daily_leaders(
             "next_date": next_day,
             "category": cat,
             "games": games,
+            # Which games these were (stage, teams, final score), so a page can
+            # say "NBA Finals, Game 5" instead of an unexplained one-game night.
+            "game_list": _night_games(conn, day, game_ids),
             "categories": sorted(CATEGORIES),
             "leaders": [dict(r) for r in rows],
         }
@@ -9241,8 +9324,13 @@ def get_daily_leaders(
 #     clicking through seasons hit the rate limit.
 # Now: one row per player (sums, percentages from makes and attempts, teams
 # in the order he played for them), per-game boards ranked per game among
-# players who appeared in 70% of their team's games, attempt minimums
+# players who appeared in 70% of their team's games, shooting minimums
 # scaled to the season's length, and a batch route.
+# Fixed 2026-09-27: the shooting minimums were applied to ATTEMPTS, but the
+# NBA's rule counts MAKES (300 FGM, 82 3PM, 125 FTM) and sets no games-played
+# floor for the percentage boards. On attempts Jakob Poeltl led 2025-26 FG%
+# on 217-310; under the league's rule he does not qualify and Rudy Gobert
+# (335-491) leads.
 
 LEADER_COUNTING = ["pts", "ast", "reb", "stl", "blk", "min", "fg3m", "tov", "pf"]
 # Fantasy points is the league's own scoring rule, not a house formula:
@@ -9251,8 +9339,9 @@ LEADER_COUNTING = ["pts", "ast", "reb", "stl", "blk", "min", "fg3m", "tov", "pf"
 # players in 2025-26 - zero difference to four decimal places - so the number
 # here matches the one nba.com prints rather than approximating it.
 _FANTASY_SQL = "(a.pts + 1.2 * a.reb + 1.5 * a.ast + 3.0 * a.stl + 3.0 * a.blk - a.tov)"
-# category -> (attempts column, minimum attempts per 82 team games)
-LEADER_PCT = {"fg_pct": ("fga", 300), "fg3_pct": ("fg3a", 82), "ft_pct": ("fta", 125)}
+# category -> (makes column, minimum makes per 82 team games): the NBA's
+# current qualification rule, applied to every archived season.
+LEADER_PCT = {"fg_pct": ("fgm", 300), "fg3_pct": ("fg3m", 82), "ft_pct": ("ftm", 125)}
 LEADER_CATEGORIES = LEADER_COUNTING + list(LEADER_PCT) + ["fantasy"]
 LEADER_MIN_GAME_SHARE = 0.70   # appear in 70% of the team's games for a per-game board
 
@@ -9295,7 +9384,8 @@ def _leader_rules(conn, season: str, season_type: str) -> dict:
     return {
         "team_games": team_games,
         "min_games": math.ceil(LEADER_MIN_GAME_SHARE * team_games) if team_games else 0,
-        "min_attempts": {cat: math.ceil(base * scale) for cat, (_, base) in LEADER_PCT.items()},
+        # Made shots, not attempts (see LEADER_PCT). No games floor applies.
+        "min_makes": {cat: math.ceil(base * scale) for cat, (_, base) in LEADER_PCT.items()},
     }
 
 
@@ -9323,9 +9413,9 @@ def _leader_board(conn, cat: str, season: str, season_type: str, limit: int, ran
     """
     params: list = [season, season_type]
     if cat in LEADER_PCT:
-        attempts_col = LEADER_PCT[cat][0]
-        sql = select + f" WHERE a.{attempts_col} >= ? AND a.{cat} IS NOT NULL ORDER BY a.{cat} DESC LIMIT ?"
-        params += [rules["min_attempts"][cat], limit]
+        makes_col = LEADER_PCT[cat][0]
+        sql = select + f" WHERE a.{makes_col} >= ? AND a.{cat} IS NOT NULL ORDER BY a.{cat} DESC LIMIT ?"
+        params += [rules["min_makes"][cat], limit]
     else:
         value = _FANTASY_SQL if cat == "fantasy" else f"a.{cat}"
         if rank == "per_game":
@@ -9360,8 +9450,9 @@ def get_stats_leaders(category: str = "pts", season: str = CURRENT_SEASON, seaso
     rank=total (the default, kept for existing callers) orders counting
     stats by the season total; rank=per_game orders them per game among
     players who appeared in 70% of their team's games. Percentage stats are
-    always ordered by the percentage, with attempt minimums scaled to the
-    season's length so a 3-for-3 bench stint can't lead the league.
+    always ordered by the percentage, among players who cleared the NBA's
+    made-shot minimums (scaled to the season's length) so a 3-for-3 bench
+    stint can't lead the league.
     """
     cat = category.lower()
     _check_leader_args([cat], rank)
@@ -9384,7 +9475,8 @@ def get_stats_leader_board(categories: str = "pts,ast,reb", season: str = CURREN
     """
     Several leader boards in one request, with the qualification rules that
     were applied, so a page can print them instead of hardcoding them:
-    {season, season_type, rules: {team_games, min_games, min_attempts}, boards: {cat: [rows]}}.
+    {season, season_type, rules: {team_games, min_games, min_makes}, boards: {cat: [rows]}}.
+    min_games applies to the per-game boards only; min_makes to the percentage boards.
     """
     cats = [c.strip().lower() for c in categories.split(",") if c.strip()]
     if not cats or len(cats) > len(LEADER_CATEGORIES):
@@ -9433,10 +9525,104 @@ def _check_standings_request(conn, season: str, season_type: str) -> bool:
     return False
 
 
+_season_conference_cache: Dict[str, Dict[int, str]] = {}
+
+
+def _season_conferences(conn, season: str, stored: Dict[int, str]) -> Dict[int, str]:
+    """Each team's conference IN THAT SEASON, read from the season's schedule.
+
+    team_metadata holds today's alignment, which put the 2002-03 and 2003-04
+    New Orleans Hornets in the West. The game log settles it without anyone's
+    memory: every archived schedule plays a team's own conference 3-4 times
+    per opponent and the other conference at most twice (0-1 in the lockout
+    seasons). Starting from today's labels, a team moves only when it clearly
+    played the other group more (by 0.75+ games per opponent, 20+ games
+    played); on 1996-97..2025-26 that moves exactly New Orleans 2002-03 and
+    2003-04 to the East. Early in a season the evidence is too thin to move
+    anyone, so today's alignment stands.
+    """
+    if season in _season_conference_cache:
+        return _season_conference_cache[season]
+    rows = conn.execute(
+        """
+        SELECT a.team_id, b.team_id
+        FROM game_results a JOIN game_results b ON b.game_id = a.game_id AND b.team_id <> a.team_id
+        WHERE a.season = ? AND a.season_type = 'Regular Season'
+        """,
+        (season,),
+    ).fetchall()
+    games: Dict[tuple, int] = {}
+    played: Dict[int, int] = {}
+    for t, o in rows:
+        if t in stored and o in stored:
+            games[(t, o)] = games.get((t, o), 0) + 1
+            played[t] = played.get(t, 0) + 1
+    teams = set(played)
+    labels = {t: stored[t] for t in teams}
+    for _ in range(5):
+        moved = False
+        for t in teams:
+            avg = {}
+            for conf in ("East", "West"):
+                opp = [o for o in teams if o != t and labels[o] == conf]
+                avg[conf] = sum(games.get((t, o), 0) for o in opp) / len(opp) if opp else 0.0
+            other = "West" if labels[t] == "East" else "East"
+            if played[t] >= 20 and avg[other] - avg[labels[t]] >= 0.75:
+                labels[t] = other
+                moved = True
+        if not moved:
+            break
+    out = {**stored, **labels}
+    if season < CURRENT_SEASON:
+        _season_conference_cache[season] = out
+    return out
+
+
+def _season_postseason(conn, season: str) -> tuple:
+    """(known, {team_id: tag}) from the postseason games actually archived.
+
+    Replaces a rank rule (1-6 "playoffs", 7-10 "play-in") that was printed on
+    every season although the play-in began in 2020-21 and the 2019-20 bubble
+    had a one-off version in the West only. Tags: 'playoffs' (went straight
+    in), 'play_in_to_playoffs', 'play_in' (out in the play-in), 'none'.
+    known is False until all 16 playoff teams have a game on file, so a
+    season in progress is never labelled from a partial bracket.
+    """
+    def team_ids(season_type: str) -> set:
+        ids = set()
+        for h, a in conn.execute(
+            "SELECT home_team_id, away_team_id FROM box_scores WHERE season = ? AND season_type = ?",
+            (season, season_type),
+        ):
+            ids.update(x for x in (h, a) if x is not None)
+        for (t,) in conn.execute(
+            "SELECT DISTINCT team_id FROM game_results WHERE season = ? AND season_type = ?",
+            (season, season_type),
+        ):
+            ids.add(t)
+        return ids
+
+    playoffs, play_in = team_ids("Playoffs"), team_ids("PlayIn")
+    if len(playoffs) < 16:
+        return False, {}
+    tags: Dict[int, str] = {}
+    for t in playoffs | play_in:
+        if t in playoffs:
+            tags[t] = "play_in_to_playoffs" if t in play_in else "playoffs"
+        else:
+            tags[t] = "play_in"
+    return True, tags
+
+
 @app.get("/api/stats/standings")
 def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
     Fetch league standings compiled from team_season_advanced and team_metadata.
+
+    conference is the team's conference THAT season (_season_conferences);
+    division is null before the 2004-05 realignment (the archive holds only
+    today's divisions). postseason / postseason_known say how the team's
+    season ended, from the archived playoff and play-in games.
     """
     conn = get_db_conn()
     try:
@@ -9458,7 +9644,19 @@ def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regula
             # a league without teams.
             raise HTTPException(status_code=503, detail=(
                 f"{season} {season_type} standings have not been built from the archive."))
-        return [dict(r) for r in rows]
+        stored = {r[0]: r[1] for r in conn.execute("SELECT team_id, conference FROM team_metadata")}
+        conferences = _season_conferences(conn, season, stored)
+        known, tags = _season_postseason(conn, season)
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["conference"] = conferences.get(d["team_id"], d["conference"])
+            if season < "2004-05" or d["conference"] != stored.get(d["team_id"]):
+                d["division"] = None
+            d["postseason_known"] = known
+            d["postseason"] = tags.get(d["team_id"], "none") if known else None
+            out.append(d)
+        return out
     except HTTPException:
         raise
     except Exception as e:

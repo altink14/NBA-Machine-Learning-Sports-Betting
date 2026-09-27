@@ -1,13 +1,8 @@
 """
 ingest_career_totals.py
 =======================
-Builds career totals for every player who appeared between 1996-97 and now, by
-summing one bulk request per season instead of one request per player.
-
-Thirty requests instead of five thousand. leaguedashplayerstats returns every
-player's season totals in a single call, so summing across seasons per player id
-gives career games, minutes and points - enough to ask what a draft slot has
-actually been worth.
+Builds career totals for every player who appeared between 1996-97 and now,
+for the Pick Value curve (what a draft slot has actually been worth).
 
 The window is the whole point and also the limitation. A career is only complete
 in this table if it started in 1996-97 or later; someone drafted in 1990 has the
@@ -15,7 +10,30 @@ first half of his career outside the window and would look worse than he was.
 `first_season_in_window` is stored so a caller can exclude anyone whose career
 may be clipped, rather than quietly comparing a truncated total to a full one.
 
-    venv/Scripts/python.exe ingest_career_totals.py [--from 1996]
+WHERE THE NUMBERS COME FROM (changed 2026-09-27). This used to sum one
+leaguedashplayerstats request per season from stats.nba.com, skip any season
+whose request failed, and write anyway if 80% of seasons answered. On
+2026-08-18 the 2011-12 request failed and the guard let it through, so every
+career in the table was missing the lockout season: Kobe Bryant 1,288 games
+(he played 1,346), LeBron James 62 short, Stephen Curry 26 short, and the 21
+players whose only season was 2011-12 counted as never having played.
+
+It now sums the archive's own per-season table, player_season_totals (one row
+per player per team per season, built from our box scores), with no network
+at all. Those are the same totals the player pages show. They can differ from
+nba.com's own career rows by a game or two where nba.com's box score for a
+game does not exist (four permanent holes, e.g. the 1996-97 Sonics) - the
+archive-wide caveat, not a new one. Kobe's career sums to 1,346 games and
+33,643 points, nba.com's figures exactly.
+
+THE GUARD. No season may be missing: the build refuses unless every season in
+the window has box scores AND player rows whose appearances fit a real season
+(8-16 player-games per team-game; every archived season sits at 10-11). A
+missing or half-built season stops the build instead of shrinking every
+career. The table is replaced in one transaction, after the old rows are
+copied to Data/backups/.
+
+    venv/Scripts/python.exe ingest_career_totals.py [--from 1996] [--to 2025] [--dry-run]
 """
 
 import argparse
@@ -24,6 +42,7 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from typing import List, Optional
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
@@ -34,7 +53,10 @@ logger = logging.getLogger("career_totals")
 
 DB_PATH = os.path.join(REPO_ROOT, "Data", "TeamData.sqlite")
 FIRST = 1996
-LAST = 2025
+# Appearances per team-game a real season produces. Every archived season is
+# 10.3-10.8; a season with only some of its box scores built lands far below.
+MIN_APPEARANCES_PER_TEAM_GAME = 8.0
+MAX_APPEARANCES_PER_TEAM_GAME = 16.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS player_career_span (
@@ -55,61 +77,96 @@ CREATE TABLE IF NOT EXISTS player_career_span (
 """
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--from", dest="start", type=int, default=FIRST)
-    ap.add_argument("--to", dest="end", type=int, default=LAST)
-    args = ap.parse_args()
+def season_label(year: int) -> str:
+    return f"{year}-{str(year + 1)[2:]}"
 
-    from nba_api.stats.endpoints import leaguedashplayerstats
 
-    agg: dict = {}
-    seasons_done = 0
-    for year in range(args.start, args.end + 1):
-        season = f"{year}-{str(year + 1)[2:]}"
-        try:
-            d = leaguedashplayerstats.LeagueDashPlayerStats(
-                season=season,
-                season_type_all_star="Regular Season",
-                per_mode_detailed="Totals",
-                timeout=90,
-            ).get_dict()
-        except Exception as exc:
-            logger.warning("  %s: %s", season, str(exc)[:90])
+def latest_archived_year(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT MAX(season) FROM player_season_totals WHERE season_type = 'Regular Season'"
+    ).fetchone()
+    return int(row[0][:4])
+
+
+def window_problems(conn: sqlite3.Connection, start: int, end: int) -> List[str]:
+    """Every reason the window cannot be summed; empty when it can."""
+    problems = []
+    for year in range(start, end + 1):
+        season = season_label(year)
+        games = conn.execute(
+            "SELECT COUNT(*) FROM box_scores WHERE season = ? AND season_type = 'Regular Season'", (season,)
+        ).fetchone()[0]
+        appearances, players = conn.execute(
+            "SELECT COALESCE(SUM(gp), 0), COUNT(DISTINCT player_id) FROM player_season_totals "
+            "WHERE season = ? AND season_type = 'Regular Season'", (season,)
+        ).fetchone()
+        if not games:
+            problems.append(f"{season}: no regular-season box scores")
             continue
-        rs = d["resultSets"][0]
-        idx = {h: i for i, h in enumerate(rs["headers"])}
-        for r in rs["rowSet"]:
-            pid = r[idx["PLAYER_ID"]]
-            if pid is None:
-                continue
-            a = agg.setdefault(pid, {
-                "name": r[idx["PLAYER_NAME"]], "seasons": 0, "gp": 0, "min": 0.0,
-                "pts": 0, "reb": 0, "ast": 0, "first": year, "last": year,
-            })
-            a["seasons"] += 1
-            a["gp"] += r[idx["GP"]] or 0
-            a["min"] += r[idx["MIN"]] or 0.0
-            a["pts"] += r[idx["PTS"]] or 0
-            a["reb"] += r[idx["REB"]] or 0
-            a["ast"] += r[idx["AST"]] or 0
-            a["first"] = min(a["first"], year)
-            a["last"] = max(a["last"], year)
-        seasons_done += 1
-        if year % 5 == 0 or year == args.end:
-            logger.info("  %s done (%d players so far)", season, len(agg))
+        if not players:
+            problems.append(f"{season}: no player_season_totals rows")
+            continue
+        rate = appearances / (2 * games)
+        if not (MIN_APPEARANCES_PER_TEAM_GAME <= rate <= MAX_APPEARANCES_PER_TEAM_GAME):
+            problems.append(f"{season}: {rate:.1f} player-games per team-game (expected "
+                            f"{MIN_APPEARANCES_PER_TEAM_GAME:.0f}-{MAX_APPEARANCES_PER_TEAM_GAME:.0f})")
+    return problems
 
-    if seasons_done < (args.end - args.start) * 0.8:
-        logger.error(
-            "Only %d of %d seasons returned data. Refusing to write a career table "
-            "built on a partial window.", seasons_done, args.end - args.start + 1
-        )
+
+def career_rows(conn: sqlite3.Connection, start: int, end: int, now: str) -> list:
+    """One row per player: his regular seasons in the window, stints summed."""
+    return conn.execute(
+        """
+        SELECT t.player_id,
+               COALESCE(p.full_name, CAST(t.player_id AS TEXT)),
+               COUNT(DISTINCT t.season), SUM(t.gp), ROUND(SUM(t.min), 1),
+               SUM(t.pts), SUM(t.reb), SUM(t.ast),
+               MIN(CAST(substr(t.season, 1, 4) AS INTEGER)),
+               MAX(CAST(substr(t.season, 1, 4) AS INTEGER)),
+               ?, ?, ?
+        FROM player_season_totals t
+        LEFT JOIN players p ON p.player_id = t.player_id
+        WHERE t.season_type = 'Regular Season' AND t.season BETWEEN ? AND ?
+        GROUP BY t.player_id
+        """,
+        (start, end, now, season_label(start), season_label(end)),
+    ).fetchall()
+
+
+def build(conn: sqlite3.Connection, start: int, end: Optional[int] = None, dry_run: bool = False,
+          backup_dir: Optional[str] = None) -> int:
+    end = latest_archived_year(conn) if end is None else end
+    problems = window_problems(conn, start, end)
+    if problems:
+        for p in problems:
+            logger.error("  %s", p)
+        logger.error("Refusing to write a career table with a missing or partial season (%d-%d).", start, end)
         return 1
 
     now = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(SCHEMA)
+    rows = career_rows(conn, start, end, now)
+    logger.info("%d players from %d seasons (%s to %s).", len(rows), end - start + 1,
+                season_label(start), season_label(end))
+    if dry_run:
+        return 0
+
+    conn.execute(SCHEMA)
+    if backup_dir:
+        os.makedirs(backup_dir, exist_ok=True)
+        path = os.path.join(backup_dir, f"player_career_span_before_{datetime.now():%Y%m%d_%H%M%S}.sqlite")
+        b = sqlite3.connect(path)
+        try:
+            b.execute(SCHEMA)
+            b.executemany("INSERT INTO player_career_span VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          conn.execute("SELECT * FROM player_career_span").fetchall())
+            b.commit()
+        finally:
+            b.close()
+        logger.info("Old table copied to %s", path)
+    with conn:
+        # Replaced whole, not upserted: a player the new build no longer
+        # finds must not keep a stale career.
+        conn.execute("DELETE FROM player_career_span")
         conn.executemany(
             """
             INSERT INTO player_career_span (
@@ -117,28 +174,25 @@ def main() -> int:
                 first_season_in_window, last_season_in_window,
                 window_first, window_last, fetched_at
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(player_id) DO UPDATE SET
-                player_name=excluded.player_name, seasons=excluded.seasons,
-                gp=excluded.gp, min=excluded.min, pts=excluded.pts,
-                reb=excluded.reb, ast=excluded.ast,
-                first_season_in_window=excluded.first_season_in_window,
-                last_season_in_window=excluded.last_season_in_window,
-                window_first=excluded.window_first, window_last=excluded.window_last,
-                fetched_at=excluded.fetched_at
             """,
-            [
-                (pid, a["name"], a["seasons"], a["gp"], round(a["min"], 1), a["pts"],
-                 a["reb"], a["ast"], a["first"], a["last"], args.start, args.end, now)
-                for pid, a in agg.items()
-            ],
+            rows,
         )
-        conn.commit()
-        total = conn.execute("SELECT COUNT(*) FROM player_career_span").fetchone()[0]
-        logger.info(
-            "player_career_span: %d players from %d seasons (%d-%d).",
-            total, seasons_done, args.start, args.end,
-        )
-        return 0
+    total = conn.execute("SELECT COUNT(*) FROM player_career_span").fetchone()[0]
+    logger.info("player_career_span: %d players written.", total)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--from", dest="start", type=int, default=FIRST)
+    ap.add_argument("--to", dest="end", type=int, default=None,
+                    help="last season's start year (default: the latest archived season)")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return build(conn, args.start, args.end, args.dry_run,
+                     backup_dir=os.path.join(REPO_ROOT, "Data", "backups"))
     finally:
         conn.close()
 

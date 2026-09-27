@@ -78,14 +78,15 @@ def compute_clutch(conn, season: str, season_type: str = "Regular Season") -> Di
         overall[r["pid"]] = {"fga": r["fga"], "fgm": r["fgm"]}
 
     # The walk: every 4th-quarter-and-later event, in order, tracking the
-    # score BEFORE each event.
+    # score BEFORE each event. "In order" is action_id, the feed's sequence:
+    # action_number is shared by a miss and its block and is not time order.
     events = conn.execute(
-        "SELECT e.game_id, e.action_number, e.period, e.clock_seconds, e.team_tricode, "
+        "SELECT e.game_id, e.action_id, e.period, e.clock_seconds, e.team_tricode, "
         "e.person_id, e.player_name, e.action_type, e.sub_type, e.description, "
         "e.shot_value, e.is_field_goal, e.score_home, e.score_away "
         "FROM pbp_events e JOIN box_scores b ON b.game_id = e.game_id "
         "WHERE b.season = ? AND b.season_type = ? AND e.period >= 4 "
-        "ORDER BY e.game_id, e.action_number",
+        "ORDER BY e.game_id, e.action_id",
         (season, season_type),
     ).fetchall()
 

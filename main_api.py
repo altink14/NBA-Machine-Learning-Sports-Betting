@@ -5876,7 +5876,7 @@ player_stats_cache = {}
 
 @app.get("/api/player-stats")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
-def get_player_stats(request: Request, season: str = "2025-26", per_mode: str = "PerGame", measure_type: str = "Base"):
+def get_player_stats(request: Request, season: str = CURRENT_SEASON, per_mode: str = "PerGame", measure_type: str = "Base"):
     cache_key = f"{season}_{per_mode}_{measure_type}"
     now = datetime.now()
     
@@ -5922,93 +5922,16 @@ def get_player_stats(request: Request, season: str = "2025-26", per_mode: str = 
         except Exception as e:
             logger.warning(f"Failed to query player stats from database cache: {e}")
 
-    if not leaguedashplayerstats:
-        raise HTTPException(status_code=500, detail="nba_api library not imported")
-        
-    try:
-        logger.info(f"Fetching league-wide player stats for season: {season}, per_mode: {per_mode}")
-        
-        # 1. Fetch Base stats
-        with _nba_slot("leaguedashplayerstats"):
-            base_endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
-                season=season,
-                per_mode_detailed=per_mode,
-                measure_type_detailed_defense="Base"
-            )
-        base_df = base_endpoint.get_data_frames()[0]
-        
-        # 2. Fetch Advanced stats
-        with _nba_slot("leaguedashplayerstats"):
-            adv_endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
-                season=season,
-                per_mode_detailed=per_mode,
-                measure_type_detailed_defense="Advanced"
-            )
-        adv_df = adv_endpoint.get_data_frames()[0]
-        
-        if base_df.empty or adv_df.empty:
-            return []
-            
-        # 3. Merge dataframes on PLAYER_ID
-        merged = pd.merge(
-            base_df,
-            adv_df[['PLAYER_ID', 'TS_PCT', 'USG_PCT', 'DEF_RATING', 'NET_RATING']],
-            on='PLAYER_ID',
-            how='inner'
-        )
-        
-        # 4. Calculate Player Power Index
-        # Formula: (BPM * 1.5) + (TS% * 20) + (USG% * 0.5) - (DRtg * 0.8) + (OnOff * 1.2)
-        bpm = merged['PLUS_MINUS'].fillna(0)
-        ts = merged['TS_PCT'].fillna(0) * 100
-        usg = merged['USG_PCT'].fillna(0) * 100
-        drtg = merged['DEF_RATING'].fillna(110)
-        onoff = merged['NET_RATING'].fillna(0)
-        
-        merged['power_index'] = (bpm * 1.5) + (ts * 20) + (usg * 0.5) - (drtg * 0.8) + (onoff * 1.2)
-        
-        # Apply qualification check: subtract 500 penalty if GP < 5 or MIN < 10 to filter outliers
-        def apply_qualification_penalty(row):
-            gp = row.get('GP', 0)
-            min_val = row.get('MIN', 0)
-            pi = row.get('power_index', 0.0)
-            if gp < 5 or min_val < 10:
-                return pi - 500.0
-            return pi
-            
-        merged['power_index'] = merged.apply(apply_qualification_penalty, axis=1)
-        
-        # 5. Extract results matching the requested measure_type
-        target_cols = base_df.columns.tolist() if measure_type == "Base" else adv_df.columns.tolist()
-        # Add power_index, ts_pct, usg_pct, def_rating, net_rating so they are always accessible
-        extra_cols = ['power_index', 'TS_PCT', 'USG_PCT', 'DEF_RATING', 'NET_RATING']
-        all_cols = list(set(target_cols + extra_cols))
-        
-        final_df = merged[all_cols]
-        
-        results = []
-        for _, row in final_df.iterrows():
-            player_record = {}
-            for col in all_cols:
-                val = row[col]
-                if pd.isna(val) or val is None:
-                    player_record[col.lower()] = None
-                else:
-                    # Convert numpy types to native Python types for JSON compatibility
-                    if isinstance(val, (np.integer, np.int64)):
-                        player_record[col.lower()] = int(val)
-                    elif isinstance(val, (np.floating, np.float64)):
-                        player_record[col.lower()] = float(val)
-                    else:
-                        player_record[col.lower()] = val
-            results.append(player_record)
-            
-        player_stats_cache[cache_key] = (results, now)
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error in get_player_stats API: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    # No archived rows for this season: answer empty rather than fetch.
+    # Until 2026-09-28 this fell through to a live nba.com call that returned
+    # a DIFFERENT shape (nba.com's own column names, `team_abbreviation` not
+    # `team_abbr`, and an invented `power_index` with a -500 "penalty"), so
+    # every page reading this endpoint would have met a new schema on opening
+    # night, before the first ingest. The daily backfill fills
+    # player_season_stats; an empty list until it has is the honest answer.
+    logger.info("No archived player stats for %s yet; returning an empty list.", season)
+    player_stats_cache[cache_key] = ([], now)
+    return []
 
 # ---------------------------------------------------------------------------
 # 12 New Database-Backed Endpoints (Replaces BBRef scraping/JSON dependency)

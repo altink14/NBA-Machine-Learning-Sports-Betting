@@ -283,10 +283,8 @@ class PlayerStatsRow(Contract):
     filled (null on every row). `player_name` is absent when the player is
     not in the directory.
 
-    NOTE: when a season has no archived rows the handler fetches nba.com
-    live and returns a DIFFERENT shape (nba.com's column names lowercased,
-    e.g. `team_abbreviation`, plus `power_index`). That path is not described
-    here; see the 2026-09-28 contract report."""
+    A season with no archived rows returns an empty list (since 2026-09-28;
+    it used to fetch nba.com live and answer in a different shape)."""
     player_id: int
     season: str
     season_type: str

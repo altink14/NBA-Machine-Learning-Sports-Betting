@@ -212,6 +212,37 @@ def _officials() -> str:
     return f"{with_crew or 0} of {games} {season} games with a crew"
 
 
+def _server_mirror() -> str:
+    """The public server's copy of the league-wide stats.nba.com tables.
+
+    The server cannot reach stats.nba.com (it refuses cloud IPs) and is given
+    only this database, so the schedule, play types, tracking tables, hustle,
+    lineups and zone averages it serves come from `nba_response_mirror`,
+    which this fills (src/Utils/nba_mirror.py). The current season only, disk
+    cache first; a season-type stored after it ended is never asked for again,
+    so the offseason costs no requests. Fails only when every request failed.
+
+    Off until NBA_MIRROR_REFRESH=on is in this repo's .env (daily_update.py
+    loads it): added on 2026-09-28 while another job owned stats.nba.com, and
+    its first run asks for ~60 tables, so it waits to be switched on.
+    """
+    if (os.environ.get("NBA_MIRROR_REFRESH") or "").strip().lower() not in ("on", "1", "true", "yes"):
+        return "skipped: switch on with NBA_MIRROR_REFRESH=on in .env"
+    from src.Utils import nba_mirror
+    from datetime import date
+    conn = sqlite3.connect(DB_PATH, timeout=60)
+    try:
+        newest = conn.execute("SELECT MAX(season) FROM box_scores").fetchone()[0]
+        counts = nba_mirror.refresh_live(
+            conn, newest, nba_mirror.schedule_season_for(date.today(), newest))
+    finally:
+        conn.close()
+    if counts["failed"] and not counts["copied"]:
+        raise RuntimeError(f"no table copied: {counts}")
+    return (f"{counts['copied']} copied, {counts['already_final']} final, "
+            f"{counts['failed']} failed, {counts['no_games_yet']} not started")
+
+
 # Cadences are set by how fast the underlying truth moves, not by habit.
 # The Hall inducts once a year; weekly means a new class appears within days
 # without hammering a site that changes eleven times a decade.
@@ -223,6 +254,7 @@ JOBS: List[Job] = [
     Job("draft_bios", 7, _draft_bios, "Bios for the newest picks appear over the weeks after the draft"),
     Job("player_bios", 7, _player_bios, "Current-season bios; historical buckets never change"),
     Job("officials", 1, _officials, "New games need their crews; the newest can lag a day"),
+    Job("server_mirror", 1, _server_mirror, "The public server cannot reach stats.nba.com; it reads this copy"),
 ]
 
 

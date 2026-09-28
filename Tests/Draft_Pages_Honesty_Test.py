@@ -160,6 +160,7 @@ class RookieBaselineTest(unittest.TestCase):
              mock.patch.object(main_api, "_ensure_draft_history", lambda conn: None), \
              mock.patch.object(main_api, "_schedule_season", lambda: "2026-27"), \
              mock.patch.object(nsc, "_read_cache", lambda path, ttl: cache), \
+             mock.patch.object(nsc, "read_mirror", lambda endpoint, params: None), \
              mock.patch.object(nsc.NBAStatsClient, "_fetch", side_effect=AssertionError("no network")):
             return main_api.get_rookies("2025-26")
 

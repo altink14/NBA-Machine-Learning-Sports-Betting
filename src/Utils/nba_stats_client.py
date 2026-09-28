@@ -68,6 +68,116 @@ _BACKOFF_BASE = 2.0
 _GZ_SUFFIX = ".gz"
 
 
+# --- The no-nba.com switch (production) -------------------------------------
+# stats.nba.com refuses cloud-datacenter IPs (DEPLOY.md section 3), so on the
+# public server any request-time call to it hangs for the library's timeout
+# and then fails, once per visitor. NBA_STATS_LIVE=off makes this process
+# never ask: a response already on disk is still served, anything else raises
+# LiveFetchDisabled at once, with no network and no waiting. Default is on,
+# so the home PC (which fetches and ships the data) is unchanged. Read on
+# every call, not at import, so tests and a restarted process see the change.
+_LIVE_OFF_VALUES = {"off", "0", "false", "no"}
+
+
+def live_fetch_enabled() -> bool:
+    """False when NBA_STATS_LIVE is off/0/false/no: no stats.nba.com calls."""
+    return (os.environ.get("NBA_STATS_LIVE") or "on").strip().lower() not in _LIVE_OFF_VALUES
+
+
+class LiveFetchDisabled(RuntimeError):
+    """A stats.nba.com request was needed and this process does not make them.
+
+    Deliberately NOT caught as "the endpoint returned nothing": callers that
+    record an empty answer (e.g. an '__EMPTY__' marker) must never record
+    this, because nobody was asked. main_api.py turns it into a 503 whose
+    body says the data is live-only on the home PC.
+    """
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        super().__init__(
+            f"stats.nba.com is switched off here (NBA_STATS_LIVE=off); "
+            f"'{endpoint}' is not in the local cache"
+        )
+
+
+def install_live_guard() -> None:
+    """Make every nba_api stats.nba.com request honour the switch.
+
+    The client's _fetch and outbound_slot are the intended chokepoints, but a
+    module that calls nba_api directly would slip past them. nba_api sends
+    every stats request through NBAStatsHTTP.send_api_request, so the guard
+    sits there as well. cdn.nba.com (nba_api.live) uses a different class and
+    is cloud-safe, so it is untouched. Idempotent; a no-op while the switch is on.
+    """
+    try:
+        from nba_api.stats.library.http import NBAStatsHTTP
+    except Exception:  # pragma: no cover - nba_api always ships with the backend
+        return
+    if getattr(NBAStatsHTTP.send_api_request, "_live_guard", False):
+        return
+    original = NBAStatsHTTP.send_api_request
+
+    def guarded(self, endpoint, *args, **kwargs):
+        if not live_fetch_enabled():
+            raise LiveFetchDisabled(str(endpoint))
+        return original(self, endpoint, *args, **kwargs)
+
+    guarded._live_guard = True
+    NBAStatsHTTP.send_api_request = guarded
+
+
+install_live_guard()
+
+
+# --- The published copy (nba_response_mirror) --------------------------------
+# The public server receives TeamData.sqlite and nothing else: Data/nba_cache
+# is not shipped. So the league-wide tables that pages read at request time
+# (schedule, Synergy play types, tracking rebounding / shot tables, hustle,
+# lineups, zone averages) are copied into one table of that database by the
+# home PC (src/Utils/nba_mirror.py, run by refresh_registry.py), and a process
+# with the switch off reads that copy when its own disk cache has no answer.
+# Only nba_mirror.py writes it; _fetch never does, so no test or backfill can
+# put a row there by accident.
+MIRROR_TABLE = "nba_response_mirror"
+
+
+def _mirror_db_path() -> Path:
+    env = os.environ.get("NBA_MIRROR_DB")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parents[2] / "Data" / "TeamData.sqlite"
+
+
+def cache_key(endpoint: str, params: Dict[str, Any]) -> str:
+    """The key a response is stored under, on disk and in the mirror."""
+    return _cache_path(endpoint, params).stem
+
+
+def read_mirror(endpoint: str, params: Dict[str, Any]) -> Optional[Dict]:
+    """The published copy of one response, or None. Read-only, never raises."""
+    import sqlite3
+    from urllib.parse import quote
+    path = _mirror_db_path()
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{quote(path.as_posix(), safe='/:')}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute(
+                f"SELECT payload FROM {MIRROR_TABLE} WHERE cache_key = ?",
+                (cache_key(endpoint, params),),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or row[0] is None:
+            return None
+        return json.loads(gzip.decompress(row[0]).decode("utf-8"))
+    except Exception as exc:  # no table yet, locked, corrupt: all "not here"
+        logger.debug("Mirror read miss for %s: %s", endpoint, exc)
+        return None
+
+
 def _cache_path(endpoint: str, params: Dict[str, Any]) -> Path:
     safe_params = {k: v for k, v in sorted(params.items()) if v is not None}
     key = endpoint + "_" + "_".join(f"{k}={v}" for k, v in safe_params.items())
@@ -89,6 +199,28 @@ def plain_path(path: Path) -> Path:
     return path
 
 
+def _fs(path) -> str:
+    """The name to hand the OS for a cache file.
+
+    Windows refuses paths over 260 characters unless they carry the
+    extended-length prefix, and some cache keys are long: every "Less Than
+    10 ft" shot-quality cut is 278-284 characters under this repo's folder,
+    so on the home PC those entries could never be read back (found
+    2026-09-28, which is also why every shot-quality load re-asked nba.com
+    for four of its eight tables). Elsewhere, and for short names, the path
+    is unchanged.
+    """
+    if os.name != "nt":
+        return str(path)
+    full = os.path.abspath(str(path))
+    if len(full) >= 240 and not full.startswith(_WIN_LONG_PREFIX):
+        return _WIN_LONG_PREFIX + full
+    return full
+
+
+_WIN_LONG_PREFIX = "\\\\?\\"   # the four characters \\?\
+
+
 def load_cache_file(path) -> Any:
     """Parse one cache file, gzipped or plain, chosen by its name.
 
@@ -98,7 +230,7 @@ def load_cache_file(path) -> Any:
     entry as a miss catch Exception.
     """
     path = Path(path)
-    with open(path, "rb") as f:
+    with open(_fs(path), "rb") as f:
         raw = f.read()
     if path.name.endswith(_GZ_SUFFIX):
         raw = gzip.decompress(raw)
@@ -118,7 +250,7 @@ def cache_candidates(path: Path) -> List[Tuple[Path, os.stat_result]]:
     found = []
     for rank, p in enumerate((gz_path(path), path)):
         try:
-            found.append((p, p.stat(), rank))
+            found.append((p, os.stat(_fs(p)), rank))
         except OSError:
             continue
     found.sort(key=lambda t: (-t[1].st_mtime, t[2]))
@@ -157,10 +289,14 @@ def _write_cache(path: Path, data: Dict) -> None:
     tmp_name = None
     try:
         payload = gzip.compress(json.dumps(data).encode("utf-8"), compresslevel=6)
-        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+        # The temp file sits beside the target with a longer name, so it
+        # needs the long-path prefix whenever the target does.
+        tmp_dir = (_WIN_LONG_PREFIX + os.path.abspath(str(target.parent))
+                   if _fs(target).startswith(_WIN_LONG_PREFIX) else _fs(target.parent))
+        fd, tmp_name = tempfile.mkstemp(dir=tmp_dir, prefix=target.name + ".", suffix=".tmp")
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
-        os.replace(tmp_name, target)
+        os.replace(tmp_name, _fs(target))
         tmp_name = None
     except Exception as exc:
         logger.debug("Cache write error (%s): %s", target, exc)
@@ -172,7 +308,7 @@ def _write_cache(path: Path, data: Dict) -> None:
             except OSError:
                 pass
     try:
-        path.unlink(missing_ok=True)
+        Path(_fs(path)).unlink(missing_ok=True)
     except OSError as exc:
         logger.debug("Could not remove superseded %s: %s", path, exc)
 
@@ -200,7 +336,12 @@ class NBAStatsClient:
 
             with get_client().outbound_slot("playercareerstats"):
                 data = playercareerstats.PlayerCareerStats(...).get_dict()
+
+        With NBA_STATS_LIVE=off this raises LiveFetchDisabled on entry, before
+        the lock: a refused turn should not queue behind other callers.
         """
+        if not live_fetch_enabled():
+            raise LiveFetchDisabled(endpoint_name)
         with self._lock:
             wait = self._rate_delay - (time.time() - self._last_request_time)
             if wait > 0:
@@ -224,6 +365,17 @@ class NBAStatsClient:
         if cached is not None:
             logger.debug("Cache HIT: %s", endpoint_name)
             return cached
+        if not live_fetch_enabled():
+            # A disk copy past its TTL is NOT served in its place: an old
+            # answer that looks current is the silent-fallback shape this
+            # project has been bitten by. The mirror is different: it is the
+            # home PC's deliberate published copy, as current as the rest of
+            # the database this server was given.
+            mirrored = read_mirror(endpoint_name, params)
+            if mirrored is not None:
+                logger.debug("Mirror HIT: %s", endpoint_name)
+                return mirrored
+            raise LiveFetchDisabled(endpoint_name)
 
         for attempt in range(1, _MAX_RETRIES + 1):
             with self._lock:

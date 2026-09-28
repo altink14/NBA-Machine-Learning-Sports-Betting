@@ -73,6 +73,7 @@ from src.Sports.ledger import ensure_ledger as _ensure_ledger
 from src.Utils import availability as availability_adjust
 from src.Utils import espn_injuries
 from src.Utils import similar_players
+from src.Utils import pbp_archive
 
 
 
@@ -322,6 +323,35 @@ app = FastAPI(
 # src/Utils/api_contracts.py and Tests/Api_Contracts_Test.py.
 from src.Utils import api_contracts as _api_contracts
 _api_contracts.install(app)
+
+# NBA_STATS_LIVE=off (the public server: stats.nba.com refuses cloud IPs).
+# Importing the client installs its guard on nba_api itself, so a direct
+# nba_api call anywhere in this process is refused too. A route that needed
+# nba.com answers at once with a 503 that says why, instead of hanging for
+# the library's timeout and then reporting a generic upstream failure.
+from src.Utils.nba_stats_client import LiveFetchDisabled, live_fetch_enabled
+from fastapi.responses import JSONResponse as _LiveOffJSON
+
+LIVE_ONLY_REASON = (
+    "This needs a live stats.nba.com request. That source refuses cloud "
+    "servers, so it is only fetched on the home PC, and this data has not "
+    "been copied here."
+)
+
+
+@app.exception_handler(LiveFetchDisabled)
+def _live_fetch_disabled_handler(request: Request, exc: LiveFetchDisabled):
+    return _LiveOffJSON(status_code=503, content={
+        "detail": LIVE_ONLY_REASON,
+        "available": False,
+        "reason": "live-only",
+        "endpoint": exc.endpoint,
+    })
+
+
+if not live_fetch_enabled():
+    logger.warning("NBA_STATS_LIVE=off: no stats.nba.com requests from this process; "
+                   "routes that need one answer 503 'live-only'.")
 if SLOWAPI_AVAILABLE:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -2130,6 +2160,8 @@ def get_player_matchups(request: Request, player_id: int, season: str = CURRENT_
                                             off_player_id=player_id)
         as_defense = client.season_matchups(season=season, season_type=season_type,
                                             def_player_id=player_id)
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Matchup fetch failed for {player_id} {season}: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail="stats.nba.com did not answer for matchup data.")
@@ -2905,6 +2937,8 @@ def get_team_play_types(request: Request, season: str = CURRENT_SEASON, season_t
                         "poss": tot_poss,
                         "ppp": round(tot_pts / tot_poss, 4) if tot_poss else None,
                     }
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching play types for {season}: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail="Could not fetch Synergy play-type data from nba.com.")
@@ -3017,6 +3051,8 @@ def _rebounding_for(season: str, season_type: str = "Regular Season") -> Dict[st
     from src.Utils.nba_stats_client import get_client
     try:
         rows = get_client().league_pt_stats(season, season_type, "Rebounding")
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching rebounding tracking for {season}: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail="Could not fetch tracking rebounding data from nba.com.")
@@ -3082,6 +3118,8 @@ def get_shot_quality(season: str = CURRENT_SEASON, season_type: str = "Regular S
         return _shot_quality_cache[key]
     try:
         result = shot_quality.compute_shot_quality(season, season_type)
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error computing shot quality for {season}: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail="Could not fetch tracking shot data from nba.com.")
@@ -3821,7 +3859,9 @@ def _next_class_debut(conn) -> Optional[Dict[str, Any]]:
     opening = None
     try:
         from src.Utils import nba_stats_client as nsc
-        league = nsc._read_cache(nsc._cache_path("scheduleleaguev2", {"season": nxt, "league_id": "00"}), None)
+        sched_params = {"season": nxt, "league_id": "00"}
+        league = (nsc._read_cache(nsc._cache_path("scheduleleaguev2", sched_params), None)
+                  or nsc.read_mirror("scheduleleaguev2", sched_params))
         dates = []
         for gd in ((league or {}).get("leagueSchedule") or {}).get("gameDates") or []:
             for g in gd.get("games") or []:
@@ -4339,7 +4379,8 @@ def get_milestone_watch(limit: int = 25):
 
         watch.sort(key=lambda w: w["remaining"] / MILESTONE_STEPS[w["stat"]])
         if stale:
-            _refresh_career_official_async(stale)
+            if live_fetch_enabled():
+                _refresh_career_official_async(stale)
         return {"count": len(watch), "milestones": watch[:limit],
                 "players_checked": len(seed_rows) - len(unavailable),
                 "unavailable": unavailable}
@@ -5632,6 +5673,14 @@ def get_shot_chart(request: Request, game_date: str, home_team: str):
         if game_id in shot_chart_cache:
             logger.info(f"Returning cached shot chart data for game: {game_id}")
             return shot_chart_cache[game_id]
+
+        # Our own play-by-play first: the same shots, coordinates and results
+        # (see src/Utils/pbp_archive.py), and no request to nba.com.
+        archived = pbp_archive.game_shots(conn, game_id)
+        if archived is not None:
+            response_data = {"game_id": game_id, "shots": archived, "source": pbp_archive.SOURCE}
+            shot_chart_cache[game_id] = response_data
+            return response_data
             
         logger.info(f"Fetching shot chart detail from NBA Stats API for game: {game_id}")
         with _nba_slot("shotchartdetail"):
@@ -5684,6 +5733,8 @@ def get_shot_chart(request: Request, game_date: str, home_team: str):
         shot_chart_cache[game_id] = response_data
         return response_data
         
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching game shot chart: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5759,9 +5810,38 @@ def get_player_shot_chart(request: Request, player_id: int, season: str = CURREN
             logger.info(f"Returning cached player shot chart for key: {cache_key}")
             return payload
 
+    if not live_fetch_enabled():
+        # The public server (NBA_STATS_LIVE=off): the player's shots from our
+        # play-by-play, zoned by pbp_archive.classify_zone, and the league's
+        # zone averages from the home PC's published copy when it has them.
+        # Before 2019-20 we hold no play-by-play, so that stays live-only.
+        conn = get_db_conn()
+        try:
+            got = pbp_archive.player_shots(conn, player_id, season, season_type)
+        finally:
+            conn.close()
+        if got is None:
+            raise LiveFetchDisabled("shotchartdetail")
+        averages = _get_league_shot_averages(season, season_type)
+        response_data = {
+            "player_id": player_id,
+            "season": season,
+            "season_type": season_type,
+            "shots": got["shots"],
+            "averages": averages or [],
+            "league_averages": averages or [],
+            # True = no league zone averages here, not "the league took no shots".
+            "league_averages_unavailable": averages is None,
+            "coverage": got["coverage"],
+            "source": pbp_archive.SOURCE,
+            "zones_method": pbp_archive.ZONES_METHOD,
+        }
+        player_shot_chart_cache[cache_key] = (response_data, datetime.now())
+        return response_data
+
     if not shotchartdetail:
         raise HTTPException(status_code=500, detail="nba_api library not imported")
-        
+
     try:
         logger.info(f"Fetching shot chart detail from NBA stats API for player: {player_id}, "
                     f"season: {season}, season_type: {season_type}")
@@ -6483,6 +6563,38 @@ def _player_season_line(conn, player_id: int, season: str, season_type: str = "R
     return totals, advanced, len(stints)
 
 
+def _bio_from_directory(conn, player_id: int) -> Dict[str, Any]:
+    """A bio from tables we already hold, for a player with no player_bio row.
+
+    `players` (nba.com's playerindex, refreshed by the player_bios job) has
+    position, height, weight, college, country, jersey and last team for
+    ~5,100 players; `draft_history` has the draft slot. Birth date and years
+    of experience are in neither, so they stay unknown (the page prints N/A)
+    rather than being guessed. Added 2026-09-28: the public server cannot
+    fetch commonplayerinfo, and only 256 players have a player_bio row.
+    """
+    p = conn.execute(
+        "SELECT position, height, weight, college, country, jersey, last_team, last_team_id "
+        "FROM players WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    d = conn.execute(
+        "SELECT season, round_number, overall_pick FROM draft_history "
+        "WHERE person_id = ? ORDER BY season LIMIT 1", (player_id,)
+    ).fetchone()
+    if not p and not d:
+        return {}
+    p = dict(p) if p else {}
+    return {
+        "position": p.get("position"), "height": p.get("height"), "weight": p.get("weight"),
+        "school": p.get("college"), "country": p.get("country"), "jersey": p.get("jersey"),
+        "team_abbr": p.get("last_team"), "team_id": p.get("last_team_id"),
+        "draft_year": d["season"] if d else None,
+        "draft_round": d["round_number"] if d else None,
+        "draft_number": d["overall_pick"] if d else None,
+        "birth_date": None, "years_experience": None,
+    }
+
+
 @app.get("/api/players/{id}")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
@@ -6507,8 +6619,9 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
         if bio_row:
             bio_data = dict(bio_row)
             
-        # Check if cache miss or fetched_at is NULL
-        if not bio_data or not bio_data.get("fetched_at"):
+        # Check if cache miss or fetched_at is NULL (never asked when nba.com
+        # is switched off: see _bio_from_directory below for what is shown)
+        if (not bio_data or not bio_data.get("fetched_at")) and live_fetch_enabled():
             # Per-player in-flight lock: the first concurrent request fetches, the rest
             # wait and then read the row it wrote instead of hitting the NBA themselves.
             with _bio_lock(id):
@@ -6618,6 +6731,9 @@ def get_player_by_id(request: Request, id: int, season: str = CURRENT_SEASON):
                     except Exception as e:
                         logger.error(f"Error fetching CommonPlayerInfo for player ID {id}: {e}", exc_info=True)
         
+        if not bio_data.get("fetched_at"):
+            bio_data = _bio_from_directory(conn, id)
+
         # 2-3. The season, whole: every stint for a traded player, and real
         # advanced figures (see _player_season_line; this was "LIMIT 1" with
         # no order, an arbitrary partial stint).
@@ -6793,6 +6909,11 @@ def get_player_heat_calendar(id: int, season: Optional[str] = None):
             return {
                 "player_id": id, "player": exists["full_name"], "season": None,
                 "seasons": [], "games": 0, "entries": [],
+                # The calendar's header reads totals.mean_game_score, and this
+                # answer had no `totals`, so every player whose career ended
+                # before 1996-97 got an error page instead of a player page
+                # (found 2026-09-28, Alaa Abdelnaby). Unknown, not zero.
+                "totals": {"pts": None, "mean_game_score": None},
                 "note": "No game logs on record for this player.",
             }
 
@@ -8465,6 +8586,11 @@ def _ensure_team_passing(conn, team_id: int, season: str, season_type: str) -> N
             made = client.player_pass_dashboard(
                 player_id=pid, team_id=team_id, season=season, season_type=season_type
             )
+        except LiveFetchDisabled:
+            # Nobody was asked. Swallowing this (as the line below does for a
+            # failed request) would write a fetch-log row with 0 edges and
+            # the team-season would show an empty wheel for good.
+            raise
         except Exception as exc:
             # One dead player call must not lose the other seventeen.
             logger.warning("Pass dashboard failed for player %s (%s): %s", pid, season, exc)
@@ -8653,6 +8779,8 @@ def get_team_passing(
         }
     except HTTPException:
         raise
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching team passing for {abbr}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -8813,7 +8941,14 @@ def get_game_play_by_play(request: Request, game_id: str):
             # Cache hit - return the cached JSON directly
             return json.loads(row["pbp_json"])
             
-        # 2. Cache miss - fall back to live play_by_play call
+        # 2. Our own play-by-play table (2019-20 on; the full feed above is
+        # held for a handful of games only). The public server cannot ask
+        # nba.com, and at home this saves the request.
+        archived = pbp_archive.pbp_actions(conn, game_id)
+        if archived is not None:
+            return archived
+
+        # 3. Cache miss - fall back to live play_by_play call
         logger.info(f"PBP cache miss for game {game_id}. Querying live stats.nba.com...")
         from src.Utils.nba_stats_client import get_client
         client = get_client()
@@ -8828,8 +8963,10 @@ def get_game_play_by_play(request: Request, game_id: str):
             )
             conn.commit()
             logger.info(f"PBP data cached successfully in box_scores for game {game_id}.")
-            
+
         return events
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching play-by-play events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -8854,6 +8991,9 @@ def _load_pbp_actions(game_id: str) -> List[Dict[str, Any]]:
         row = cursor.fetchone()
         if row and row["pbp_json"]:
             return json.loads(row["pbp_json"])
+        archived = pbp_archive.pbp_actions(conn, game_id)
+        if archived is not None:
+            return archived
     except Exception as e:
         logger.warning(f"DB pbp_json lookup failed for game {game_id}: {e}")
     finally:
@@ -8934,6 +9074,8 @@ def get_game_flow(request: Request, game_id: str):
 
     try:
         actions = _load_pbp_actions(game_id)
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Upstream play-by-play fetch failed for game {game_id}: {e}", exc_info=True)
         raise HTTPException(
@@ -8983,6 +9125,29 @@ def get_game_shot_chart(request: Request, game_id: str):
             cached["league_averages"] = la or []
             cached["league_averages_unavailable"] = la is None
         return cached
+
+    # Our own play-by-play first (2019-20 on): the same shots as
+    # ShotChartDetail, checked shot for shot (src/Utils/pbp_archive.py), with
+    # no request to nba.com, which the public server cannot make.
+    conn = get_db_conn()
+    try:
+        archived = pbp_archive.game_shots(conn, game_id)
+    finally:
+        conn.close()
+    if archived is not None:
+        try:
+            league_averages = _get_league_shot_averages(_season_from_game_id(game_id))
+        except Exception:
+            league_averages = None
+        response_data = {
+            "game_id": game_id,
+            "shots": archived,
+            "league_averages": league_averages or [],
+            "league_averages_unavailable": league_averages is None,
+            "source": pbp_archive.SOURCE,
+        }
+        shot_chart_cache[game_id] = response_data
+        return response_data
 
     try:
         logger.info(f"Fetching shot chart detail from NBA Stats API for game: {game_id}")
@@ -9047,6 +9212,8 @@ def get_game_shot_chart(request: Request, game_id: str):
         shot_chart_cache[game_id] = response_data
         return response_data
 
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching game shot chart: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -9325,6 +9492,8 @@ def get_hustle_stats(request: Request, season: str = CURRENT_SEASON, season_type
         # kept for good instead of being re-asked of nba.com every hour.
         ttl = None if season < CURRENT_SEASON else 3600
         rows = get_client().league_hustle_stats(season=season, season_type=season_type, ttl=ttl)
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching hustle stats: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Could not reach the hustle feed.")
@@ -10596,6 +10765,8 @@ def get_league_schedule(
         from src.Utils.nba_stats_client import get_client
 
         league = get_client().schedule_league_v2(season=season)
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching league schedule: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Could not reach the NBA schedule feed.")
@@ -11080,6 +11251,8 @@ def get_lineups(
             season=season, season_type=season_type,
             group_quantity=group_quantity, measure_type="Advanced",
         )
+    except LiveFetchDisabled:
+        raise   # 503 'live-only' (the handler near the app setup), not an upstream failure
     except Exception as e:
         logger.error(f"Error fetching lineups: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Could not reach the lineup feed.")

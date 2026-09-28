@@ -269,7 +269,8 @@ Backend: `DB_SNAPSHOT_URL`, `CORS_ORIGINS`, **`INTERNAL_API_KEY`** (see the secu
 charge for anything — unset, `/predictions` is served to anyone who finds the
 host, which is the product), `RATE_LIMIT_DEFAULT?`,
 `RATE_LIMIT_GLOBAL?`, `RATE_LIMIT_EXPENSIVE?`, `RATE_LIMIT_UPSTREAM?`,
-`NBA_CACHE_DIR?`, `WARM_MODEL_ON_START` (set it to `true` in production —
+`NBA_CACHE_DIR?`, **`NBA_STATS_LIVE=off`** (production only — see below),
+`WARM_MODEL_ON_START` (set it to `true` in production —
 otherwise the first prediction after every restart pays the model's cold
 load and a 30s gateway gives up first), `PORT` (set by the platform).
 `ODDS_API_KEY` IS read, but only by the scheduled jobs on the home PC, never
@@ -286,6 +287,27 @@ nothing today. It is one key shared by both sports' recorders and repairs,
 which is why each keeps a quota floor for the other. `DEFAULT_SPORTSBOOK` is
 listed in `render.yaml` but read by no Python in this repo — the sportsbook is
 passed per request — so setting it does nothing.
+
+**`NBA_STATS_LIVE=off` on the public server (added 2026-09-28).** stats.nba.com
+refuses cloud IPs, so any request-time call there hangs for the library's
+timeout and then fails, once per visitor. With the switch off the backend never
+asks: `nba_stats_client` serves its disk cache (not shipped, so normally empty)
+or the `nba_response_mirror` table in `TeamData.sqlite`, and otherwise raises
+`LiveFetchDisabled` at once; the route answers **503
+`{"available": false, "reason": "live-only"}`** in milliseconds. The guard also
+sits on nba_api itself, so a direct nba_api call cannot slip past it.
+cdn.nba.com (live scoreboard) and ESPN are cloud-safe and unaffected. Leave it
+unset on the home PC (default on). What the server serves from its own tables
+instead: play-by-play, game flow and every shot chart (game and player) from
+`pbp_events` for 2019-20 on; player bios from `players` + `draft_history`; the
+schedule, NBA Cup, hustle, lineups, tracking rebounding, shot quality, Synergy
+play types and shot-zone averages from `nba_response_mirror`, which the home PC
+fills (`src/Utils/nba_mirror.py`; refresh_registry job `server_mirror`, off
+until `NBA_MIRROR_REFRESH=on` is in the home PC's `.env`; one-off history fill:
+`venv/Scripts/python.exe -m src.Utils.nba_mirror --all-seasons`, ~900 requests,
+resumable). Re-publish the snapshot after the mirror fills, or the server has
+none of it. Still live-only in production: defensive matchups, play-by-play and
+shot charts before 2019-20, and any mirror table the home PC has not fetched.
 
 Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `STRIPE_SECRET_KEY`,

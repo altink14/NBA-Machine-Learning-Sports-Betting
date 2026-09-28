@@ -223,6 +223,48 @@ def build_absences(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# A note older than this says nothing about tonight: ESPN keeps a player listed
+# until a new note posts, so the offseason wire carries "Out" notes from May
+# and Summer League "Day-To-Day" notes from July (found 2026-09-27; one was 154
+# days old). Same threshold as main_api.INJURY_STALE_DAYS and the frontend's
+# src/lib/injury-freshness.ts. Owner's decision 2026-09-28: predictions ignore
+# stale notes too, and say which ones they ignored.
+STALE_AFTER_DAYS = 30
+
+
+def split_stale(absences: Dict[str, Any], now: Optional[datetime] = None,
+                max_age_days: int = STALE_AFTER_DAYS) -> tuple:
+    """(fresh, stale) from a get_absences() structure. `fresh` is a copy with
+    notes older than `max_age_days` removed from by_team; `stale` lists the
+    removed entries (with team and age). A note with no date is kept: its age
+    is unknown, and dropping it would be a guess the other way."""
+    now = now or datetime.now(timezone.utc)
+    fresh_by_team: Dict[str, List[Dict[str, Any]]] = {}
+    stale: List[Dict[str, Any]] = []
+    for abbr, players in ((absences or {}).get("by_team") or {}).items():
+        keep = []
+        for p in players:
+            age = None
+            raw = p.get("date") or ""
+            if raw:
+                try:
+                    ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age = max(0, int((now - ts).total_seconds() // 86400))
+                except ValueError:
+                    age = None
+            if age is not None and age > max_age_days:
+                stale.append({**p, "team": abbr, "age_days": age})
+            else:
+                keep.append(p)
+        if keep:
+            fresh_by_team[abbr] = keep
+    fresh = {**(absences or {}), "by_team": fresh_by_team, "stale_ignored": len(stale),
+             "stale_after_days": max_age_days}
+    return fresh, stale
+
+
 def get_absences(force_refresh: bool = False) -> Dict[str, Any]:
     """Current OUT/DOUBTFUL players by team abbr, cached for 60 seconds.
 

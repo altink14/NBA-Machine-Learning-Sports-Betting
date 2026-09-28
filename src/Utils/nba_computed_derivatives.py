@@ -253,6 +253,13 @@ def compute_game_advanced(team: BoxScoreTeam, opp: BoxScoreTeam) -> Tuple[GameAd
 # Simple Rating System (SRS)
 # ---------------------------------------------------------------------------
 
+# Every game margin is clipped to +/-30 before the solve, so one 50-point rout
+# cannot outweigh a month of results. basketball-reference uses margins as
+# played, so our SRS will not match theirs; the standings endpoint reports how
+# many games the cap touched and what SRS would be without it.
+SRS_BLOWOUT_CAP = 30.0
+
+
 @dataclass
 class TeamRecord:
     """Input record for SRS solver."""
@@ -266,7 +273,7 @@ def compute_srs(
     team_records: Dict[int, TeamRecord],
     max_iterations: int = 2000,
     convergence_threshold: float = 1e-6,
-    blowout_cap: float = 30.0,
+    blowout_cap: float = SRS_BLOWOUT_CAP,
     ot_penalty: float = 0.5,
     ot_periods: Optional[Dict[str, int]] = None,  # game_id → ot_periods
 ) -> Tuple[Dict[int, float], float]:

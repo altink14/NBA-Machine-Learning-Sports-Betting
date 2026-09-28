@@ -40,13 +40,19 @@ from typing import Dict, List, Optional
 #: The tables carried to the server, with the triggers each one must have
 #: there before we will write into it. odds_snapshots is observations, not
 #: predictions, so it has no immutability triggers of its own; the shrink
-#: check below still refuses an upload that has lost any of them.
+#: check below still refuses an upload that has lost any of them. The odds
+#: heartbeat (odds_polls: one row per poll; odds_seen: first/last sighting per
+#: game, book and market) joined on 2026-09-28 so the public Line Shop can tell
+#: a current price from one a book has pulled. Order matters: odds_polls
+#: before odds_seen, whose last_poll_id points at it.
 SYNCED_TABLES: Dict[str, frozenset] = {
     "predictions_log": frozenset({
         "predictions_log_immutable", "predictions_log_no_regrade", "predictions_log_no_delete"}),
     "ledger": frozenset({
         "ledger_prediction_is_immutable", "ledger_no_regrade", "ledger_no_delete"}),
     "odds_snapshots": frozenset(),
+    "odds_polls": frozenset(),
+    "odds_seen": frozenset(),
 }
 
 #: The natural key of each table: the thing that says which game a row is
@@ -56,7 +62,25 @@ NATURAL_KEYS: Dict[str, tuple] = {
     "predictions_log": ("log_date", "sportsbook", "game_key"),
     "ledger": ("game_id", "market_type", "side", "model_version"),
     "odds_snapshots": ("captured_at", "sportsbook", "game_key"),
+    "odds_polls": ("polled_at", "sport", "source"),
+    "odds_seen": ("source", "sport", "game_key", "sportsbook", "market"),
 }
+
+#: The columns that identify a row across the two copies. Every table has an
+#: integer `id` except odds_seen, which is keyed by what it describes (so it
+#: can never "move" to another game: its identity IS its natural key).
+IDENTITY: Dict[str, tuple] = {
+    "odds_seen": ("source", "sport", "game_key", "sportsbook", "market"),
+}
+
+
+def _identity(table: str) -> tuple:
+    return IDENTITY.get(table, ("id",))
+
+
+def _match(table: str, left: str, right: str) -> str:
+    """SQL that pairs a row of `left` with the same row of `right`."""
+    return " AND ".join(f"{left}.{_q(c)} = {right}.{_q(c)}" for c in _identity(table))
 
 
 class SyncRefused(Exception):
@@ -101,12 +125,14 @@ def fingerprint(conn: sqlite3.Connection, schema: str = "main",
             sorted(c for c, _ in _columns(conn, table, schema))
         h = hashlib.sha256()
         n = 0
+        order = ", ".join(_q(c) for c in _identity(table))
         for row in conn.execute(
-                f"SELECT {', '.join(_q(c) for c in cols)} FROM {schema}.{_q(table)} ORDER BY id"):
+                f"SELECT {', '.join(_q(c) for c in cols)} FROM {schema}.{_q(table)} ORDER BY {order}"):
             h.update(json.dumps(list(row), separators=(",", ":"), default=str).encode("utf-8"))
             h.update(b"\n")
             n += 1
-        max_id = conn.execute(f"SELECT MAX(id) FROM {schema}.{_q(table)}").fetchone()[0]
+        max_id = (conn.execute(f"SELECT MAX(id) FROM {schema}.{_q(table)}").fetchone()[0]
+                  if _identity(table) == ("id",) else None)
         out[table] = {"rows": n, "max_id": max_id, "sha256": h.hexdigest()}
     return out
 
@@ -182,18 +208,19 @@ def merge(conn: sqlite3.Connection, upload_path: str) -> dict:
                 names = [c for c, _ in up_cols]
                 hashed_columns[t] = names
                 key = NATURAL_KEYS[t]
+                ident = _identity(t)
                 tq = _q(t)
 
                 lost = conn.execute(
                     f"SELECT COUNT(*) FROM main.{tq} s WHERE NOT EXISTS "
-                    f"(SELECT 1 FROM up.{tq} u WHERE u.id = s.id)").fetchone()[0]
+                    f"(SELECT 1 FROM up.{tq} u WHERE {_match(t, 'u', 's')})").fetchone()[0]
                 if lost:
                     raise SyncRefused(
                         f"{t}: the upload is missing {lost} row(s) the public copy already has. "
                         "That is a deletion; the public record only grows.")
 
                 moved = conn.execute(
-                    f"SELECT COUNT(*) FROM main.{tq} s JOIN up.{tq} u ON u.id = s.id WHERE "
+                    f"SELECT COUNT(*) FROM main.{tq} s JOIN up.{tq} u ON {_match(t, 'u', 's')} WHERE "
                     + " OR ".join(f"s.{_q(k)} IS NOT u.{_q(k)}" for k in key)).fetchone()[0]
                 if moved:
                     raise SyncRefused(
@@ -201,24 +228,30 @@ def merge(conn: sqlite3.Connection, upload_path: str) -> dict:
                         "copies were written independently; there is no honest merge.")
 
                 col_list = ", ".join(_q(c) for c in names)
+                order = ", ".join(f"u.{_q(c)}" for c in ident)
                 inserted = conn.execute(
                     f"INSERT INTO main.{tq} ({col_list}) SELECT {col_list} FROM up.{tq} u "
-                    f"WHERE u.id NOT IN (SELECT id FROM main.{tq}) ORDER BY u.id").rowcount
+                    f"WHERE NOT EXISTS (SELECT 1 FROM main.{tq} s WHERE {_match(t, 's', 'u')}) "
+                    f"ORDER BY {order}").rowcount
 
-                others = [c for c in names if c != "id"]
+                others = [c for c in names if c not in ident]
                 differs = " OR ".join(f"s.{_q(c)} IS NOT u.{_q(c)}" for c in others) or "0"
-                changed_ids = [r[0] for r in conn.execute(
-                    f"SELECT s.id FROM main.{tq} s JOIN up.{tq} u ON u.id = s.id WHERE {differs}")]
+                ident_cols = ", ".join(f"s.{_q(c)}" for c in ident)
+                changed = [tuple(r) for r in conn.execute(
+                    f"SELECT {ident_cols} FROM main.{tq} s JOIN up.{tq} u ON {_match(t, 'u', 's')} "
+                    f"WHERE {differs}")]
                 # One UPDATE per changed row, so the triggers judge each row
                 # exactly as they would a local grading write. A pick that
                 # changed raises here and the whole transaction is undone.
-                set_clause = ", ".join(f"{_q(c)} = (SELECT {_q(c)} FROM up.{tq} u WHERE u.id = ?)"
+                where_up = " AND ".join(f"u.{_q(c)} = ?" for c in ident)
+                where_main = " AND ".join(f"{_q(c)} = ?" for c in ident)
+                set_clause = ", ".join(f"{_q(c)} = (SELECT {_q(c)} FROM up.{tq} u WHERE {where_up})"
                                        for c in others)
-                for rid in changed_ids:
-                    conn.execute(f"UPDATE main.{tq} SET {set_clause} WHERE id = ?",
-                                 [rid] * len(others) + [rid])
+                for key_values in changed:
+                    conn.execute(f"UPDATE main.{tq} SET {set_clause} WHERE {where_main}",
+                                 list(key_values) * len(others) + list(key_values))
 
-                report[t] = {"inserted": inserted, "updated": len(changed_ids),
+                report[t] = {"inserted": inserted, "updated": len(changed),
                              "columns_added": added}
             conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:

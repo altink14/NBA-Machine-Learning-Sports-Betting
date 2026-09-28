@@ -120,6 +120,10 @@ def matchup_availability(
 
     if absences is None:
         absences = espn_injuries.get_absences()
+    # Stale notes (older than espn_injuries.STALE_AFTER_DAYS) never move a
+    # number; idempotent when the caller already filtered.
+    if isinstance(absences, dict):
+        absences, _stale = espn_injuries.split_stale(absences)
     by_team = absences.get("by_team", {}) if isinstance(absences, dict) else {}
 
     def side(abbr: str) -> Dict[str, Any]:

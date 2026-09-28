@@ -63,7 +63,7 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
 from src.Utils.odds_api_client import (  # noqa: E402
-    OddsApiError, fetch_nba_events, snapshot_nba_board,
+    OddsApiError, fetch_nba_events, snapshot_nba_board, SOURCE_ODDS_API,
 )
 
 logging.basicConfig(
@@ -127,24 +127,51 @@ def _minutes_to_nearest_tip(events) -> float:
 
 
 def _minutes_since_last_capture() -> float:
-    """How long since we last wrote a snapshot, from the archive itself."""
+    """How long since we last spent credits on the board.
+
+    Until 2026-09-28 this read MAX(captured_at) from odds_snapshots, but the
+    snapshot writer stores a row only when a price CHANGES, so on a quiet
+    board the "last capture" looked hours old and the cooldown never held:
+    the recorder could pay for the board every 15 minutes. The poll log
+    (odds_polls, written on every Odds API poll since the heartbeat) knows
+    when we last asked. A poll counts when the API answered (ok, empty, or a
+    failure after events came back, e.g. an archive write that failed); a
+    fetch that never got an answer did not spend a capture. Without the poll
+    log (before its first run) this falls back to the snapshot rows, as it
+    always did."""
+    stamps = []
     try:
         conn = sqlite3.connect(DB_PATH)
         try:
             row = conn.execute("SELECT MAX(captured_at) FROM odds_snapshots").fetchone()
+            if row and row[0]:
+                stamps.append(row[0])
+            try:
+                row = conn.execute(
+                    "SELECT MAX(polled_at) FROM odds_polls WHERE sport = 'NBA' AND source = ? "
+                    "AND (status IN ('ok', 'empty') OR events IS NOT NULL)",
+                    (SOURCE_ODDS_API,),
+                ).fetchone()
+                if row and row[0]:
+                    stamps.append(row[0])
+            except sqlite3.OperationalError:
+                pass  # no odds_polls table yet: the first heartbeat poll creates it
         finally:
             conn.close()
     except sqlite3.Error:
         return float("inf")
-    if not row or not row[0]:
+    latest = None
+    for raw in stamps:
+        try:
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        latest = ts if latest is None or ts > latest else latest
+    if latest is None:
         return float("inf")
-    try:
-        last = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
-    except ValueError:
-        return float("inf")
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - last).total_seconds() / 60.0
+    return (datetime.now(timezone.utc) - latest).total_seconds() / 60.0
 
 
 def should_capture(events) -> tuple:

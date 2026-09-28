@@ -1553,6 +1553,13 @@ class PredictionRunner:
                         "note": "injury feed unavailable - not assessed",
                     }
                 return result
+            # Notes older than espn_injuries.STALE_AFTER_DAYS say nothing about
+            # tonight (owner's decision 2026-09-28): they are left out of the
+            # adjustment and named on each game they would have touched.
+            absences, stale_notes = espn_injuries.split_stale(absences)
+            stale_by_team: Dict[str, List[str]] = {}
+            for n in stale_notes:
+                stale_by_team.setdefault(n["team"], []).append(f'{n.get("name")} ({n["age_days"]} days old)')
             for pred in preds:
                 try:
                     home_abbr = espn_injuries.resolve_team_abbr(pred.get("home_team") or "")
@@ -1570,6 +1577,7 @@ class PredictionRunner:
                             + [p["name"] for p in info["away"]["players_out"]]
                         ),
                         "note": "impact-adjusted",
+                        "stale_notes_ignored": stale_by_team.get(home_abbr, []) + stale_by_team.get(away_abbr, []),
                     }
                 except Exception as ex:
                     logger.warning(f"Availability attach skipped for one game (non-fatal): {ex}")
@@ -3593,6 +3601,100 @@ def get_games_by_date(game_date: str):
 
 
 # --- Rookies: a draft class's first-season stats ---
+def _season_label(start_year: int) -> str:
+    return f"{start_year}-{(start_year + 1) % 100:02d}"
+
+
+def _rookie_slot_baselines(conn, draft_year: int, season_type: str) -> Dict[str, Any]:
+    """What a rookie drafted in each Pick Value band typically did in year one.
+
+    For every other archived class, each pick's first season after the draft
+    (stints summed), pooled into the Pick Value page's bands. Medians over
+    EVERY pick in the band: a pick who played no NBA minutes that season counts
+    as zero, because "what a pick-40 rookie gives you" includes the ones who
+    never got on the floor. The class being shown is left out of its own
+    baseline.
+    """
+    seasons = {r[0] for r in conn.execute(
+        "SELECT DISTINCT season FROM player_season_totals WHERE season_type = ?", (season_type,))}
+    classes = sorted(y for y in {int(s[:4]) for s in seasons if s[:4].isdigit()} if y != draft_year)
+    if not classes:
+        return {"bands": [], "classes": None}
+    totals = {}
+    for r in conn.execute(
+        """
+        SELECT player_id, season, SUM(gp) AS gp, SUM(min) AS min, SUM(pts) AS pts
+        FROM player_season_totals WHERE season_type = ? GROUP BY player_id, season
+        """, (season_type,)):
+        totals[(r["player_id"], r["season"])] = r
+    picks = conn.execute(
+        """
+        SELECT person_id, season, overall_pick FROM draft_history
+        WHERE season BETWEEN ? AND ? AND season != ? AND overall_pick BETWEEN 1 AND 60
+        """, (classes[0], classes[-1], draft_year)).fetchall()
+
+    def median(vals):
+        vals = sorted(vals)
+        return round(vals[len(vals) // 2], 1) if vals else None
+
+    bands = []
+    for lo, hi in PICK_VALUE_BANDS:
+        mpg, ppg, played = [], [], 0
+        for p in picks:
+            if not lo <= p["overall_pick"] <= hi:
+                continue
+            t = totals.get((p["person_id"], _season_label(p["season"])))
+            gp = (t["gp"] or 0) if t else 0
+            if gp > 0:
+                played += 1
+                mpg.append((t["min"] or 0) / gp)
+                ppg.append((t["pts"] or 0) / gp)
+            else:
+                mpg.append(0.0)
+                ppg.append(0.0)
+        n = len(mpg)
+        if not n:
+            continue
+        bands.append({
+            "label": f"{lo}-{hi}", "from_pick": lo, "to_pick": hi, "n_players": n,
+            "median_mpg": median(mpg), "median_ppg": median(ppg),
+            "share_played": round(played / n * 100, 1),
+        })
+    return {"bands": bands, "classes": {"first": classes[0], "last": classes[-1],
+                                         "excluded": draft_year}}
+
+
+def _next_class_debut(conn) -> Optional[Dict[str, Any]]:
+    """The drafted class whose rookie season has not started, and its opening night.
+
+    Opening night is the first regular-season date in the published schedule,
+    read from the schedule cache on disk only (no network: a page load must not
+    wait on nba.com). None when the next season is already the current one or
+    no class is on file; opening_night is None when the schedule is not cached.
+    """
+    nxt = _schedule_season()
+    if nxt <= CURRENT_SEASON:
+        return None
+    year = int(nxt[:4])
+    n = conn.execute("SELECT COUNT(*) FROM draft_history WHERE season = ?", (year,)).fetchone()[0]
+    if not n:
+        return None
+    opening = None
+    try:
+        from src.Utils import nba_stats_client as nsc
+        league = nsc._read_cache(nsc._cache_path("scheduleleaguev2", {"season": nxt, "league_id": "00"}), None)
+        dates = []
+        for gd in ((league or {}).get("leagueSchedule") or {}).get("gameDates") or []:
+            for g in gd.get("games") or []:
+                if str(g.get("gameId") or "")[:3] == "002" and (g.get("gameDateEst") or g.get("gameDateTimeEst")):
+                    dates.append(str(g.get("gameDateEst") or g.get("gameDateTimeEst"))[:10])
+        opening = min(dates) if dates else None
+    except Exception as e:  # a missing or unreadable cache is "unknown", not an error
+        logger.info(f"Opening night not read from the schedule cache: {e}")
+    return {"draft_year": year, "season": nxt, "picks": n, "opening_night": opening,
+            "opening_night_source": "published league schedule (cached)" if opening else None}
+
+
 @app.get("/api/stats/rookies")
 def get_rookies(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
@@ -3653,7 +3755,19 @@ def get_rookies(season: str = CURRENT_SEASON, season_type: str = "Regular Season
                     """, (row["player_id"], season, season_type))]
                 row["team_abbr"] = "/".join(teams) if teams else None
             rookies.append(row)
-        return {"season": season, "draft_year": draft_year, "rookies": rookies}
+        from src.Utils.school_names import common_school_name
+        for row in rookies:
+            row["organization"] = common_school_name(row.get("organization"))
+        # Each rookie's band, so the page can set his year beside the typical
+        # rookie year for his draft slot (the page's "draft slot vs production").
+        baselines = _rookie_slot_baselines(conn, draft_year, season_type)
+        for row in rookies:
+            pick = row.get("overall_pick")
+            band = next((b for b in baselines["bands"]
+                         if pick is not None and b["from_pick"] <= pick <= b["to_pick"]), None)
+            row["slot_band"] = band["label"] if band else None
+        return {"season": season, "draft_year": draft_year, "rookies": rookies,
+                "slot_baselines": baselines, "next_class": _next_class_debut(conn)}
     except Exception as e:
         logger.error(f"Error fetching rookies for {season}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -4696,6 +4810,10 @@ def get_draft_years():
 # player who debuted before that window has a clipped career and is excluded too.
 DEFAULT_PICK_VALUE_MIN_YEARS = 9
 
+#: Pick ranges pooled until n is large enough for the trend to be the signal.
+#: Shared by the Pick Value page and the Rookie Class page's slot baselines.
+PICK_VALUE_BANDS = [(1, 3), (4, 7), (8, 14), (15, 20), (21, 30), (31, 45), (46, 60)]
+
 
 @app.get("/api/draft/pick-value")
 def get_pick_value(
@@ -4786,14 +4904,14 @@ def get_pick_value(
 
         lottery = [p for p in picks if p["pick"] <= 14]
         second = [p for p in picks if p["pick"] >= 31]
+        pick1_median = next((p["median"] for p in picks if p["pick"] == 1), None)
 
         # Twenty-one players per slot is not enough to rank slot against slot: in
         # this window the median at pick 5 is HIGHER than at pick 1, which is noise,
         # not a finding about pick 5. Bands pool slots until the sample is large
         # enough for the trend to be the signal, and the page leads with these.
-        BANDS = [(1, 3), (4, 7), (8, 14), (15, 20), (21, 30), (31, 45), (46, 60)]
         bands = []
-        for lo, hi in BANDS:
+        for lo, hi in PICK_VALUE_BANDS:
             group = [g for pick in range(lo, hi + 1) for g in by_pick.get(pick, [])]
             if not group:
                 continue
@@ -4831,6 +4949,13 @@ def get_pick_value(
                     sum(p["median"] for p in lottery) / len(lottery), 1) if lottery else None,
                 "second_round_median": round(
                     sum(p["median"] for p in second) / len(second), 1) if second else None,
+                # Lottery slots whose median beat pick 1's in this window: the
+                # page's small-sample warning names them from here instead of
+                # asserting "the fifth pick" whatever the controls say.
+                "lottery_slots_above_pick1": [
+                    p["pick"] for p in picks
+                    if 2 <= p["pick"] <= 14 and pick1_median is not None and p["median"] > pick1_median
+                ],
             },
         }
     except HTTPException:
@@ -4852,79 +4977,108 @@ def get_draft_pipeline(since: int = 2000, limit: int = 40):
 
     This is the honest version of a "prospects" page. Pre-draft rankings are
     scouting opinion and no feed we can reach publishes them, but which programs
-    have actually produced NBA picks is a matter of record - 8,434 of them.
+    have actually produced NBA picks is a matter of record.
 
     Volume and quality are reported separately on purpose. A program can send
     plenty of players to the league without sending high ones, and one number
     covering both would hide the more interesting half.
+
+    Program names are the common ones (src/Utils/school_names.py: nba.com
+    records "California-Los Angeles", readers look for UCLA), grouped after the
+    rename. A pick with no school on record is not a program: it is left out of
+    the ranking and the program count and reported as `totals.no_school`
+    (a blank organization used to be counted as one more "program").
     """
+    from src.Utils.school_names import common_school_name
     conn = get_db_conn()
     try:
         rows = conn.execute(
             """
-            SELECT organization AS org,
-                   organization_type AS org_type,
-                   COUNT(*) AS picks,
-                   SUM(CASE WHEN overall_pick <= 14 THEN 1 ELSE 0 END) AS lottery,
-                   SUM(CASE WHEN round_number = 1 THEN 1 ELSE 0 END) AS first_round,
-                   MIN(overall_pick) AS best_pick,
-                   MIN(season) AS first_season,
-                   MAX(season) AS last_season
-            FROM draft_history
-            WHERE season >= ? AND organization IS NOT NULL AND organization != ''
-            GROUP BY organization, organization_type
-            ORDER BY picks DESC, lottery DESC
-            LIMIT ?
-            """,
-            (since, limit),
-        ).fetchall()
-
-        programs = []
-        for r in rows:
-            d = dict(r)
-            picks = d["picks"] or 0
-            d["lottery_rate"] = round((d["lottery"] or 0) / picks * 100, 1) if picks else None
-            # Who the program's highest pick actually was, since "best pick 1" is
-            # a number until it has a name attached.
-            top = conn.execute(
-                """
-                SELECT player_name, season, overall_pick, team_abbreviation
-                FROM draft_history
-                WHERE organization = ? AND season >= ? AND overall_pick = ?
-                ORDER BY season DESC LIMIT 1
-                """,
-                (d["org"], since, d["best_pick"]),
-            ).fetchone()
-            d["best_player"] = dict(top) if top else None
-            programs.append(d)
-
-        totals = conn.execute(
-            """
-            SELECT COUNT(*) AS picks,
-                   COUNT(DISTINCT organization) AS orgs,
-                   MIN(season) AS first_season,
-                   MAX(season) AS last_season
+            SELECT organization, organization_type, overall_pick, round_number,
+                   season, player_name, team_abbreviation
             FROM draft_history WHERE season >= ?
             """,
             (since,),
-        ).fetchone()
+        ).fetchall()
 
-        by_type = [
-            dict(r) for r in conn.execute(
-                """
-                SELECT organization_type AS org_type, COUNT(*) AS picks
-                FROM draft_history WHERE season >= ?
-                GROUP BY organization_type ORDER BY picks DESC
-                """,
-                (since,),
-            ).fetchall()
-        ]
+        groups: Dict[tuple, Dict[str, Any]] = {}
+        no_school = 0
+        unnumbered_total = 0
+        by_type_counts: Dict[str, int] = {}
+        for r in rows:
+            # Territorial picks (1947-65) and most 1949-56 picks carry
+            # overall_pick 0 in nba.com's history: no slot, so they can be
+            # neither a lottery pick nor a program's "highest pick". Taken at
+            # face value, 0 <= 14 made them lottery picks and "#0" the best.
+            pick = r["overall_pick"] if (r["overall_pick"] or 0) >= 1 else None
+            if pick is None:
+                unnumbered_total += 1
+            org = common_school_name(r["organization"])
+            if org is None:
+                no_school += 1
+                continue
+            by_type_counts[r["organization_type"]] = by_type_counts.get(r["organization_type"], 0) + 1
+            g = groups.setdefault((org, r["organization_type"]), {
+                "org": org, "org_type": r["organization_type"], "official_names": set(),
+                "picks": 0, "numbered": 0, "lottery": 0, "first_round": 0, "best": None,
+                "first_season": r["season"], "last_season": r["season"],
+            })
+            g["official_names"].add(r["organization"].strip())
+            g["picks"] += 1
+            if pick is not None:
+                g["numbered"] += 1
+            if pick is not None and pick <= 14:
+                g["lottery"] += 1
+            if r["round_number"] == 1:
+                g["first_round"] += 1
+            g["first_season"] = min(g["first_season"], r["season"])
+            g["last_season"] = max(g["last_season"], r["season"])
+            # Highest pick; among equal picks the most recent, as before.
+            b = g["best"]
+            if pick is not None and (b is None or pick < b["overall_pick"]
+                                     or (pick == b["overall_pick"] and r["season"] > b["season"])):
+                g["best"] = {"player_name": r["player_name"], "season": r["season"],
+                             "overall_pick": pick, "team_abbreviation": r["team_abbreviation"]}
 
+        ranked = sorted(groups.values(), key=lambda g: (-g["picks"], -g["lottery"], g["org"]))
+        programs = []
+        for g in ranked[:max(1, limit)]:
+            picks = g["picks"]
+            programs.append({
+                "org": g["org"],
+                "org_type": g["org_type"],
+                "official_names": sorted(g["official_names"]),
+                "picks": picks,
+                # Picks with a slot number; the lottery rate is over these.
+                "numbered_picks": g["numbered"],
+                "lottery": g["lottery"],
+                "first_round": g["first_round"],
+                "best_pick": g["best"]["overall_pick"] if g["best"] else None,
+                "first_season": g["first_season"],
+                "last_season": g["last_season"],
+                "lottery_rate": round(g["lottery"] / g["numbered"] * 100, 1) if g["numbered"] else None,
+                # Who the program's highest pick actually was, since "best pick 1"
+                # is a number until it has a name attached.
+                "best_player": g["best"],
+            })
+
+        seasons = [r["season"] for r in rows]
         return {
             "since": since,
-            "totals": dict(totals) if totals else {},
-            "by_type": by_type,
+            "totals": {
+                "picks": len(rows),
+                "picks_with_school": len(rows) - no_school,
+                "no_school": no_school,
+                "unnumbered_picks": unnumbered_total,
+                "orgs": len({k[0] for k in groups}),
+                "first_season": min(seasons) if seasons else None,
+                "last_season": max(seasons) if seasons else None,
+            },
+            "by_type": [{"org_type": t, "picks": n}
+                        for t, n in sorted(by_type_counts.items(), key=lambda kv: -kv[1])],
             "programs": programs,
+            "names_note": ("School names are the common ones (UCLA for nba.com's "
+                           "\"California-Los Angeles\"); official_names keeps nba.com's spelling."),
         }
     except Exception as e:
         logger.error(f"Error in /api/draft/pipeline: {e}", exc_info=True)
@@ -4964,18 +5118,32 @@ def get_draft_class(year: int):
 
         # Where a pick ended up. No feed maps a draft-night trade to the pick it
         # moved, but the player's current team is on record, and a current team
-        # that differs from the drafting team IS the move - 26 of the 2026 class.
+        # that differs from the drafting team IS the move.
         # Called "moved_to" rather than "traded_to" because a later trade or a
         # waiver-and-signing produces the same difference, and the endpoint should
         # not claim to know which happened.
+        from src.Utils.school_names import common_school_name
         for p in picks:
             cur = p.get("current_team")
             p["moved_to"] = cur if cur and cur != p.get("team_abbreviation") else None
+            # Common school name (UCLA, not "California-Los Angeles"); nba.com's
+            # spelling kept alongside. Blank stays None, never "".
+            p["organization_official"] = p.get("organization") or None
+            p["organization"] = common_school_name(p.get("organization"))
+        # The current team comes from player_bio, which is filled for recent
+        # classes only (2015: 3 of 60). "N of this class moved" counted only
+        # the players whose bio happened to be on file, so it read "1" for a
+        # 2015 class half the league traded for. The page states the count
+        # over the known players and how many are unknown.
+        known = sum(1 for p in picks if p.get("current_team"))
         return {
             "year": year,
             "count": len(picks),
             "rounds": sorted({p["round_number"] for p in picks if p.get("round_number")}),
             "bios_available": sum(1 for p in picks if p.get("height")),
+            "current_team_known": known,
+            "current_team_unknown": len(picks) - known,
+            "moved_count": sum(1 for p in picks if p.get("moved_to")),
             "picks": picks,
         }
     except Exception as e:
@@ -6833,49 +7001,83 @@ def get_team_advanced(abbr: str, season: Optional[str] = None):
     finally:
         conn.close()
 
+_POSITION_SHORT = {
+    "guard": "G", "forward": "F", "center": "C",
+    "guard-forward": "G-F", "forward-guard": "F-G",
+    "forward-center": "F-C", "center-forward": "C-F",
+}
+
+
+def _roster_row(r: Dict[str, Any], team_id: int) -> Dict[str, Any]:
+    """One roster line: the stint's totals plus the number and position that
+    are actually known (see get_team_roster). Empty strings are unknown."""
+    def clean(v):
+        v = (v or "").strip() if isinstance(v, str) else v
+        return v if v not in ("", None) else None
+
+    jersey = None
+    for num, listed_team in ((r.get("bio_jersey"), r.get("bio_team_id")),
+                             (r.get("idx_jersey"), r.get("idx_team_id"))):
+        if clean(num) is not None and listed_team == team_id:
+            jersey = clean(num)
+            break
+    pos = clean(r.get("bio_position")) or clean(r.get("idx_position"))
+    if pos is not None:
+        pos = _POSITION_SHORT.get(pos.lower(), pos)
+    return {
+        "player_id": r["player_id"], "full_name": r["full_name"],
+        "first_name": r["first_name"], "last_name": r["last_name"],
+        "gp": r["gp"], "min": r["min"], "pts": r["pts"], "reb": r["reb"], "ast": r["ast"],
+        "jersey": jersey, "position": pos,
+    }
+
+
 @app.get("/api/teams/{abbr}/roster")
 def get_team_roster(abbr: str, season: str = CURRENT_SEASON):
     """
-    Fetch the roster for a team including season averages (GP, PTS, REB, AST) from player_season_totals.
+    Everyone who played for the team in `season` (regular season), with his
+    totals FOR THIS TEAM (player_season_totals is one row per stint), so a
+    player traded mid-season appears on both teams' lists.
+
+    jersey is the player's CURRENT listed number and is given only while that
+    listing is with this team: a number from his new team is not the one he
+    wore here, so it stays null. It comes from player_bio (filled when a
+    profile is opened) or else from `players` (the league-wide index), whichever
+    lists this team. position is the league's listing, abbreviated (G, F-C...).
+    Until 2026-09-27 only player_bio was read, which is empty for ~3 in 4
+    players, so most rows printed "--" for both. Unknown stays null.
     """
     conn = get_db_conn()
     try:
         cursor = conn.cursor()
-        
-        # Query players that have season totals for this team and season
+        t_row = cursor.execute(
+            "SELECT team_id FROM team_metadata WHERE abbreviation = ?", (abbr.upper(),)
+        ).fetchone()
+        if not t_row:
+            raise HTTPException(status_code=404, detail=f"Team {abbr} not found.")
+        team_id = t_row["team_id"]
+
         cursor.execute(
             """
             SELECT p.player_id, p.full_name, p.first_name, p.last_name,
                    t.gp, t.min, t.pts, t.reb, t.ast,
-                   (SELECT jersey FROM player_bio WHERE player_id = p.player_id) as jersey,
-                   (SELECT position FROM player_bio WHERE player_id = p.player_id) as position
+                   b.jersey AS bio_jersey, b.team_id AS bio_team_id, b.position AS bio_position,
+                   p.jersey AS idx_jersey, p.last_team_id AS idx_team_id, p.position AS idx_position
             FROM players p
             JOIN player_season_totals t ON p.player_id = t.player_id
-            JOIN team_metadata m ON t.team_id = m.team_id
-            WHERE m.abbreviation = ? AND t.season = ? AND t.season_type = 'Regular Season'
+            LEFT JOIN player_bio b ON b.player_id = p.player_id
+            WHERE t.team_id = ? AND t.season = ? AND t.season_type = 'Regular Season'
             ORDER BY t.pts DESC
             """,
-            (abbr.upper(), season)
+            (team_id, season)
         )
         rows = cursor.fetchall()
-        if rows:
-            return [dict(r) for r in rows]
-            
-        # Fallback to player_game_log if season totals aren't computed yet
-        cursor.execute(
-            """
-            SELECT DISTINCT p.player_id, p.full_name, p.first_name, p.last_name,
-                            (SELECT jersey FROM player_bio WHERE player_id = p.player_id) as jersey,
-                            (SELECT position FROM player_bio WHERE player_id = p.player_id) as position
-            FROM players p
-            JOIN player_game_log pgl ON p.player_id = pgl.player_id
-            JOIN team_metadata m ON pgl.team_id = m.team_id
-            WHERE m.abbreviation = ?
-            """,
-            (abbr.upper(),)
-        )
-        rows = cursor.fetchall()
-        return [dict(r) for r in rows]
+        # No fallback to "every player who ever appeared for the franchise":
+        # that is what this used to return before a season's totals existed,
+        # hundreds of names presented as a roster. An empty season is empty.
+        return [_roster_row(dict(r), team_id) for r in rows]
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching team roster: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -7822,6 +8024,30 @@ def _build_comeback_grid(conn) -> Dict[str, Any]:
     }
 
 
+def _comeback_missing_pbp(conn, seasons: List[str]) -> Dict[str, Any]:
+    """Games in the grid's seasons that have a box score but no play-by-play,
+    so they are not in the counts. The page used to say "every game" while 31
+    play-in games were missing; it now prints this instead."""
+    if not seasons:
+        return {"games": 0, "by_season_type": {}, "seasons": []}
+    marks = ",".join("?" * len(seasons))
+    rows = conn.execute(
+        f"SELECT b.season, b.season_type, COUNT(*) FROM box_scores b "
+        f"WHERE b.season IN ({marks}) "
+        f"AND NOT EXISTS (SELECT 1 FROM pbp_events p WHERE p.game_id = b.game_id) "
+        f"GROUP BY b.season, b.season_type ORDER BY b.season",
+        list(seasons),
+    ).fetchall()
+    by_type: Dict[str, int] = {}
+    for _, st, n in rows:
+        by_type[st] = by_type.get(st, 0) + n
+    return {
+        "games": sum(r[2] for r in rows),
+        "by_season_type": by_type,
+        "seasons": sorted({r[0] for r in rows}),
+    }
+
+
 @app.get("/api/stats/comebacks")
 def get_comeback_grid():
     """
@@ -7839,11 +8065,14 @@ def get_comeback_grid():
                 status_code=503,
                 detail="Play-by-play has not been backfilled yet. Run backfill_pbp.py.",
             )
-        if _COMEBACK_CACHE is not None and _COMEBACK_CACHE_GAMES == games:
-            return _COMEBACK_CACHE
-        _COMEBACK_CACHE = _build_comeback_grid(conn)
-        _COMEBACK_CACHE_GAMES = games
-        return _COMEBACK_CACHE
+        if _COMEBACK_CACHE is None or _COMEBACK_CACHE_GAMES != games:
+            _COMEBACK_CACHE = _build_comeback_grid(conn)
+            _COMEBACK_CACHE_GAMES = games
+        # Counted on every call (about 0.2 s), outside the cache: a box score
+        # can land without its play-by-play, which the pbp-keyed cache would
+        # never notice.
+        return {**_COMEBACK_CACHE,
+                "missing_pbp": _comeback_missing_pbp(conn, _COMEBACK_CACHE["seasons"])}
     except HTTPException:
         raise
     except Exception as e:
@@ -9762,6 +9991,45 @@ def _season_postseason(conn, season: str) -> tuple:
     return True, tags
 
 
+_srs_cap_cache: Dict[tuple, Dict[int, Dict[str, Any]]] = {}
+
+
+def _srs_cap_effect(conn, season: str, season_type: str) -> Dict[int, Dict[str, Any]]:
+    """{team_id: {capped_games, srs_uncapped}}: what the stored SRS's +/-30
+    margin cap did to each team.
+
+    The stored srs clips every margin at SRS_BLOWOUT_CAP before solving
+    (backfill.compute_and_save_season_stats), which the page used to leave
+    unsaid; basketball-reference does not clip. Solving again from the same
+    team_game_advanced rows with no cap lets the page say how many games the
+    cap touched and how far it moved anyone, instead of asserting it is small.
+    """
+    key = (season, season_type)
+    if key in _srs_cap_cache:
+        return _srs_cap_cache[key]
+    from src.Utils.nba_computed_derivatives import SRS_BLOWOUT_CAP, TeamRecord, compute_srs
+    records: Dict[int, TeamRecord] = {}
+    capped: Dict[int, int] = {}
+    for tid, opp, pts, opp_pts in conn.execute(
+        "SELECT team_id, opp_team_id, pts, opp_pts FROM team_game_advanced "
+        "WHERE season = ? AND season_type = ?",
+        (season, season_type),
+    ):
+        if pts is None or opp_pts is None:
+            continue
+        rec = records.setdefault(tid, TeamRecord(team_id=tid, abbr=str(tid)))
+        rec.point_diffs.append(float(pts - opp_pts))
+        rec.opponent_ids.append(opp)
+        if abs(pts - opp_pts) > SRS_BLOWOUT_CAP:
+            capped[tid] = capped.get(tid, 0) + 1
+    uncapped, _ = compute_srs(records, blowout_cap=float("inf")) if records else ({}, {})
+    out = {tid: {"capped_games": capped.get(tid, 0), "srs_uncapped": uncapped.get(tid)}
+           for tid in records}
+    if season < CURRENT_SEASON:
+        _srs_cap_cache[key] = out
+    return out
+
+
 @app.get("/api/stats/standings")
 def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
@@ -9771,6 +10039,8 @@ def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regula
     division is null before the 2004-05 realignment (the archive holds only
     today's divisions). postseason / postseason_known say how the team's
     season ended, from the archived playoff and play-in games.
+    srs clips each game margin at +/-srs_margin_cap; capped_games counts the
+    team's games beyond it and srs_uncapped is the same solve without it.
     """
     conn = get_db_conn()
     try:
@@ -9795,9 +10065,15 @@ def get_stats_standings(season: str = CURRENT_SEASON, season_type: str = "Regula
         stored = {r[0]: r[1] for r in conn.execute("SELECT team_id, conference FROM team_metadata")}
         conferences = _season_conferences(conn, season, stored)
         known, tags = _season_postseason(conn, season)
+        from src.Utils.nba_computed_derivatives import SRS_BLOWOUT_CAP
+        cap_effect = _srs_cap_effect(conn, season, season_type) if rows else {}
         out = []
         for r in rows:
             d = dict(r)
+            eff = cap_effect.get(d["team_id"], {})
+            d["srs_margin_cap"] = SRS_BLOWOUT_CAP
+            d["capped_games"] = eff.get("capped_games")
+            d["srs_uncapped"] = eff.get("srs_uncapped")
             d["conference"] = conferences.get(d["team_id"], d["conference"])
             if season < "2004-05" or d["conference"] != stored.get(d["team_id"]):
                 d["division"] = None
@@ -9819,6 +10095,90 @@ def get_season_info(year: str):
     Fetch team standings and overview stats for a season.
     """
     return get_stats_standings(season=year)
+
+
+# Season History (src/Utils/season_history.py): champion, finals, best record
+# and MVP per season, and each season's bracket. Imported here rather than at
+# the top so this block stays self-contained in a file several people edit.
+_season_history_cache: Dict[str, Any] = {}
+
+
+@app.get("/api/season-history")
+def get_season_history():
+    """Every archived season's headline facts, newest first.
+
+    Champion and finals come from the league game log (four wins in the last
+    round, three in a pre-2002-03 first round), best record from the same log,
+    MVP from nba.com's award rows. A season whose final is unfinished has no
+    champion rather than a guessed one. Cached against the game log's size and
+    latest date, so a backfill or a repair reaches the page on the next call.
+    """
+    from src.Utils import season_history
+    conn = get_db_conn()
+    try:
+        stamp = conn.execute("SELECT COUNT(*) || ':' || MAX(game_date) FROM game_results").fetchone()[0]
+        awards = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='player_awards'").fetchone()[0]
+        if awards:
+            stamp += ":" + str(conn.execute("SELECT COUNT(*) FROM player_awards").fetchone()[0])
+        cached = _season_history_cache.get("all")
+        if cached and cached["key"] == stamp:
+            return cached["payload"]
+        # The archive's seasons, from the table built from its box scores (one
+        # row per team-season; a DISTINCT over box_scores reads every JSON blob).
+        seasons = [r[0] for r in conn.execute(
+            "SELECT DISTINCT season FROM team_season_advanced WHERE season_type = 'Regular Season' "
+            "ORDER BY season DESC")]
+        payload = {
+            "seasons": [season_history.season_summary(conn, s) for s in seasons],
+            "source": "League game log (game_results) for results and records; nba.com award rows for MVP.",
+        }
+        _season_history_cache["all"] = {"key": stamp, "payload": payload}
+        return payload
+    except Exception as e:
+        logger.error(f"Error building season history: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not build the season history.")
+    finally:
+        conn.close()
+
+
+@app.get("/api/seasons/{year}/playoffs")
+def get_season_playoffs(year: str):
+    """One season's playoffs from the league game log: every series by round.
+
+    Each series carries its games (date, winner, score), the result ("4-2"),
+    best_of, and whether it is decided. Rounds 1-3 carry the conference the
+    teams played in THAT season. Play-in games come from the box-score archive
+    (the game log does not hold them). `summary` is the same record the
+    Season History index shows.
+    """
+    from src.Utils import season_history
+    if not re.fullmatch(r"\d{4}-\d{2}", year or ""):
+        raise HTTPException(status_code=400, detail="Season must look like 2025-26")
+    conn = get_db_conn()
+    try:
+        bracket = season_history.playoff_bracket(conn, year)
+        stored = {r[0]: r[1] for r in conn.execute("SELECT team_id, conference FROM team_metadata")}
+        conferences = _season_conferences(conn, year, stored) if bracket["series"] else {}
+        for s in bracket["series"]:
+            if s["round"] < 4:
+                confs = {conferences.get(s["winner"]["team_id"]), conferences.get(s["loser"]["team_id"])}
+                s["conference"] = confs.pop() if len(confs) == 1 else None
+            else:
+                s["conference"] = None
+        return {
+            **bracket,
+            "play_in": season_history.play_in_games(conn, year),
+            "summary": season_history.season_summary(conn, year, bracket),
+            "source": "League game log (game_results); play-in games from the box-score archive.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error building playoffs for {year}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not build this season's playoffs.")
+    finally:
+        conn.close()
 
 # --- Key numbers -------------------------------------------------------------
 # The historical odds archive stores one table per season. Two quirks, both
@@ -10612,6 +10972,7 @@ def get_nba_cup(request: Request, season: Optional[str] = None):
 # which will not happen again. The floor is the feature here, so it is a
 # first-class parameter with a real default rather than a filter nobody finds.
 LINEUP_MIN_MINUTES_DEFAULT = 100
+LINEUP_FEED_ROW_CAP = 2000
 
 LINEUP_SORTS = {
     "net_rating": "NET_RATING", "off_rating": "OFF_RATING", "def_rating": "DEF_RATING",
@@ -10736,6 +11097,13 @@ def get_lineups(
         "sort": sort,
         "min_minutes": min_minutes,
         "total_lineups": total,
+        # nba.com returns at most LINEUP_FEED_ROW_CAP groups, most-used first
+        # (every cached 2007-08..2025-26 five-man season is exactly 2,000 rows,
+        # sorted by minutes, bottoming out at 11-12 minutes). So total_lineups
+        # is the feed's cap, not the league's count, and the median below is
+        # the median of the most-used groups.
+        "feed_capped": total >= LINEUP_FEED_ROW_CAP,
+        "feed_min_minutes": round(min((l["min"] or 0) for l in all_lineups), 1),
         "in_scope": len(pool),
         "qualified": len(qualified),
         "excluded": len(below),
@@ -11093,6 +11461,10 @@ def _summary_from_candidate_artifact() -> Dict[str, Any]:
         "baselines": {
             "home_team_pct": overall["home_team_baseline_pct"],
             "better_record_pct": overall["better_record_baseline_pct"],
+            # The paired test behind "beats the standings page". The track
+            # record printed p = 0.039 as typed text; this is the artifact's.
+            "better_record_p_value": ((artifact.get("paired_tests") or {})
+                                      .get("candidate_vs_better_record_baseline") or {}).get("p_value"),
         },
         "previous_model": {
             "accuracy_pct": old_overall["model_accuracy_pct"],
@@ -11137,6 +11509,9 @@ def _summary_from_legacy_artifact() -> Dict[str, Any]:
         "baselines": {
             "home_team_pct": baseline["always_pick_home"]["accuracy_pct"],
             "better_record_pct": baseline["pick_better_win_pct"]["accuracy_pct"],
+            # p = 0.61 here: this model did NOT beat the standings page, and a
+            # page reading this field must be able to say so.
+            "better_record_p_value": (baseline["pick_better_win_pct"].get("mcnemar_vs_model") or {}).get("p_value"),
         },
         "calibration": calibration,
         "generated_at": artifact["generated_at_utc"],
@@ -11157,6 +11532,212 @@ def _summary_from_legacy_artifact() -> Dict[str, Any]:
 # records the claim it replaced ("68.9% test accuracy") and why that claim was
 # wrong, so even the retired figure is sourced to a file rather than to a
 # recollection. Nothing on this page is authored except the labels.
+
+# The over/under pick was withdrawn from every surface on this date (policy,
+# like serving_since below). Everything else in its diary entry is read from
+# backtest_results.json's own "over_under" block.
+OU_PICK_WITHDRAWN_ON = "2026-09-19"
+
+
+def _fmt_p(p: Any) -> Optional[str]:
+    return f"{float(p):.3f}" if isinstance(p, (int, float)) else None
+
+
+def _req_number(req: Optional[str], pattern: str) -> Optional[float]:
+    """A threshold read out of a gate's own requirement text, so the sentence
+    that states it cannot drift from what was pre-registered."""
+    m = re.search(pattern, req or "")
+    return float(m.group(1)) if m else None
+
+
+def _num(x: float) -> str:
+    """2.5 not 2.50, 5 not 5.0: thresholds as they were written."""
+    return f"{x:g}"
+
+
+def _diary_gate_result(gate_id: str, t: Dict[str, Any], cand: Dict[str, Any]) -> Optional[str]:
+    """One plain-English sentence per pre-registered gate: what it measured,
+    the figure, and the bar it had to clear. Every number is the artifact's.
+    The page used to show only a pass/fail mark and raw JSON, so a failed gate
+    never said by how much it failed. None for a gate this does not know."""
+    req = t.get("requirement")
+    n_games = ((cand.get("evaluation") or {}).get("n_games_scored"))
+    p_bar = _req_number(req, r"p\s*<\s*([\d.]+)")
+    p = _fmt_p((t.get("mcnemar") or {}).get("p_value"))
+    bar = f" (the gate needed under {_num(p_bar)})" if p_bar is not None else ""
+
+    if gate_id == "t1_beats_old_model" and t.get("candidate_pct") is not None:
+        games = f" {n_games:,}" if isinstance(n_games, int) else ""
+        return (f"{t['candidate_pct']}% right against the old model's {t.get('old_model_pct')}% "
+                f"on the same{games} games. The chance of a gap that size by luck: p = {p}{bar}.")
+    if gate_id == "t2_beats_better_record" and t.get("candidate_pct") is not None:
+        return (f"{t['candidate_pct']}% right against {t.get('better_record_pct')}% for simply "
+                f"picking the team with the better record. The chance of a gap that size by "
+                f"luck: p = {p}{bar}.")
+    if gate_id == "t4_oct_dec" and t.get("improvement_pp") is not None:
+        target = _req_number(req, r">=\s*\+?([\d.]+)\s*pp")
+        tgt = f"; the target was +{_num(target)}" if target is not None else ""
+        return (f"October to December: {t.get('candidate_oct_dec_pct')}% against the old model's "
+                f"{t.get('old_model_oct_dec_pct')}% on {t.get('n_oct_dec'):,} games, "
+                f"{t['improvement_pp']:+.2f} points{tgt}. p = {p}, so even that gain "
+                f"could be luck." if p else
+                f"October to December: {t['improvement_pp']:+.2f} points over the old model{tgt}.")
+    if gate_id == "t3_calibration":
+        d = t.get("detail") or {}
+        min_n = _req_number(req, r"n\s*>=\s*(\d+)")
+        bound = _req_number(req, r"within\s*\+/-\s*([\d.]+)\s*pp")
+        mean_bound = _req_number(req, r"<=\s*([\d.]+)\s*pp")
+        parts = []
+        rows = [r for r in (cand.get("calibration_reliability_home_prob") or [])
+                if isinstance(r.get("calibration_error_pp"), (int, float))
+                and (min_n is None or (r.get("n") or 0) >= min_n)]
+        if d.get("all_ge100_buckets_within_5pp") is False and rows:
+            worst = max(rows, key=lambda r: abs(r["calibration_error_pp"]))
+            label = str(worst.get("bucket", "")).replace("-", "–")
+            b = f"; the bound was ±{_num(bound)}" if bound is not None else ""
+            parts.append(
+                f"Missed on one bucket: when the model gave the home team {label}, it predicted "
+                f"{worst.get('mean_predicted_home_win_pct')}% and the home team won "
+                f"{worst.get('actual_home_win_pct')}% of {worst.get('n'):,} games, off by "
+                f"{worst['calibration_error_pp']:+.2f} points{b}.")
+        passed = []
+        if d.get("mean_within_3pp") and d.get("mean_abs_bucket_error_pp") is not None:
+            lim = f" (limit {_num(mean_bound)})" if mean_bound is not None else ""
+            passed.append(f"average bucket error {d['mean_abs_bucket_error_pp']} points{lim}")
+        if d.get("brier_ok") and d.get("brier") is not None:
+            passed.append(f"Brier score {d['brier']} (limit {d.get('brier_max')})")
+        if d.get("logloss_ok") and d.get("log_loss") is not None:
+            passed.append(f"log loss {d['log_loss']} (limit {d.get('logloss_max')})")
+        if passed:
+            parts.append("The other checks passed: " + ", ".join(passed) + ".")
+        return " ".join(parts) or None
+    return None
+
+
+def _safe_gate_result(gate_id: str, t: Dict[str, Any], cand: Dict[str, Any]) -> Optional[str]:
+    # A malformed gate must not take the whole diary down with it.
+    try:
+        return _diary_gate_result(gate_id, t, cand)
+    except Exception as exc:
+        logger.warning("Model diary: no sentence for gate %s: %s", gate_id, exc)
+        return None
+
+
+def _diary_plain_caveats(old: Dict[str, Any]) -> List[str]:
+    """The previous model's caveats in plain English. The artifact's own text
+    names files, functions and JSON keys (main_api.py, days_rest_sensitivity,
+    'the validation block'), which mean nothing to a reader. Each known caveat
+    is rebuilt from the artifact's structured fields, or from figures quoted
+    in its own sentence; one this does not recognise is passed through as
+    written, so nothing is ever silently dropped."""
+    base = old.get("baseline") or {}
+    rec = base.get("pick_better_win_pct") or {}
+    mar = base.get("pick_better_point_margin") or {}
+    home = base.get("always_pick_home") or {}
+    val = (old.get("validation") or {}).get("snapshot_reconstruction") or {}
+    ou = old.get("over_under") or {}
+    rest = ((old.get("days_rest_sensitivity") or {}).get("accuracy") or {})
+
+    def biggest(_: str) -> Optional[str]:
+        if rec.get("accuracy_pct") is None or base.get("model_accuracy_pct") is None:
+            return None
+        pr = _fmt_p((rec.get("mcnemar_vs_model") or {}).get("p_value"))
+        pm = _fmt_p((mar.get("mcnemar_vs_model") or {}).get("p_value"))
+        luck = f" Gaps that small could be luck (p = {pr} and {pm})." if pr and pm else ""
+        beat = (f" It did beat always picking the home team, by {home['model_minus_baseline_pp']} points."
+                if home.get("model_minus_baseline_pp") is not None else "")
+        return (f"The biggest one: it did not beat a simple rule. Picking the team with the better "
+                f"record so far went {rec['accuracy_pct']}% and picking the better point "
+                f"differential went {mar.get('accuracy_pct')}% on the same games; the model went "
+                f"{base['model_accuracy_pct']}%.{luck}{beat} What it added over those rules was a "
+                f"probability, not just a pick.")
+
+    def floor(_: str) -> str:
+        return ("Its figures for its most confident picks were cut after looking at the results "
+                "and cover only some of the games, so they are diagnostics, not claims.")
+
+    def odds(_: str) -> Optional[str]:
+        end = ou.get("latest_historical_odds_date")
+        if not end:
+            return None
+        return (f"Our archive of closing odds stops on {end}, before these seasons, so profit, "
+                f"expected value, Kelly stakes and closing-line value could not be measured. "
+                f"Accuracy is not profit: a moneyline bettor has to beat the price, not a coin flip.")
+
+    def rebuilt(_: str) -> Optional[str]:
+        if not val.get("seasons") or val.get("exact_match_pct") is None:
+            return None
+        n = f" of {val['n_cells_compared']:,}" if val.get("n_cells_compared") else ""
+        return (f"The pre-game stats were rebuilt from our box scores and checked against the "
+                f"original snapshots only for {' and '.join(val['seasons'])}, the seasons where both "
+                f"exist: {round(val['exact_match_pct'], 2)}%{n} values matched exactly.")
+
+    def rounding(text: str) -> Optional[str]:
+        m = re.search(r"(one game in [\d,]+).*?by ([\d.]+)", text, re.I)
+        if not m:
+            return None
+        return (f"About {m.group(1)} has a rebuilt per-game average that is off by {m.group(2)} "
+                f"from the original because of rounding; its effect on the model's output was "
+                f"measured and is negligible.")
+
+    def clock(text: str) -> Optional[str]:
+        accs = {v.get("accuracy_pct") for v in rest.values() if isinstance(v, dict)}
+        if len(accs) != 1 or None in accs:
+            return None
+        m = re.search(r"([\d.]+)% correct.*?to ([\d.]+)% agreement", text)
+        how = (f" (right {m.group(1)}% of the time during the daytime hours the daily job "
+               f"runs in, {m.group(2)}% at midnight)") if m else ""
+        return (f"A bug in the live site's count of rest days was found and fixed: it read the "
+                f"clock in the wrong time zone, so the answer depended on the hour of the "
+                f"request{how}. The fix matches how the model was trained. Every way of counting "
+                f"rest days gives {accs.pop()}% on these games, and this evaluation never used "
+                f"the live code, so none of its numbers were affected.")
+
+    rules = [("biggest one", biggest), ("confidence-floor", floor), ("closing odds", odds),
+             ("reconstruction is validated", rebuilt), ("half-up rounding", rounding),
+             ("days-rest path", clock)]
+    out: List[str] = []
+    for text in old.get("caveats") or []:
+        plain = None
+        for key, fn in rules:
+            if key.lower() in text.lower():
+                try:
+                    plain = fn(text)
+                except Exception as exc:
+                    logger.warning("Model diary: caveat %r kept as written: %s", key, exc)
+                break
+        out.append(plain or text)
+    return out
+
+
+def _diary_ou_withdrawal(old: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The over/under pick's withdrawal, from the previous model's artifact:
+    it records that the totals model was never backtested, why, and the file
+    it lives in. Missing that block, there is no entry rather than a guess."""
+    ou = old.get("over_under") or {}
+    if not ou.get("model_file") or ou.get("backtested") is not False:
+        return None
+    seasons = (old.get("headline") or {}).get("seasons") or []
+    why_not = (f" It needs the sportsbook's own total as an input, and we hold no historical "
+               f"totals for {' or '.join(seasons)}, so it could not be scored on games after its "
+               f"training.") if seasons else ""
+    return {
+        "version": "over/under pick",
+        "status": "withdrawn",
+        "retired_on": OU_PICK_WITHDRAWN_ON,
+        "claim": "An over/under pick on every game",
+        "why_wrong": (
+            f"Withdrawn from every page and from the chat. The pick came from "
+            f"{os.path.basename(ou['model_file'])}, which never had a sealed evaluation.{why_not} "
+            f"The percentage in that filename is a random-split figure of the same kind as the "
+            f"withdrawn accuracy claim below, not a measured result. The market's total is still "
+            f"shown everywhere as a fact; only our pick is gone. It comes back only if a totals "
+            f"model passes a pre-registered evaluation the way the moneyline model did."
+        ),
+        "gates": [],
+    }
+
+
 @app.get("/api/model/diary")
 def get_model_diary():
     """
@@ -11207,6 +11788,9 @@ def get_model_diary():
                 # deciding which figures matter.
                 "detail": {k: v for k, v in t.items()
                            if k not in ("requirement", "PASS")},
+                # The figure against the bar, in words. A sentence that cannot
+                # be built is left out, never guessed.
+                "result": _safe_gate_result(key, t, cand),
             })
 
         entries.append({
@@ -11266,8 +11850,17 @@ def get_model_diary():
             "gates_total": None,
             # The most useful thing this artifact says is what it could NOT show.
             "caveats": old.get("caveats"),
+            # The same caveats for a reader: no file or function names.
+            "caveats_plain": _diary_plain_caveats(old),
             "methodology_notes": old.get("methodology_notes"),
         })
+
+        # ---- the over/under pick, withdrawn 2026-09-19 --------------------
+        # Newest event first: it goes straight after the serving model.
+        ou_entry = _diary_ou_withdrawal(old)
+        if ou_entry:
+            at = 1 if entries and entries[0].get("status") == "serving" else 0
+            entries.insert(at, ou_entry)
 
         # ---- the claim this replaced --------------------------------------
         if head.get("replaces_claim"):

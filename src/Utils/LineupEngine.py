@@ -471,6 +471,36 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
                     if r_off is not None:
                         v["off"] += (st["_net"] - r_off * st["_poss"]) ** 2
 
+    # Full names and BOX-SCORE minutes, keyed by player_id. The box score's
+    # "J. Williams" is three different OKC players; and the stint minutes
+    # above leave out every dropped period (SGA 2025-26: 31.0 a game in
+    # stints vs 33.2 in the box score), so a floor share built from them
+    # undercounts. box_* are this team's stint of player_season_totals.
+    full_names: Dict[int, str] = {}
+    box: Dict[int, Dict[str, float]] = {}
+    ids = list(on_acc)
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for pid, name in conn.execute(
+            f"SELECT player_id, full_name FROM players WHERE player_id IN ({marks})", chunk
+        ):
+            if name:
+                full_names[pid] = name
+    for pid, gp, mins in conn.execute(
+        "SELECT player_id, gp, min FROM player_season_totals "
+        "WHERE team_id = ? AND season = ? AND season_type = ?",
+        (team_id, season, season_type),
+    ):
+        box[pid] = {"gp": gp, "min": mins}
+    team_box = conn.execute(
+        "SELECT SUM(min) FROM player_season_totals WHERE team_id = ? AND season = ? AND season_type = ?",
+        (team_id, season, season_type),
+    ).fetchone()
+    # Five players on the floor at every moment: the team's minutes played
+    # (overtime included) are its players' minutes over five.
+    team_box_minutes = round(team_box[0] / 5.0, 1) if team_box and team_box[0] else None
+
     players_out = []
     for pid, a in on_acc.items():
         net_on = per100(a["net_on"], a["poss_on"])
@@ -484,7 +514,10 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
         players_out.append({
             "player_id": pid,
             "name": names.get(pid, f"#{pid}"),
+            "full_name": full_names.get(pid) or names.get(pid, f"#{pid}"),
             "gp": a["gp"],
+            "box_gp": box.get(pid, {}).get("gp"),
+            "box_min": round(box[pid]["min"], 1) if box.get(pid, {}).get("min") is not None else None,
             "min_on": round(a["sec_on"] / 60.0, 1),
             "poss_on": round(a["poss_on"], 1),
             "net_on_per100": net_on,
@@ -502,6 +535,7 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
         poss = a["poss"]
         lineups_out.append({
             "players": sorted(names.get(pid, f"#{pid}") for pid in key),
+            "player_names": sorted(full_names.get(pid) or names.get(pid, f"#{pid}") for pid in key),
             "games": len(a["games"]),
             "min": round(a["seconds"] / 60.0, 1),
             "poss": round(poss, 1),
@@ -525,6 +559,7 @@ def compute_team_onoff(conn, team_abbr: str, season: str,
             "poss": round(garbage["poss"], 1),
             "definition": GARBAGE_DEFINITION,
         },
+        "box_team_minutes": team_box_minutes,
         "players": players_out,
         "lineups": lineups_out[:60],
         "method": (

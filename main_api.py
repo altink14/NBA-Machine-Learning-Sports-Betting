@@ -72,6 +72,7 @@ from src.Utils import pick_reasons
 from src.Sports.ledger import ensure_ledger as _ensure_ledger
 from src.Utils import availability as availability_adjust
 from src.Utils import espn_injuries
+from src.Utils import similar_players
 
 
 
@@ -401,6 +402,7 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
     if not odds_data:
         return
     conn = _odds_snapshot_conn()
+    seen = []  # heartbeat sightings; see _record_sbr_heartbeat
     try:
         captured_at = datetime.utcnow().isoformat()
         for game_key, game in odds_data.items():
@@ -411,6 +413,8 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
                 ou_line = game.get('under_over_odds')
                 start = game.get('game_start_time_utc')
                 start_str = start.isoformat() if isinstance(start, datetime) else (start or None)
+                seen.append({"game_key": game_key, "sportsbook": sportsbook,
+                             "home_ml": home_ml, "away_ml": away_ml, "ou_line": ou_line})
 
                 last = conn.execute(
                     """
@@ -434,8 +438,27 @@ def snapshot_odds(odds_data: Dict[str, Any], sportsbook: str, sport: str) -> Non
             except Exception as exc:
                 logger.warning(f"Skipping odds snapshot for {game_key}: {exc}")
         conn.commit()
+        _record_sbr_heartbeat(conn, captured_at, sportsbook, sport, len(odds_data), seen)
     finally:
         conn.close()
+
+
+def _record_sbr_heartbeat(conn, polled_at: str, sportsbook: str, sport: str,
+                          games: int, seen: List[Dict[str, Any]]) -> None:
+    """Mark what this SBR scrape saw (src/Utils/odds_api_client.py, HEARTBEAT).
+
+    covers_board is 0: sbrscrape reads ONE book for ONE date and reports a
+    failed request as "no games", so a game missing from it proves nothing.
+    Its sightings keep a quote confirmed; only a whole-board poll can pull one.
+    Best-effort: the snapshot rows above are already committed.
+    """
+    try:
+        from src.Utils.odds_api_client import record_poll
+        record_poll(conn, polled_at=polled_at, sport=sport, source="sbr", status="ok",
+                    covers_board=False, books=sportsbook, markets="ml,total",
+                    events=games, book_rows=len(seen), rows=seen)
+    except Exception as exc:
+        logger.warning(f"Odds heartbeat (SBR) not recorded: {exc}")
 
 # --- Prediction track record ---
 # Tag for the market-implied fallback in run_predictions(). It is NOT a model:
@@ -3027,6 +3050,47 @@ def get_shot_quality(season: str = CURRENT_SEASON, season_type: str = "Regular S
     return result
 
 
+# ESPN keeps a player on its report until it posts a new note, so between
+# seasons the list fills with months-old entries (found 2026-09-24: 39 of 70
+# over 60 days old, Summer League notes still "Day-To-Day"). A note older
+# than this is shown as old and left out of a team's total: nobody knows
+# whether he is still out. Same threshold as the frontend's
+# src/lib/injury-freshness.ts.
+INJURY_STALE_DAYS = 30
+# A season whose last game (any type) is older than this is over: its on/off
+# describes last season's rosters. Longer than the All-Star break (~9 days).
+SEASON_OVER_AFTER_DAYS = 14
+
+
+def _injury_note_age_days(iso: str, now: datetime) -> Optional[int]:
+    """Whole days since ESPN's note time, or None if the feed gave no date."""
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0, int((now - ts).total_seconds() // 86400))
+
+
+def _onoff_season_state(conn, season: str, season_type: str, today) -> Dict[str, Any]:
+    """The last game of the on/off evidence (this season type), the season's
+    last game of any type, and whether the season is over."""
+    ev = conn.execute("SELECT MAX(game_date) FROM box_scores WHERE season = ? AND season_type = ?",
+                      (season, season_type)).fetchone()
+    anyt = conn.execute("SELECT MAX(game_date) FROM box_scores WHERE season = ?", (season,)).fetchone()
+    last_any = anyt[0] if anyt else None
+    over = None
+    if last_any:
+        try:
+            over = (today - datetime.fromisoformat(str(last_any)[:10]).date()).days > SEASON_OVER_AFTER_DAYS
+        except ValueError:
+            over = None
+    return {"last_game": ev[0] if ev else None, "season_last_game": last_any, "season_over": over}
+
+
 @app.get("/api/injury-impact")
 def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular Season"):
     """
@@ -3046,6 +3110,7 @@ def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular 
     been this much worse per game without him", not a causal guarantee.
     """
     absences = espn_injuries.get_absences()
+    now = datetime.now(timezone.utc)
 
     # Team pace for converting per-100-possession impact to per-game points.
     pace_by_abbr: Dict[str, float] = {}
@@ -3059,6 +3124,7 @@ def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular 
         ):
             if r["pace"]:
                 pace_by_abbr[r["abbreviation"]] = float(r["pace"])
+        onoff_state = _onoff_season_state(conn, season, season_type, to_nba_date(now) or now.date())
     finally:
         conn.close()
 
@@ -3076,11 +3142,17 @@ def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular 
         total = 0.0
         var_total = 0.0
         measured_any = False
+        stale_left_out = 0
         for e in entries:
+            age = _injury_note_age_days(e.get("date") or "", now)
+            stale = age is not None and age > INJURY_STALE_DAYS
             item: Dict[str, Any] = {
                 "name": e.get("name"),
                 "status": e.get("status"),
                 "detail": e.get("detail"),
+                "updated": e.get("date") or None,
+                "age_days": age,
+                "stale": stale,
                 "measured": False,
             }
             p = by_id.get(e.get("player_id"))
@@ -3097,13 +3169,18 @@ def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular 
                     "impact_ci95": [round(impact - 1.96 * se, 2), round(impact + 1.96 * se, 2)],
                     "thin": p["min_on"] < 200,
                 })
-                total += impact
-                var_total += se * se
-                measured_any = True
+                if stale:
+                    # Priced for reference, but not added up: a note this old
+                    # does not say he is still out.
+                    stale_left_out += 1
+                else:
+                    total += impact
+                    var_total += se * se
+                    measured_any = True
             else:
                 item["why_unmeasured"] = (
-                    "no resolvable stint data this season - a rookie, a new "
-                    "arrival, or too few minutes"
+                    f"no {season} minutes for {abbr} in our play-by-play - a rookie, "
+                    "a new arrival, or too few minutes"
                 )
             players.append(item)
 
@@ -3116,11 +3193,18 @@ def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular 
             "team_impact_pts": round(total, 2) if measured_any else None,
             "team_impact_ci95": [round(total - 1.96 * se_total, 2), round(total + 1.96 * se_total, 2)]
                 if measured_any else None,
+            "stale_left_out": stale_left_out,
         })
 
     return {
         "season": season,
         "season_type": season_type,
+        # The on/off is this season's only while it is being played; after
+        # its last game it describes last season's rosters (the page says so).
+        "onoff_last_game": onoff_state["last_game"],
+        "season_last_game": onoff_state["season_last_game"],
+        "season_over": onoff_state["season_over"],
+        "stale_after_days": INJURY_STALE_DAYS,
         "teams": teams_out,
         "wire": {
             "source": absences.get("source"),
@@ -3134,7 +3218,8 @@ def get_injury_impact(season: str = CURRENT_SEASON, season_type: str = "Regular 
             "the same removal math as the Trade Machine, in points per game on the "
             "margin. The interval is a stint-clustered 95% band - a floor on the real "
             "uncertainty, not a ceiling. Out/Doubtful only; game-time decisions are "
-            "never priced, by policy."
+            "never priced, by policy. A listing whose latest ESPN note is more than "
+            f"{INJURY_STALE_DAYS} days old is priced but left out of the team total."
         ),
     }
 
@@ -5777,6 +5862,36 @@ def get_impact_ratings_endpoint(season: str = CURRENT_SEASON, min_gp: int = 20):
     }
 
 
+@app.get("/api/players/{id}/similar")
+def get_similar_players(id: int, season: str = CURRENT_SEASON, scope: str = "all", limit: int = 10):
+    """The closest whole-season stat lines to one player-season, across every
+    archived season (scope=all) or inside his own season (scope=season).
+    Per-season z-scores, a weighted gap over the stats both lines have, one
+    entry per other player. The method (stats, weights, pool rule, bands) is
+    returned with the result; see src/Utils/similar_players.py for why."""
+    if scope not in ("all", "season"):
+        raise HTTPException(status_code=400, detail="scope must be 'all' or 'season'")
+    limit = max(1, min(int(limit), 25))
+    conn = get_db_conn()
+    try:
+        pool = similar_players.get_pool(conn)
+        result = similar_players.find_similar(pool, id, season, scope, limit)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"No {similar_players.SEASON_TYPE} line for player {id} in {season}.")
+        abbr = {r[0]: r[1] for r in conn.execute("SELECT team_id, abbreviation FROM team_metadata")}
+        # A traded player's teams in the order he played for them (as the
+        # career table prints them); a single-stint season is just its team.
+        for line in [result["target"], *result["matches"]]:
+            if line["n_teams"] == 1:
+                line["team"] = abbr.get(line["team_id"])
+            else:
+                line["team"] = _teams_in_order(conn, line["player_id"], line["season"], similar_players.SEASON_TYPE)
+    finally:
+        conn.close()
+    result["method"] = similar_players.method()
+    return result
+
+
 @app.get("/api/players/{id}/impact")
 def get_player_impact_endpoint(id: int):
     """One player's estimated impact by season (career series within our
@@ -7768,17 +7883,25 @@ def _rest_bucket(days: Optional[int]) -> Optional[str]:
 
 def _load_rest_rows(conn, season: str, season_type: str) -> List[Dict[str, Any]]:
     """One row per team-game with days of rest, the opponent's rest, and the result."""
+    # The date comes from game_results (the league game log), not from
+    # team_game_advanced. The latter keeps a postponed game's ORIGINAL date:
+    # 22 team-game rows in 2025-26 disagree (0022500652 sits on Jan 25 there
+    # but was played Mar 31), which moved games into the wrong gaps and made
+    # the page count 432 back-to-backs where the game log has 441.
+    # game_results holds no play-in rows, so those keep the box-score date.
     rows = conn.execute(
         """
-        SELECT tga.team_id, tga.opp_team_id, tga.game_id, tga.game_date,
+        SELECT tga.team_id, tga.opp_team_id, tga.game_id,
+               substr(COALESCE(gr.game_date, tga.game_date), 1, 10) AS game_date,
                tga.pts, tga.opp_pts,
                m.abbreviation AS team, m.full_name AS team_name,
                (CASE WHEN bs.home_team_id = tga.team_id THEN 1 ELSE 0 END) AS is_home
         FROM team_game_advanced tga
         JOIN team_metadata m ON m.team_id = tga.team_id
         JOIN box_scores bs ON bs.game_id = tga.game_id
+        LEFT JOIN game_results gr ON gr.game_id = tga.game_id AND gr.team_id = tga.team_id
         WHERE tga.season = ? AND tga.season_type = ?
-        ORDER BY tga.team_id, tga.game_date
+        ORDER BY tga.team_id, game_date
         """,
         (season, season_type),
     ).fetchall()
@@ -7825,6 +7948,7 @@ def get_rest_splits(request: Request, season: str = CURRENT_SEASON, season_type:
         if not rows:
             return {
                 "season": season, "season_type": season_type, "games": 0,
+                "team_games": 0, "team_games_with_rest": 0, "b2b_effect": None,
                 "by_rest": [], "by_advantage": [], "by_team": [],
             }
 
@@ -7878,10 +8002,38 @@ def get_rest_splits(request: Request, season: str = CURRENT_SEASON, season_type:
                 record(t["rested"], d)
 
         order = [lbl for _, _, lbl in REST_BUCKETS]
+
+        # What a back-to-back costs in scoring margin, against every game
+        # played with a day or more off. The page used to type "worth roughly
+        # two points" under every season; it is 1.4 in 2025-26 and 2.5 in
+        # 2024-25, so it is computed here and the page prints this.
+        b2b_rows = [d for d in rows if d["rest_days"] == 0]
+        off_rows = [d for d in rows if d["rest_days"] is not None and d["rest_days"] >= 1]
+
+        def _avg_margin(rs: List[Dict[str, Any]]) -> Optional[float]:
+            return sum(d["pts"] - d["opp_pts"] for d in rs) / len(rs) if rs else None
+
+        b2b_m, off_m = _avg_margin(b2b_rows), _avg_margin(off_rows)
+        b2b_per_team = [t["b2b"]["games"] for t in by_team.values()]
         return {
             "season": season,
             "season_type": season_type,
             "games": len({d["game_id"] for d in rows}),
+            # The tables count TEAM-games (each game twice, once per side), and
+            # a team's first game has no rest to count, so the tables sum to
+            # team_games_with_rest, not to `games`. Both are sent so the page
+            # can say which it is.
+            "team_games": len(rows),
+            "team_games_with_rest": sum(1 for d in rows if d["rest_days"] is not None),
+            "b2b_effect": {
+                "b2b_games": len(b2b_rows),
+                "b2b_avg_margin": round(b2b_m, 2) if b2b_m is not None else None,
+                "rested_games": len(off_rows),
+                "rested_avg_margin": round(off_m, 2) if off_m is not None else None,
+                "margin_cost": round(off_m - b2b_m, 2) if b2b_m is not None and off_m is not None else None,
+                "b2b_per_team_min": min(b2b_per_team) if b2b_per_team else None,
+                "b2b_per_team_max": max(b2b_per_team) if b2b_per_team else None,
+            },
             "by_rest": [finish(by_rest[k], label=k) for k in order if k in by_rest],
             "by_advantage": sorted(
                 [finish(v, label=k, diff=v.get("diff", 0)) for k, v in by_adv.items()],
@@ -8867,45 +9019,41 @@ def get_hustle_stats(request: Request, season: str = CURRENT_SEASON, season_type
     """
     Season hustle totals for every player: the effort plays the box score skips.
 
-    Tracked by the league from 2015-16 onward. Charges drawn are genuinely rare -
-    a handful of players a season reach double digits - which the builder page
-    should surface rather than smooth over.
+    nba.com's feed starts in 2015-16, but that regular season covers only its last
+    few nights (147 players, nobody past 2 games), so the page starts at 2016-17.
+    Box-outs were not counted until 2017-18: a stat that is zero for every player
+    in a season comes back as null and is listed in `untracked` (src/Utils/Hustle.py).
+    Charges drawn are genuinely rare - a handful of players a season reach double
+    digits - which the builder page should surface rather than smooth over.
     """
+    from src.Utils import Hustle as hustle_shape
     try:
         from src.Utils.nba_stats_client import get_client
 
-        rows = get_client().league_hustle_stats(season=season, season_type=season_type)
+        # A finished season's hustle totals never change, so its cached copy is
+        # kept for good instead of being re-asked of nba.com every hour.
+        ttl = None if season < CURRENT_SEASON else 3600
+        rows = get_client().league_hustle_stats(season=season, season_type=season_type, ttl=ttl)
     except Exception as e:
         logger.error(f"Error fetching hustle stats: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Could not reach the hustle feed.")
 
     if not rows:
-        return {"season": season, "season_type": season_type, "players": []}
+        return {"season": season, "season_type": season_type, "players": [], "untracked": []}
 
-    players = []
-    for r in rows:
-        players.append({
-            "player_id": r.get("PLAYER_ID"),
-            "name": r.get("PLAYER_NAME"),
-            "team": r.get("TEAM_ABBREVIATION"),
-            "gp": r.get("G"),
-            "min": r.get("MIN"),
-            "deflections": r.get("DEFLECTIONS"),
-            "screen_assists": r.get("SCREEN_ASSISTS"),
-            "screen_assist_pts": r.get("SCREEN_AST_PTS"),
-            "loose_balls": r.get("LOOSE_BALLS_RECOVERED"),
-            "charges_drawn": r.get("CHARGES_DRAWN"),
-            "contested_shots": r.get("CONTESTED_SHOTS"),
-            "box_outs": r.get("BOX_OUTS"),
-        })
+    players, untracked = hustle_shape.shape_players(rows)
 
     return {
         "season": season,
         "season_type": season_type,
         "players": players,
+        "untracked": untracked,
+        "coverage": hustle_shape.season_coverage(rows),
         "source_note": (
-            "Hustle tracking is the league's own, recorded from 2015-16. These are "
-            "counted events, not estimates."
+            "Hustle tracking is the league's own; the page starts at 2016-17 because "
+            "2015-16's feed covers only the season's last few nights, and box-outs were "
+            "not counted until 2017-18 (null, not zero, before then). These are counted "
+            "events, not estimates."
         ),
     }
 
@@ -9888,11 +10036,117 @@ def _broadcaster_names(game: Dict[str, Any], scope: str, media: str) -> List[str
     return out
 
 
+def _schedule_season(today=None) -> str:
+    """The season whose schedule the schedule pages show, derived from CURRENT_SEASON.
+
+    CURRENT_SEASON moves on opening night (bump_season.py), but the next
+    season's schedule is published in the summer and its preseason starts
+    before opening night. So from July 1 of CURRENT_SEASON's end year the
+    schedule is the NEXT season's; before that it is CURRENT_SEASON's. This
+    used to be the literal '2026-27' in three places bump_season.py does not
+    touch, which would have gone stale next fall without a sound.
+    """
+    if today is None:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+    start = int(CURRENT_SEASON[:4])
+    if today >= datetime(start + 1, 7, 1).date():
+        start += 1
+    return f"{start}-{(start + 1) % 100:02d}"
+
+
+def _schedule_team(t: Dict[str, Any]) -> Dict[str, Any]:
+    """One side of a scheduled game. Unknown stays None, never the string 'None'.
+
+    Cup knockout slots are in the feed before their teams are known, with
+    teamCity/teamName null and teamId 0. f"{city} {name}" on those printed
+    "None None at None None" on the schedule.
+    """
+    city, name = t.get("teamCity"), t.get("teamName")
+    full = " ".join(p for p in (city, name) if p) or None
+    return {
+        "tricode": t.get("teamTricode") or None,
+        "name": full,
+        "team_id": t.get("teamId") or None,
+    }
+
+
+def _time_tbd(g: Dict[str, Any]) -> bool:
+    """True when the feed has a date but no tip-off time for this game.
+
+    The feed parks those at midnight (gameDateTimeEst ...T00:00:00Z) with
+    gameTimeEst '0001-01-01...' and status 'TBD'; read literally, that is a
+    12:00 AM tip.
+    """
+    t = str(g.get("gameTimeEst") or "")
+    return not t or t.startswith("0001-") or (g.get("gameStatusText") or "").strip().upper() == "TBD"
+
+
+# A regular season is 82 games a team. The league's own rule, not a count:
+# it is what the published schedule is compared against, to say how many
+# games per team are still to be added.
+REGULAR_SEASON_GAMES_PER_TEAM = 82
+
+
+def _regular_season_summary(league: Dict[str, Any]) -> Dict[str, Any]:
+    """What the published regular season does and does not contain yet.
+
+    The feed lists fewer than 82 games per team before the NBA Cup knockout
+    round is set: the knockout slots are in it with no teams, and the games
+    for teams that do not reach the knockout round are added once group play
+    ends. Read from the whole feed, never from a filtered view, so the page's
+    "80 per team" note is the feed's own arithmetic.
+    """
+    per_team: Dict[str, int] = {}
+    total = named = 0
+    tbd_slots: List[Dict[str, Any]] = []
+    seqs: List[int] = []
+    for gd in league.get("gameDates") or []:
+        for g in gd.get("games") or []:
+            gid = str(g.get("gameId") or "")
+            if gid[:3] != "002":
+                continue
+            total += 1
+            if gid[5:].isdigit():
+                seqs.append(int(gid[5:]))
+            h = (g.get("homeTeam") or {}).get("teamTricode")
+            a = (g.get("awayTeam") or {}).get("teamTricode")
+            if h and a:
+                named += 1
+                per_team[h] = per_team.get(h, 0) + 1
+                per_team[a] = per_team.get(a, 0) + 1
+            else:
+                tbd_slots.append({
+                    "game_id": gid,
+                    "date": (g.get("gameDateTimeEst") or "")[:10],
+                    "stage": g.get("gameSubLabel") or None,
+                })
+    counts = sorted(per_team.values())
+    # Game ids are numbered 1..N for the season; the numbers the feed does not
+    # carry yet are the games still to be scheduled.
+    missing_ids = sorted(set(range(1, max(seqs) + 1)) - set(seqs)) if seqs else []
+    teams = len(per_team)
+    return {
+        "games": total,
+        "games_with_teams": named,
+        "knockout_slots_tbd": tbd_slots,
+        "teams": teams,
+        "per_team_min": counts[0] if counts else None,
+        "per_team_max": counts[-1] if counts else None,
+        "per_team_full_season": REGULAR_SEASON_GAMES_PER_TEAM,
+        "full_season_games": teams * REGULAR_SEASON_GAMES_PER_TEAM // 2 if teams else None,
+        "unscheduled_game_ids": len(missing_ids),
+        "unscheduled_id_range": (
+            [missing_ids[0], missing_ids[-1]] if missing_ids else None
+        ),
+    }
+
+
 @app.get("/api/schedule")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
 def get_league_schedule(
     request: Request,
-    season: str = "2026-27",
+    season: Optional[str] = None,
     season_type: Optional[str] = None,
     month: Optional[int] = None,
     team: Optional[str] = None,
@@ -9904,10 +10158,12 @@ def get_league_schedule(
     """
     The published league schedule, filtered the way nba.com/schedule filters it.
 
+    `season` defaults to _schedule_season() (derived from CURRENT_SEASON).
     `team` is a tricode (BOS). `broadcaster` matches a national TV display name
     (ESPN, ABC, NBC, Peacock, Prime Video). `hide_previous` drops dates before
     today. Every filter is optional and they compose.
     """
+    season = season or _schedule_season()
     # Play-in games were labelled "Play-In" here while the archive stores
     # "PlayIn", so ?season_type=PlayIn matched nothing and came back as an
     # empty schedule. The label is now the archive's; the old spelling is
@@ -9922,7 +10178,10 @@ def get_league_schedule(
         logger.error(f"Error fetching league schedule: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Could not reach the NBA schedule feed.")
 
-    today = datetime.now(timezone.utc).date()
+    # An NBA game date is an Eastern date. UTC rolls over at 8 PM ET, which
+    # made "upcoming only" drop the evening's own late games.
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("America/New_York")).date()
     dates_out = []
     teams_seen: Dict[str, str] = {}
     broadcasters_seen: Dict[str, int] = {}
@@ -9938,14 +10197,7 @@ def get_league_schedule(
 
             home = g.get("homeTeam") or {}
             away = g.get("awayTeam") or {}
-            for t in (home, away):
-                if t.get("teamTricode"):
-                    teams_seen[t["teamTricode"]] = f"{t.get('teamCity', '')} {t.get('teamName', '')}".strip()
-
             natl_tv = _broadcaster_names(g, "national", "tv")
-            for name in natl_tv:
-                if name != "TBD":
-                    broadcasters_seen[name] = broadcasters_seen.get(name, 0) + 1
 
             label = g.get("gameLabel") or ""
             subtype = g.get("gameSubtype") or ""
@@ -9955,11 +10207,26 @@ def get_league_schedule(
                 continue
             if cup_only and not is_cup:
                 continue
+            if national_tv_only and not [n for n in natl_tv if n != "TBD"]:
+                continue
+
+            # Dropdown options come from the VIEW (season type, Cup, national
+            # TV) but not from the narrowing filters below, so they do not
+            # shrink as the user narrows. Built from the whole feed they had
+            # offered the London Lions, a preseason opponent, as a
+            # regular-season team, and counted preseason broadcasts in the
+            # regular-season view's "Peacock (100)".
+            for t in (home, away):
+                tt = _schedule_team(t)
+                if tt["tricode"]:
+                    teams_seen[tt["tricode"]] = tt["name"] or tt["tricode"]
+            for name in natl_tv:
+                if name != "TBD":
+                    broadcasters_seen[name] = broadcasters_seen.get(name, 0) + 1
+
             if team and team.upper() not in {home.get("teamTricode"), away.get("teamTricode")}:
                 continue
             if broadcaster and broadcaster not in natl_tv:
-                continue
-            if national_tv_only and not [n for n in natl_tv if n != "TBD"]:
                 continue
 
             est = g.get("gameDateTimeEst") or ""
@@ -9980,25 +10247,20 @@ def get_league_schedule(
                 "time_est": g.get("gameTimeEst"),
                 "date_utc": g.get("gameDateTimeUTC"),
                 "status": g.get("gameStatusText"),
+                "time_tbd": _time_tbd(g),
                 "week": g.get("weekNumber"),
                 "week_name": g.get("weekName"),
                 "label": label or None,
                 "sub_label": g.get("gameSubLabel") or None,
                 "is_cup": is_cup,
                 "is_neutral": bool(g.get("isNeutral")),
-                "arena": g.get("arenaName"),
-                "arena_city": g.get("arenaCity"),
-                "arena_state": g.get("arenaState"),
-                "home": {
-                    "tricode": home.get("teamTricode"),
-                    "name": f"{home.get('teamCity', '')} {home.get('teamName', '')}".strip(),
-                    "team_id": home.get("teamId"),
-                },
-                "away": {
-                    "tricode": away.get("teamTricode"),
-                    "name": f"{away.get('teamCity', '')} {away.get('teamName', '')}".strip(),
-                    "team_id": away.get("teamId"),
-                },
+                # Knockout slots carry "" here until a host is set.
+                "arena": g.get("arenaName") or None,
+                "arena_city": g.get("arenaCity") or None,
+                "arena_state": g.get("arenaState") or None,
+                "home": _schedule_team(home),
+                "away": _schedule_team(away),
+                "teams_tbd": not (home.get("teamTricode") and away.get("teamTricode")),
                 "national_tv": natl_tv,
                 "national_radio": _broadcaster_names(g, "national", "radio"),
                 "home_tv": _broadcaster_names(g, "home", "tv"),
@@ -10021,6 +10283,7 @@ def get_league_schedule(
         "games": total,
         "dates": dates_out,
         "weeks": league.get("weeks") or [],
+        "regular_season": _regular_season_summary(league),
         "filters": {
             "season_type": season_type,
             "month": month,
@@ -10031,8 +10294,8 @@ def get_league_schedule(
             "cup_only": cup_only,
         },
         "options": {
-            # Built from the whole feed, before filtering, so the dropdowns do
-            # not shrink as the user narrows the view.
+            # season_types from the whole feed; teams and broadcasters from the
+            # view (see the loop), before the narrowing filters.
             "season_types": [
                 {"value": k, "games": v}
                 for k, v in sorted(season_types_seen.items(), key=lambda x: -x[1])
@@ -10221,7 +10484,7 @@ def get_hof_careers(sort: str = "pts"):
 
 @app.get("/api/cup")
 @limiter.limit(RATE_LIMIT_UPSTREAM)
-def get_nba_cup(request: Request, season: str = "2026-27"):
+def get_nba_cup(request: Request, season: Optional[str] = None):
     """
     The Emirates NBA Cup: six groups, the knockout round, and who plays whom.
 
@@ -10239,6 +10502,7 @@ def get_nba_cup(request: Request, season: str = "2026-27"):
     # any cup logic ran, so /api/cup had returned 500 on every request since
     # it was written -- while /api/schedule?cup_only=true, the same data,
     # worked fine.
+    season = season or _schedule_season()
     sched = get_league_schedule(request, season=season, cup_only=True)
     games = [g for d in sched["dates"] for g in d["games"]]
     if not games:
@@ -10275,15 +10539,49 @@ def get_nba_cup(request: Request, season: str = "2026-27"):
     ]
     knockout.sort(key=lambda g: (KNOCKOUT_ORDER.get(g.get("sub_label") or "", 9), g["date_est"]))
 
+    # The page's header used to type "thirty teams, six groups, one knockout
+    # round, five teams each"; the knockout is three rounds. Every count the
+    # header prints is taken from the fixtures here instead.
+    sizes = [len(g["teams"]) for g in group_list]
+    rounds: List[Dict[str, Any]] = []
+    for g in knockout:
+        st = g.get("sub_label")
+        if not rounds or rounds[-1]["stage"] != st:
+            rounds.append({"stage": st, "games": 0,
+                           "first_date": g["date_est"][:10], "last_date": g["date_est"][:10]})
+        rounds[-1]["games"] += 1
+        rounds[-1]["last_date"] = g["date_est"][:10]
+    qf = next((r["games"] for r in rounds if r["stage"] == "Quarterfinal"), 0)
+    structure = {
+        "teams": sum(sizes),
+        "groups": len(group_list),
+        "group_size_min": min(sizes) if sizes else None,
+        "group_size_max": max(sizes) if sizes else None,
+        "group_games": sum(g["games"] for g in group_list),
+        "knockout_games": len(knockout),
+        "knockout_rounds": rounds,
+        # Two teams per quarterfinal; the group winners fill all but these.
+        "knockout_teams": qf * 2 if qf else None,
+        "wildcards": (qf * 2 - len(group_list)) if qf else None,
+        # A game's id prefix is its season type: 002 knockout games count in
+        # the regular-season standings, the 006 final does not.
+        "knockout_games_in_standings": sum(1 for g in knockout if g["season_type"] == "Regular Season"),
+    }
+
     return {
         "season": season,
         "total_games": len(games),
+        "structure": structure,
         "groups": group_list,
         "knockout": [
             {
                 "stage": g.get("sub_label"),
+                "game_id": g["game_id"],
+                "season_type": g["season_type"],
+                "counts_in_standings": g["season_type"] == "Regular Season",
                 "date": g["date_est"][:10],
                 "date_est": g["date_est"],
+                "time_tbd": g["time_tbd"],
                 "arena": g["arena"],
                 "arena_city": g["arena_city"],
                 "national_tv": g["national_tv"],

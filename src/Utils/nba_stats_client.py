@@ -400,12 +400,15 @@ class NBAStatsClient:
         return self._parse_result_set(raw, "PlayerIndex")
 
     def league_hustle_stats(
-        self, season: str = "2025-26", season_type: str = "Regular Season"
+        self, season: str = "2025-26", season_type: str = "Regular Season",
+        ttl: Optional[int] = 3600,
     ) -> List[Dict]:
         """Season hustle totals per player: deflections, screen assists, loose
-        balls, charges drawn, contested shots, box-outs. Tracked from 2015-16.
+        balls, charges drawn, contested shots, box-outs. Tracked from 2015-16
+        (box-outs from 2017-18; nba.com sends zeros before that, see Hustle.py).
 
-        Cached for an hour in season; the numbers only move when games are played.
+        Cached for an hour by default; the numbers only move when games are
+        played, so callers pass ttl=None for a finished season.
         """
         params = {
             "season": season,
@@ -415,7 +418,7 @@ class NBAStatsClient:
         raw = self._fetch(
             "leaguehustlestatsplayer",
             leaguehustlestatsplayer.LeagueHustleStatsPlayer,
-            params, ttl=3600,
+            params, ttl=ttl,
         )
         return self._parse_result_set(raw, "HustleStatsPlayer")
 

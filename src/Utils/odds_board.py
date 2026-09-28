@@ -31,10 +31,28 @@ WHAT DROPS, and the one thing the archive cannot see:
   * a book whose latest row carries no price at all (it took every market
     down while still listing the game - the recorder writes that as a change);
   * a single market whose latest value is empty (e.g. the book pulled its
-    moneyline but kept the spread).
-  A book that stops listing a game ENTIRELY writes nothing, so its last price
-  would stay on the board. The archive cannot tell that apart from a price
-  that has not moved; the page says so rather than pretending otherwise.
+    moneyline but kept the spread);
+  * a market the book STOPPED LISTING (the heartbeat, below).
+
+THE HEARTBEAT (2026-09-27). A book that stops listing a game writes no
+snapshot row, so until now its last price stayed on the board forever. Each
+poll now records what it saw (odds_polls / odds_seen, written by
+odds_api_client.record_poll). For each quoted market the board asks: has a
+successful WHOLE-BOARD poll that could have listed this book and market run
+since we last knew it was offered (its latest row or its last sighting,
+whichever is later), without listing it? If so the market leaves the board
+and fair/best, and is reported under the game's "withdrawn" with its last
+sighting and the first poll that missed it. Otherwise it stays, labelled:
+
+  "confirmed"    a poll has seen it priced; last_seen_at says when.
+  "unconfirmed"  no poll has looked since this price was recorded: rows from
+                 before the heartbeat existed, or a book only the SBR scraper
+                 reads. Today's rule applies (the latest row is the price),
+                 and the label says it has not been re-checked.
+
+A failed or empty poll is never evidence (record_poll refuses to write an 'ok'
+poll with no sightings), and the SBR scraper's polls never are either: it
+reads one book for one date and reports a failed request as "no games".
 """
 
 from datetime import datetime, timezone
@@ -128,6 +146,89 @@ def market_history(rows: List[Any], market: str) -> Dict[str, Any]:
     return {"current": current, "since": since, "open": opened, "changes": changes}
 
 
+class _Heartbeat:
+    """What the recorders' polls saw, loaded once per board."""
+
+    def __init__(self, conn, sport: str):
+        # (time, source, books asked for or None = all, markets) per ok whole-board poll
+        self.polls: List[Tuple[datetime, str, Optional[frozenset], frozenset]] = []
+        self.seen: Dict[Tuple[str, str, str], datetime] = {}
+        self.books_by_source: Dict[str, set] = {}
+        self.first_poll_at: Optional[datetime] = None
+        self.last_ok_at: Optional[datetime] = None
+        self.last_poll: Optional[Dict[str, Any]] = None
+        have = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('odds_polls', 'odds_seen')")}
+        if have != {"odds_polls", "odds_seen"}:
+            return  # an archive from before the heartbeat: every quote unconfirmed
+        for polled_at, source, status, covers, books, markets in conn.execute(
+                "SELECT polled_at, source, status, covers_board, books, markets "
+                "FROM odds_polls WHERE sport = ?", (sport,)):
+            ts = parse_ts(polled_at)
+            if ts is None:
+                continue
+            if self.first_poll_at is None or ts < self.first_poll_at:
+                self.first_poll_at = ts
+            if self.last_poll is None or ts > self.last_poll["_ts"]:
+                self.last_poll = {"_ts": ts, "at": polled_at, "status": status, "source": source}
+            if status != "ok":
+                continue
+            if self.last_ok_at is None or ts > self.last_ok_at:
+                self.last_ok_at = ts
+            if covers:
+                self.polls.append((
+                    ts, source,
+                    frozenset(b.strip() for b in books.split(",")) if books else None,
+                    frozenset(m.strip() for m in (markets or "").split(","))))
+        self.polls.sort(key=lambda p: p[0])
+        for source, game_key, book, market, last in conn.execute(
+                "SELECT source, game_key, sportsbook, market, last_seen_at FROM odds_seen "
+                "WHERE sport = ?", (sport,)):
+            ts = parse_ts(last)
+            if ts is None:
+                continue
+            self.books_by_source.setdefault(source, set()).add(book)
+            key = (game_key, book, market)
+            if key not in self.seen or ts > self.seen[key]:
+                self.seen[key] = ts
+
+    def _covers(self, poll, book: str, market: str) -> bool:
+        _, source, books, markets = poll
+        if market not in markets:
+            return False
+        if books is not None:
+            return book in books
+        # "Every book the source carries" = the books it has ever shown us. A
+        # name only another feed uses (SBR's 'caesars' is the Odds API's
+        # 'williamhill_us') is never covered, so a feed that could not have
+        # listed a book never pulls it.
+        return book in self.books_by_source.get(source, ())
+
+    def check(self, game_key: str, book: str, market: str, recorded_at: datetime):
+        """(status, last_seen_at, missing_since) for one quoted market."""
+        last_seen = self.seen.get((game_key, book, market))
+        known = max(recorded_at, last_seen) if last_seen else recorded_at
+        for poll in self.polls:  # oldest first, so this is the FIRST poll that missed it
+            if poll[0] > known and self._covers(poll, book, market):
+                return "withdrawn", last_seen, poll[0]
+        return ("confirmed" if last_seen else "unconfirmed"), last_seen, None
+
+    def summary(self) -> Dict[str, Any]:
+        last = None
+        if self.last_poll:
+            last = {k: v for k, v in self.last_poll.items() if k != "_ts"}
+        return {
+            "since": _iso(self.first_poll_at),
+            "last_ok_poll_at": _iso(self.last_ok_at),
+            "last_poll": last,
+        }
+
+
+def _iso(d: Optional[datetime]) -> Optional[str]:
+    return d.isoformat() if d else None
+
+
 def _fair(quotes: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Median of per-book Shin de-vigs of the moneyline pair."""
     probs = []
@@ -193,8 +294,10 @@ def build_board(conn, sport: str = "NBA", now: Optional[datetime] = None,
         latest_change = ts if latest_change is None or ts > latest_change else latest_change
         grouped.setdefault(r["game_key"], {}).setdefault(r["sportsbook"], []).append(r)
 
-    dropped = {"started": 0, "no_price": 0}
+    beat = _Heartbeat(conn, sport)
+    dropped = {"started": 0, "no_price": 0, "withdrawn": 0, "withdrawn_markets": 0}
     games = []
+    withdrawn_games = []
     for game_key, by_book in grouped.items():
         for book_rows in by_book.values():
             book_rows.sort(key=lambda r: (parse_ts(r["captured_at"]), r["id"]))
@@ -207,12 +310,34 @@ def build_board(conn, sport: str = "NBA", now: Optional[datetime] = None,
             continue
 
         quotes: Dict[str, Dict[str, Any]] = {}
+        withdrawn: Dict[str, Dict[str, Any]] = {}
         last_change = None
         for book, br in by_book.items():
             latest = br[-1]
             hist = {m: market_history(br, m) for m in MARKETS}
             if all(hist[m]["current"] is None for m in MARKETS):
                 dropped["no_price"] += 1
+                continue
+            recorded_at = parse_ts(latest["captured_at"])
+            feed: Dict[str, Optional[str]] = {m: None for m in MARKETS}
+            last_seen: Dict[str, Optional[str]] = {m: None for m in MARKETS}
+            for m in MARKETS:
+                if hist[m]["current"] is None:
+                    continue
+                status, seen_at, missing = beat.check(game_key, book, m, recorded_at)
+                if status == "withdrawn":
+                    # The book stopped listing it: not a price anyone can bet.
+                    withdrawn.setdefault(book, {})[m] = {
+                        **hist[m]["current"],
+                        "last_seen_at": _iso(seen_at) or latest["captured_at"],
+                        "missing_since": _iso(missing),
+                    }
+                    dropped["withdrawn_markets"] += 1
+                    hist[m] = {**hist[m], "current": None, "since": None}
+                    continue
+                feed[m], last_seen[m] = status, _iso(seen_at)
+            if all(hist[m]["current"] is None for m in MARKETS):
+                dropped["withdrawn"] += 1
                 continue
             q: Dict[str, Any] = {f: None for f in _ALL_FIELDS}
             for m in MARKETS:
@@ -226,11 +351,23 @@ def build_board(conn, sport: str = "NBA", now: Optional[datetime] = None,
                 "changes": {m: hist[m]["changes"] for m in MARKETS},
                 "first_seen_at": br[0]["captured_at"],
                 "provenance": _get(latest, "provenance") or "observed",
+                # Heartbeat per market: 'confirmed' (a poll saw it; last_seen_at
+                # says when) or 'unconfirmed' (no poll has looked since this
+                # price was recorded). None where the market has no price.
+                "feed": feed,
+                "last_seen_at": last_seen,
             })
             quotes[book] = q
             ts = parse_ts(latest["captured_at"])
             last_change = ts if last_change is None or ts > last_change else last_change
         if not quotes:
+            if withdrawn:
+                # Every book stopped listing it (postponed, or pulled): say so
+                # rather than letting the game vanish without a trace.
+                withdrawn_games.append({"game_key": game_key, "home_team": newest["home_team"],
+                                        "away_team": newest["away_team"],
+                                        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                        "withdrawn": withdrawn})
             continue
 
         fair = _fair(quotes)
@@ -244,6 +381,8 @@ def build_board(conn, sport: str = "NBA", now: Optional[datetime] = None,
             "fair": fair,
             "best": {"home_ml": _best(quotes, "home_ml", fair),
                      "away_ml": _best(quotes, "away_ml", fair)},
+            # Markets a book stopped listing; kept out of fair and best.
+            "withdrawn": withdrawn,
         })
 
     games.sort(key=lambda g: (g["start"], g["game_key"]))
@@ -255,5 +394,7 @@ def build_board(conn, sport: str = "NBA", now: Optional[datetime] = None,
         "archive_since": archive_since.isoformat() if archive_since else None,
         "latest_change_at": latest_change.isoformat() if latest_change else None,
         "dropped": dropped,
+        "heartbeat": beat.summary(),
+        "withdrawn_games": withdrawn_games,
         "generated_at": now.isoformat(),
     }

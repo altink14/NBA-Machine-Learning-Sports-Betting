@@ -23,10 +23,106 @@ rivalry matchups, which differ in pace, stakes and foul rate before anyone
 blows a whistle. A difference here is an association with the games an
 official is given, not proof of how they call them. No causal or betting
 claim is made or supported.
+
+MANY TESTS AT ONCE (added 2026-09-27, nav audit bug 19). The page checks
+every official on five measures - 600-odd separate 95% tests in the default
+view - so about thirty of them would clear a single 95% test by luck alone.
+Each test's p-value is therefore run through a Benjamini-Hochberg
+false-discovery-rate correction across the whole family the page flags, and
+only `fdr_significant` rows are colored or promoted to a card. BH rather than
+Bonferroni: Bonferroni guards against even ONE fluke among 600 and would hide
+real, large foul-rate gaps; BH keeps the expected share of flukes among the
+flagged rows at 5%, which is the promise the page actually makes ("among
+what we highlight, about 1 in 20 could still be luck"). BH stays valid when
+the tests are positively correlated, as these are (fouls and free-throw rate
+move together, three officials share every game).
 """
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# The measures the officials page colors or turns into a finding card. This IS
+# the family of tests: adding a flagged measure to the page means adding it
+# here, or the correction silently covers fewer tests than the page runs.
+FDR_FAMILY = ("total_points", "fouls", "ft_rate", "over", "home_cover")
+FDR_ALPHA = 0.05
+
+
+def _p_two_sided(z: float) -> float:
+    return math.erfc(abs(z) / math.sqrt(2))
+
+
+def _p_mean(values: List[float], baseline: Optional[float]) -> Optional[float]:
+    """Two-sided p that the mean differs from the baseline, with the same
+    normal approximation _mean_ci uses, so p < .05 exactly when the interval
+    excludes the baseline."""
+    n = len(values)
+    if n < 2 or baseline is None:
+        return None
+    m = sum(values) / n
+    var = sum((v - m) ** 2 for v in values) / (n - 1)
+    se = math.sqrt(var / n)
+    if se == 0:
+        return None
+    return _p_two_sided((m - baseline) / se)
+
+
+def _p_prop(k: int, n: int, p0: Optional[float]) -> Optional[float]:
+    """Two-sided score test of k/n against p0. The score test is the one the
+    Wilson interval inverts, so it agrees with the interval shown."""
+    if n == 0 or p0 is None or p0 <= 0 or p0 >= 1:
+        return None
+    return _p_two_sided((k / n - p0) / math.sqrt(p0 * (1 - p0) / n))
+
+
+def _bh_adjust(pvals: List[float]) -> List[float]:
+    """Benjamini-Hochberg adjusted p-values (q-values), in input order.
+    A test is a discovery at level a exactly when its q <= a."""
+    m = len(pvals)
+    order = sorted(range(m), key=lambda i: pvals[i])
+    q = [1.0] * m
+    running = 1.0
+    for rank in range(m, 0, -1):
+        i = order[rank - 1]
+        running = min(running, pvals[i] * m / rank)
+        q[i] = min(1.0, running)
+    return q
+
+
+def _apply_fdr(cells: List[Dict[str, Any]], alpha: float = FDR_ALPHA) -> Tuple[int, int, int]:
+    """Stamp q and fdr_significant on every metric dict in `cells` that has a
+    p-value. Returns (tests, uncorrected hits, survivors)."""
+    tested = [c for c in cells if c is not None and c.get("p") is not None]
+    qs = _bh_adjust([c["p"] for c in tested]) if tested else []
+    for c, q in zip(tested, qs):
+        c["q"] = round(q, 4)
+        c["fdr_significant"] = q <= alpha
+    for c in cells:
+        if c is not None and c.get("p") is None:
+            c["q"] = None
+            c["fdr_significant"] = False
+    raw = sum(1 for c in tested if c["p"] < alpha)
+    return len(tested), raw, sum(1 for c in tested if c["fdr_significant"])
+
+
+def _fdr_note(tests: int, raw: int, survivors: int, what: str) -> str:
+    """The correction in plain English, with this view's own numbers."""
+    if survivors == 0:
+        return (
+            f"This view runs {tests} separate checks ({what}). At the usual 95% bar, about "
+            f"{round(tests * FDR_ALPHA)} of them would look unusual by luck alone, so a single "
+            f"check is not enough. We apply a false-discovery-rate correction "
+            f"(Benjamini-Hochberg): {raw} gaps clear a single 95% check, and none survives it, "
+            f"so nothing here stands out from what luck produces."
+        )
+    return (
+        f"This view runs {tests} separate checks ({what}). At the usual 95% bar, about "
+        f"{round(tests * FDR_ALPHA)} of them would look unusual by luck alone, so a single "
+        f"check is not enough. We apply a false-discovery-rate correction "
+        f"(Benjamini-Hochberg): of the {raw} gaps that clear a single 95% check, {survivors} "
+        f"{'survives' if survivors == 1 else 'survive'} it. Among the ones that survive, "
+        f"expect about 1 in 20 to still be luck."
+    )
 
 
 def _wilson(k: int, n: int, z: float = 1.96) -> Optional[List[float]]:
@@ -206,6 +302,7 @@ def compute_officials(
                 "diff": round(mean - base, 3 if key == "ft_rate" else 1) if base is not None else None,
                 "ci95": _mean_ci(vals),
                 "n": len(vals),
+                "p": _p_mean(vals, base),
             }
         wins = sum(o["home_win"])
         base_hw = matched_baseline(o["seasons"], "home_win")
@@ -232,10 +329,17 @@ def compute_officials(
                 "diff": round(k / m * 100 - base * 100, 1) if base is not None else None,
                 "ci95": _wilson(k, m),
                 "n": m,
+                "p": _p_prop(k, m, base),
             }
         out.append(row)
 
     out.sort(key=lambda r: -r["games"])
+
+    # ---- one correction across every test the page flags ----
+    n_tests, raw_hits, survivors = _apply_fdr([r.get(k) for r in out for k in FDR_FAMILY])
+    officials_surviving = sum(
+        1 for r in out if any(r.get(k) and r[k].get("fdr_significant") for k in FDR_FAMILY)
+    )
 
     # ---- coverage, stated plainly ----
     asked = conn.execute("SELECT COUNT(*) FROM officials_fetch").fetchone()[0]
@@ -246,6 +350,25 @@ def compute_officials(
         "SELECT MIN(b.game_date), MAX(b.game_date) FROM game_officials g "
         "JOIN box_scores b ON b.game_id = g.game_id"
     ).fetchone()
+
+    # Coverage OF THIS VIEW, per season, from the data rather than from what we
+    # remember about nba.com's feed (the page once said the feed "goes spotty
+    # after Apr 2025" long after the v3 fallback had filled those games in).
+    crewed = {link["game_id"] for link in links}
+    view_seasons: Dict[str, List[int]] = {}
+    for gid, f in facts.items():
+        s = view_seasons.setdefault(f["season"], [0, 0])
+        s[0] += 1
+        s[1] += 1 if gid in crewed else 0
+    feed_seasons = sorted(s for s, (_, c) in view_seasons.items() if c > 0)
+    feed_floor = feed_seasons[0] if feed_seasons else None
+    by_season = [
+        {"season": s, "games": g, "with_crew": c}
+        for s, (g, c) in sorted(view_seasons.items())
+        if feed_floor is not None and s >= feed_floor
+    ]
+    view_games = sum(x["games"] for x in by_season)
+    view_crewed = sum(x["with_crew"] for x in by_season)
 
     return {
         "season_from": season_from,
@@ -260,21 +383,45 @@ def compute_officials(
             "last_game": covered[1],
             "games_scored": len(facts),
             "games_with_line": sum(1 for f in facts.values() if f["over"] is not None or f["home_cover"] is not None),
+            # This season type, from the first season the crew feed reaches.
+            "view_first_season": feed_floor,
+            "view_games": view_games,
+            "view_games_with_crew": view_crewed,
+            "view_games_without_crew": view_games - view_crewed,
+            "view_seasons_with_gaps": [x for x in by_season if x["with_crew"] < x["games"]],
+            "by_season": by_season,
+            "market_first_season": _market.FIRST_SEASON if lines is not None else None,
+            "market_last_season": _market.LAST_SEASON if lines is not None else None,
+        },
+        "testing": {
+            "method": "Benjamini-Hochberg false discovery rate",
+            "alpha": FDR_ALPHA,
+            "family": list(FDR_FAMILY),
+            "tests": n_tests,
+            "uncorrected_hits": raw_hits,
+            "surviving": survivors,
+            "officials_surviving": officials_surviving,
+            "note": _fdr_note(
+                n_tests, raw_hits, survivors,
+                f"{len(out)} officials, up to {len(FDR_FAMILY)} measures each",
+            ),
         },
         "market_note": (
             "Over % and Home ATS % use closing lines from the historical odds dataset "
             f"({_market.FIRST_SEASON} to {_market.LAST_SEASON}) for the games that have one; pushes are skipped and "
             "the baseline is the league rate over the same seasons. A crew is not "
             "assigned at random, so these describe the games an official was given, "
-            "not how he called them, and they are not a betting edge. With eighty-odd "
-            "officials on the table, a few will clear their interval by chance alone."
+            "not how they called them, and they are not a betting edge. These two "
+            "columns are inside the same false-discovery-rate correction as the rest."
         ) if lines is not None else None,
         "method": (
             "Crews come from nba.com's Officials feed; every game statistic is "
             "computed from our own box-score archive. Each official's average is "
             "compared with the league average of the SAME seasons, weighted by how "
             "many games they worked in each, because scoring and foul rates move "
-            "between seasons. Intervals are 95%. Crews are NOT assigned at random - "
+            "between seasons. Intervals are 95%; a gap is highlighted only if it also "
+            "survives a Benjamini-Hochberg false-discovery-rate correction across "
+            "every official and measure in the view. Crews are NOT assigned at random - "
             "senior officials draw nationally televised, playoff and rivalry games, "
             "which differ before anyone blows a whistle - so these are associations "
             "with the games an official is given, not evidence about how they call "
@@ -397,16 +544,25 @@ def compute_team_officials(
             "win_baseline": round(base_win * 100, 1) if base_win is not None else None,
             "win_diff": round(o["wins"] / n * 100 - base_win * 100, 1) if base_win is not None else None,
             "win_ci95": _wilson(o["wins"], n),
+            # The win test as its own cell so it joins the same correction.
+            "win_test": {"p": _p_prop(o["wins"], n, base_win)},
             "pts_for": {"avg": round(pf_avg, 1),
                         "baseline": round(base_pf, 1) if base_pf is not None else None,
                         "diff": round(pf_avg - base_pf, 1) if base_pf is not None else None,
-                        "ci95": _mean_ci(o["pf"])},
+                        "ci95": _mean_ci(o["pf"]),
+                        "p": _p_mean(o["pf"], base_pf)},
             "pts_against": {"avg": round(pa_avg, 1),
                             "baseline": round(base_pa, 1) if base_pa is not None else None,
                             "diff": round(pa_avg - base_pa, 1) if base_pa is not None else None,
-                            "ci95": _mean_ci(o["pa"])},
+                            "ci95": _mean_ci(o["pa"]),
+                            "p": _p_mean(o["pa"], base_pa)},
         })
     out.sort(key=lambda r: -r["games"])
+
+    # Every pair on the page is tested on three things; correct across all of them.
+    n_tests, raw_hits, survivors = _apply_fdr(
+        [r[k] for r in out for k in ("win_test", "pts_for", "pts_against")]
+    )
 
     return {
         "team": team_abbr,
@@ -419,13 +575,27 @@ def compute_team_officials(
             "team_games_scored": len(facts),
             "team_games_with_crew": len(covered_games),
         },
+        "testing": {
+            "method": "Benjamini-Hochberg false discovery rate",
+            "alpha": FDR_ALPHA,
+            "family": ["win", "pts_for", "pts_against"],
+            "tests": n_tests,
+            "uncorrected_hits": raw_hits,
+            "surviving": survivors,
+            "note": _fdr_note(
+                n_tests, raw_hits, survivors,
+                f"{len(out)} referees, three measures each",
+            ),
+        },
         "method": (
             "How it works: for each referee, we take this team's games he worked and "
             "compare the results to the TEAM'S OWN usual numbers over the same "
             "seasons - not the league's. Referee crews come from nba.com's feed; "
             "every result is computed from our own archive. A team only sees a given "
             "referee a few times a season, so these are small samples and most gaps "
-            "are plain luck. Referees are assigned by the league, not chosen; nothing "
+            "are plain luck; a gap is highlighted only if it survives a "
+            "false-discovery-rate correction across every referee and measure on the "
+            "page. Referees are assigned by the league, not chosen; nothing "
             "here is evidence of favoritism, and none of it is a betting angle."
         ),
     }

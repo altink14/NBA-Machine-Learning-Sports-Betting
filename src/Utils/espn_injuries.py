@@ -208,6 +208,10 @@ def build_absences(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
             "name": entry.get("player_name"),
             "status": entry.get("status"),
             "detail": entry.get("detail") or "",
+            # ESPN's time of its latest note on this player. It keeps a
+            # player listed until a new note posts, so offseason entries
+            # can be months old; readers that care use this to say so.
+            "date": entry.get("date") or "",
         })
     match_rate = 1.0 if counted == 0 else round((counted - len(unmatched)) / counted, 3)
     return {

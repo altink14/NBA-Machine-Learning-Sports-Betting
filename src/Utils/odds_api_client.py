@@ -23,6 +23,25 @@ headers are logged on every call so drift is visible in daily_update.log.
 
 KEY. Set ODDS_API_KEY in the environment. No key -> callers get a clear
 error, never a silent no-op that leaves the archive empty while looking fine.
+
+HEARTBEAT (2026-09-27). odds_snapshots is written on CHANGE, so a book that
+stops listing a game writes nothing and its last price looked current on the
+Line Shop forever. Every poll now also leaves a heartbeat, written separately
+from the snapshot rows (which are unchanged):
+
+  odds_polls  one row per poll, success OR failure: when, which source, which
+              books and markets it asked for, and whether it saw the source's
+              WHOLE board (covers_board). Only an 'ok' whole-board poll is
+              evidence that something missing from it is gone. A failed or
+              empty poll proves nothing, so it can never pull a quote: that is
+              the difference between "we could not look" and "the book took
+              it down" (the silent-fallback hazard, again).
+  odds_seen   per (source, game, book, market): first and last time a poll
+              saw that market priced. Upserted, one row per key.
+
+The poll row and its odds_seen upserts land in ONE transaction, so a poll can
+never exist without the sightings that go with it (that would read as "every
+book pulled every game"). The read rule lives in src/Utils/odds_board.py.
 """
 
 import logging
@@ -79,6 +98,97 @@ BEGIN
   SELECT RAISE(ABORT, 'odds_snapshots.provenance must be observed, reconstructed or third_party');
 END;
 """
+
+
+#: The board's market names (odds_board.MARKETS) and the row fields that
+#: price each one. A market counts as "seen" when any of its fields is priced.
+HEARTBEAT_MARKETS = {
+    "ml": ("home_ml", "away_ml"),
+    "spread": ("spread_home", "spread_home_price", "spread_away_price"),
+    "total": ("ou_line", "ou_over_price", "ou_under_price"),
+}
+#: The Odds API's market keys -> the board's.
+_API_TO_BOARD_MARKET = {"h2h": "ml", "spreads": "spread", "totals": "total"}
+
+SOURCE_ODDS_API = "odds_api"
+
+_HEARTBEAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS odds_polls (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    polled_at     TEXT NOT NULL,     -- UTC ISO; equals captured_at of rows this poll wrote
+    sport         TEXT NOT NULL,
+    source        TEXT NOT NULL,     -- 'odds_api' (whole board) | 'sbr' (one book, one date)
+    status        TEXT NOT NULL CHECK (status IN ('ok', 'empty', 'failed')),
+    covers_board  INTEGER NOT NULL CHECK (covers_board IN (0, 1)),
+    books         TEXT,              -- comma list asked for; NULL = every book the source carries
+    markets       TEXT NOT NULL,     -- comma list of board markets asked for (ml,spread,total)
+    events        INTEGER,
+    book_rows     INTEGER,
+    error         TEXT               -- why a failed poll failed; NULL otherwise
+);
+CREATE INDEX IF NOT EXISTS idx_odds_polls_time ON odds_polls (sport, polled_at);
+CREATE TABLE IF NOT EXISTS odds_seen (
+    source         TEXT NOT NULL,
+    sport          TEXT NOT NULL,
+    game_key       TEXT NOT NULL,
+    sportsbook     TEXT NOT NULL,
+    market         TEXT NOT NULL,    -- ml | spread | total
+    first_seen_at  TEXT NOT NULL,
+    last_seen_at   TEXT NOT NULL,
+    last_poll_id   INTEGER NOT NULL REFERENCES odds_polls(id),
+    PRIMARY KEY (source, sport, game_key, sportsbook, market)
+);
+"""
+
+
+def ensure_heartbeat_schema(conn: sqlite3.Connection) -> None:
+    """Create odds_polls / odds_seen if missing. Additive; touches no other table."""
+    conn.executescript(_HEARTBEAT_SCHEMA)
+
+
+def record_poll(conn: sqlite3.Connection, *, polled_at: str, sport: str, source: str,
+                status: str, covers_board: bool, markets: str,
+                books: Optional[str] = None, events: Optional[int] = None,
+                book_rows: Optional[int] = None, rows: Optional[List[Dict[str, Any]]] = None,
+                error: Optional[str] = None) -> int:
+    """
+    Write one poll and, for an 'ok' poll, every (game, book, market) it saw
+    priced, in one transaction. Returns the poll id.
+
+    A poll that saw nothing is recorded as 'empty', never as 'ok': an empty
+    answer from a feed that normally lists the whole slate is far more often
+    a hiccup than every book pulling every game at once, and an 'ok' poll with
+    no sightings would drop the entire board.
+    """
+    if status == "ok" and not rows:
+        status = "empty"
+    ensure_heartbeat_schema(conn)
+    with conn:  # one transaction: the poll and its sightings, or neither
+        cur = conn.execute(
+            "INSERT INTO odds_polls (polled_at, sport, source, status, covers_board, books, "
+            "markets, events, book_rows, error) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (polled_at, sport, source, status, 1 if covers_board else 0, books, markets,
+             events, book_rows, error))
+        poll_id = cur.lastrowid
+        if status == "ok":
+            seen = []
+            for row in rows or []:
+                for market, fields in HEARTBEAT_MARKETS.items():
+                    if any(row.get(f) is not None for f in fields):
+                        seen.append((source, sport, row["game_key"], row["sportsbook"], market,
+                                     polled_at, polled_at, poll_id))
+            conn.executemany(
+                "INSERT INTO odds_seen (source, sport, game_key, sportsbook, market, "
+                "first_seen_at, last_seen_at, last_poll_id) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT (source, sport, game_key, sportsbook, market) DO UPDATE SET "
+                "last_seen_at = excluded.last_seen_at, last_poll_id = excluded.last_poll_id",
+                seen)
+    return poll_id
+
+
+def _board_markets(api_markets: str) -> str:
+    return ",".join(_API_TO_BOARD_MARKET[m] for m in api_markets.split(",")
+                    if m in _API_TO_BOARD_MARKET)
 
 
 class OddsApiError(RuntimeError):
@@ -243,14 +353,15 @@ _CHANGE_FIELDS = [
 
 
 def write_snapshot_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]],
-                        sport: str = "NBA") -> Dict[str, int]:
+                        sport: str = "NBA", captured_at: Optional[str] = None) -> Dict[str, int]:
     """
     Change-detected insert, same contract as the legacy snapshot writer: a row
     is written only when any tracked number moved since that book's last
-    snapshot of that game. Returns {written, unchanged}.
+    snapshot of that game. Returns {written, unchanged}. `captured_at` lets the
+    caller stamp the rows with the same instant as the poll's heartbeat.
     """
     ensure_snapshot_schema(conn)
-    captured_at = datetime.now(timezone.utc).isoformat()
+    captured_at = captured_at or datetime.now(timezone.utc).isoformat()
     written = unchanged = 0
     for row in rows:
         last = conn.execute(
@@ -280,14 +391,49 @@ def write_snapshot_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]],
 
 
 def snapshot_nba_board(db_path: str, bookmakers: Optional[str] = None) -> Dict[str, Any]:
-    """Fetch the board once and archive it. The one-call entry point."""
-    events, quota = fetch_nba_odds(bookmakers=bookmakers)
+    """
+    Fetch the board once and archive it. The one-call entry point.
+
+    Every call leaves an odds_polls row: 'ok' (with odds_seen sightings) when
+    the board was fetched AND archived, 'empty' when the feed listed nothing,
+    'failed' when the fetch or the archive write raised (then re-raised, so
+    callers still see the failure). The heartbeat is written after the
+    snapshot rows commit, in its own transaction: if it fails, the archive is
+    intact and the board simply has no evidence from this poll, which can only
+    make it keep a quote, never drop one.
+    """
+    polled_at = datetime.now(timezone.utc).isoformat()
+    heartbeat = {"polled_at": polled_at, "sport": "NBA", "source": SOURCE_ODDS_API,
+                 # /odds returns every upcoming event the API lists, so absence
+                 # from an 'ok' poll is evidence. A --bookmakers run is still a
+                 # whole board for the books it named; `books` records which.
+                 "covers_board": True, "books": bookmakers,
+                 "markets": _board_markets(DEFAULT_MARKETS)}
+    try:
+        events, quota = fetch_nba_odds(bookmakers=bookmakers)
+    except Exception as exc:
+        _record_poll_quietly(db_path, status="failed", error=str(exc)[:500], **heartbeat)
+        raise
     rows = events_to_rows(events)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout = 15000")
-        result = write_snapshot_rows(conn, rows)
+        try:
+            result = write_snapshot_rows(conn, rows, captured_at=polled_at)
+        except Exception as exc:
+            # We saw the board but could not archive it. Recording sightings
+            # now would label the OLD price as confirmed, so the poll is failed.
+            conn.rollback()
+            _record_poll_quietly(db_path, status="failed", events=len(events),
+                                 book_rows=len(rows), error=f"archive write: {exc}"[:500],
+                                 **heartbeat)
+            raise
+        try:
+            record_poll(conn, status="ok", events=len(events), book_rows=len(rows),
+                        rows=rows, **heartbeat)
+        except Exception as exc:
+            logger.error("Odds heartbeat NOT recorded (snapshot rows are saved): %s", exc)
     finally:
         conn.close()
     summary = {
@@ -299,3 +445,16 @@ def snapshot_nba_board(db_path: str, bookmakers: Optional[str] = None) -> Dict[s
     }
     logger.info("Odds snapshot: %s", summary)
     return summary
+
+
+def _record_poll_quietly(db_path: str, **kw: Any) -> None:
+    """Write a failed/empty poll row; never mask the original error with a new one."""
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA busy_timeout = 15000")
+            record_poll(conn, **kw)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("Could not record the failed odds poll: %s", exc)

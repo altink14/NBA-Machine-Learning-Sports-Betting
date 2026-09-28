@@ -157,7 +157,7 @@ def find_db_team_stats(team_name: str, season: str = CURRENT_SEASON):
 # --- Security / networking configuration (env-driven) ---
 # CORS_ORIGINS: comma-separated list of allowed browser origins. Defaults to the
 # local Next.js dev server so a fresh checkout works with no configuration.
-DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001"  # 3001: dev fallback when 3000 is taken
+DEFAULT_CORS_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3100,http://127.0.0.1:3100"  # 3001: dev fallback when 3000 is taken; 3100: the local production rehearsal (bettingbuddy-prod-rehearsal)
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.environ.get("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")

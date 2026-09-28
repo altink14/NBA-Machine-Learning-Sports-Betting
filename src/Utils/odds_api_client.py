@@ -46,6 +46,7 @@ book pulled every game"). The read rule lives in src/Utils/odds_board.py.
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -160,6 +161,7 @@ def record_poll(conn: sqlite3.Connection, *, polled_at: str, sport: str, source:
     a hiccup than every book pulling every game at once, and an 'ok' poll with
     no sightings would drop the entire board.
     """
+    error = redact(error) if error else error
     if status == "ok" and not rows:
         status = "empty"
     ensure_heartbeat_schema(conn)
@@ -195,6 +197,30 @@ class OddsApiError(RuntimeError):
     pass
 
 
+_KEY_IN_TEXT = re.compile(r"(apiKey=)[^&\s'\")]+", re.IGNORECASE)
+
+
+def redact(text: Any) -> str:
+    """The text with any apiKey=... value replaced.
+
+    requests puts the full URL, query string included, into its exception
+    messages, so an unreachable host or a 5xx used to write ODDS_API_KEY
+    into the logs and into odds_polls.error, which ledger_sync copies to
+    the public server (found 2026-09-28). Everything that leaves this module
+    as an error goes through here."""
+    return _KEY_IN_TEXT.sub(r"\1REDACTED", str(text))
+
+
+def _get(url: str, params: Dict[str, Any], timeout: int) -> "requests.Response":
+    """requests.get whose failures never carry the key: a transport error is
+    re-raised as OddsApiError with the URL's key redacted, and without the
+    original exception chained (its message holds the raw URL)."""
+    try:
+        return requests.get(url, params=params, timeout=timeout)
+    except requests.RequestException as exc:
+        raise OddsApiError(f"The Odds API could not be reached: {redact(exc)}") from None
+
+
 def get_api_key() -> str:
     key = os.environ.get("ODDS_API_KEY", "").strip()
     if not key:
@@ -221,7 +247,7 @@ def fetch_nba_events(
     answer is yes. The alternative, and what this module did before, is a blind
     loop that pays full price to discover there is nothing to watch.
     """
-    resp = requests.get(
+    resp = _get(
         f"{ODDS_API_BASE}/sports/{SPORT_KEY}/events",
         params={"apiKey": api_key or get_api_key()},
         timeout=timeout,
@@ -235,7 +261,9 @@ def fetch_nba_events(
         raise OddsApiError("The Odds API rejected the key (401). Check ODDS_API_KEY.")
     if resp.status_code == 429:
         raise OddsApiError(f"The Odds API quota is exhausted (429). Remaining={quota['remaining']}.")
-    resp.raise_for_status()
+    if not resp.ok:
+        # raise_for_status() would put the URL, key and all, in the message.
+        raise OddsApiError(f"The Odds API returned {resp.status_code} for /events: {redact(resp.text[:200])}")
     return resp.json(), quota
 
 
@@ -259,7 +287,7 @@ def fetch_nba_odds(
     }
     if bookmakers:
         params["bookmakers"] = bookmakers
-    resp = requests.get(f"{ODDS_API_BASE}/sports/{SPORT_KEY}/odds", params=params, timeout=timeout)
+    resp = _get(f"{ODDS_API_BASE}/sports/{SPORT_KEY}/odds", params=params, timeout=timeout)
     quota = {
         "remaining": resp.headers.get("x-requests-remaining"),
         "used": resp.headers.get("x-requests-used"),
@@ -269,7 +297,7 @@ def fetch_nba_odds(
     if resp.status_code == 429:
         raise OddsApiError(f"The Odds API quota is exhausted (429). Remaining={quota['remaining']}.")
     if not resp.ok:
-        raise OddsApiError(f"The Odds API returned {resp.status_code}: {resp.text[:200]}")
+        raise OddsApiError(f"The Odds API returned {resp.status_code}: {redact(resp.text[:200])}")
     events = resp.json()
     if not isinstance(events, list):
         raise OddsApiError(f"Unexpected response shape: {type(events)}")

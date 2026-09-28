@@ -1077,8 +1077,29 @@ def _safe(fn: Callable[[], Dict[str, Any]], cid: str, name: str) -> Dict[str, An
         return _check(cid, name, UNKNOWN, f"The check itself crashed: {type(exc).__name__}: {exc}")
 
 
+_SECRET_IN_TEXT = re.compile(r"((?:api[_-]?key|token|secret|password)=)[^&\s'\")]+", re.IGNORECASE)
+
+
+def _scrub(value: Any) -> Any:
+    """Every string in the report with key=... values redacted. The checks
+    quote log lines and stored errors, and a requests error quotes its URL,
+    query string and API key included (found 2026-09-28: the Odds API key
+    appeared in this report, which /api/admin/health serves)."""
+    if isinstance(value, str):
+        return _SECRET_IN_TEXT.sub(r"REDACTED", value)
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub(v) for v in value]
+    return value
+
+
 def collect(now: Optional[datetime] = None, sched: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """The whole report as a dict. Read-only."""
+    """The whole report as a dict, secrets redacted. Read-only."""
+    return _scrub(_collect(now, sched))
+
+
+def _collect(now: Optional[datetime] = None, sched: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     now = _utc(now) if now else datetime.now(timezone.utc)
     sched = sched if sched is not None else read_task_scheduler()
 

@@ -220,6 +220,46 @@ the end of this section. The options as they were weighed:
 If a push is ever REFUSED, do not work around it. It means the two copies
 disagree about something that already happened; find out which one is wrong.
 
+### Pick commitments (built 2026-09-28)
+
+- `commit_ledger.py` (home PC only; refuses where `PREDICTIONS_SOURCE=ledger`)
+  hashes every logged pick no commitment covers yet, per log date, with a
+  secret nonce, and chains each commitment's hash to the one before, into
+  `ledger_commitments` in OddsData.sqlite (created on first run, append-only
+  by trigger). The canonical form is documented in full in
+  `src/Utils/ledger_commit.py`. It runs in `daily_update.py` straight after the
+  picks are logged, and hourly (`run_scheduled.py hourly`) before the push.
+  `commit_ledger.py --verify` rechecks the whole chain against today's rows.
+- `ledger_sync` carries the table like the ledger: the server must hold its
+  guard triggers (the sync endpoint creates them), a changed or missing
+  commitment is a 409, and so is an upload whose chain does not verify.
+- `GET /api/ledger/commitments` serves the hashes; a commitment's nonce and
+  picks are revealed only after every game it covers has tipped off. The
+  /track-record page recomputes them in the browser.
+- Covered by `Tests/Ledger_Commit_Test.py`.
+
+### Publishing the pick commitments (off until you switch it on)
+
+Until the hashes are also somewhere we do not control, the commitments prove
+the record was not edited after it was committed only to someone who trusts
+that we did not rebuild the whole chain. Publishing removes that trust.
+
+One-time setup: create an empty PUBLIC GitHub repository (e.g.
+`bettingbuddy-ledger`), clone it on the home PC, and make sure `git push` from
+that clone works without a prompt (it runs unattended).
+
+**The switch:** add `LEDGER_PUBLISH_REPO=<path to that clone>` to the backend
+`.env`. From the next daily or hourly run, `publish_commitments.py --publish`
+appends each new commitment (hashes, size and timing only, never a nonce or a
+pick) to `nba/commitments.jsonl` there, commits and pushes. It refuses, and
+writes nothing, if the published file disagrees with the database or the chain
+does not verify. `venv/Scripts/python.exe publish_commitments.py` (no flag)
+prints exactly what it would publish.
+
+Optional, at deploy: set `LEDGER_COMMITMENTS_PUBLIC_URL=<the repo's URL>` on
+the public server, and the track-record page links the public copy instead of
+saying it is not published yet.
+
 ## Env inventory
 
 The authoritative, annotated list now lives in `.env.example` in each repo —

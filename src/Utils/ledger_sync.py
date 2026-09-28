@@ -37,6 +37,8 @@ import json
 import sqlite3
 from typing import Dict, List, Optional
 
+from src.Utils import ledger_commit
+
 #: The tables carried to the server, with the triggers each one must have
 #: there before we will write into it. odds_snapshots is observations, not
 #: predictions, so it has no immutability triggers of its own; the shrink
@@ -44,12 +46,15 @@ from typing import Dict, List, Optional
 #: heartbeat (odds_polls: one row per poll; odds_seen: first/last sighting per
 #: game, book and market) joined on 2026-09-28 so the public Line Shop can tell
 #: a current price from one a book has pulled. Order matters: odds_polls
-#: before odds_seen, whose last_poll_id points at it.
+#: before odds_seen, whose last_poll_id points at it. The pick commitments
+#: (ledger_commit.py, 2026-09-28) are guarded like the ledger itself, and come
+#: after predictions_log so the chain check below can rehash the picks.
 SYNCED_TABLES: Dict[str, frozenset] = {
     "predictions_log": frozenset({
         "predictions_log_immutable", "predictions_log_no_regrade", "predictions_log_no_delete"}),
     "ledger": frozenset({
         "ledger_prediction_is_immutable", "ledger_no_regrade", "ledger_no_delete"}),
+    "ledger_commitments": ledger_commit.GUARD_TRIGGERS,
     "odds_snapshots": frozenset(),
     "odds_polls": frozenset(),
     "odds_seen": frozenset(),
@@ -61,6 +66,7 @@ SYNCED_TABLES: Dict[str, frozenset] = {
 NATURAL_KEYS: Dict[str, tuple] = {
     "predictions_log": ("log_date", "sportsbook", "game_key"),
     "ledger": ("game_id", "market_type", "side", "model_version"),
+    "ledger_commitments": ("log_date", "seq"),
     "odds_snapshots": ("captured_at", "sportsbook", "game_key"),
     "odds_polls": ("polled_at", "sport", "source"),
     "odds_seen": ("source", "sport", "game_key", "sportsbook", "market"),
@@ -253,6 +259,19 @@ def merge(conn: sqlite3.Connection, upload_path: str) -> dict:
 
                 report[t] = {"inserted": inserted, "updated": len(changed),
                              "columns_added": added}
+            if "ledger_commitments" in tables:
+                # The triggers stop a commitment changing; they cannot see a
+                # home copy that wrote a broken link or a pick that no longer
+                # hashes to what was committed. Publishing either would put a
+                # failed proof on the public page, so it is refused here.
+                check = ledger_commit.verify(conn)
+                bad = [e for e in check["entries"] if e["chain"] != "ok" or e["rows"] != "match"]
+                if bad:
+                    raise SyncRefused(
+                        f"ledger_commitments: {len(bad)} commitment(s) do not verify after the "
+                        f"merge (first: {bad[0]['log_date']} #{bad[0]['seq']}, chain "
+                        f"{bad[0]['chain']}, rows {bad[0]['rows']}). The record and its "
+                        "commitments disagree; nothing was written.")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             conn.execute("ROLLBACK")

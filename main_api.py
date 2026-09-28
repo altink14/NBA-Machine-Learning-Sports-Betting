@@ -316,6 +316,12 @@ app = FastAPI(
     version="1.1.1-stable-fixed",
     dependencies=[Depends(require_api_key)],
 )
+# Response contracts for the endpoints the frontend reads most: documentation
+# in /openapi.json only (handlers and their JSON are untouched), which the
+# frontend turns into TypeScript so a renamed field fails tsc. See
+# src/Utils/api_contracts.py and Tests/Api_Contracts_Test.py.
+from src.Utils import api_contracts as _api_contracts
+_api_contracts.install(app)
 if SLOWAPI_AVAILABLE:
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -2591,6 +2597,33 @@ def get_game_market(game_id: str):
     return result
 
 
+# --- Closing prices for a member's own bets (/bets page) ---
+# The same book's last pre-tip price from odds_snapshots, with how close to tip
+# it was last confirmed. Read-only; the logic and its rules live in
+# src/Utils/closing_lines.py. POST because a ledger is a list, not a URL: the
+# body carries teams, date, book, market, side, line and price -- never a
+# stake, a user id or anything else about the member.
+class ClosingLineRequest(BaseModel):
+    bets: List[Dict[str, Any]]
+
+
+@app.post("/api/closing-lines/lookup")
+def closing_lines_lookup(payload: ClosingLineRequest):
+    from src.Utils import closing_lines
+    if len(payload.bets) > closing_lines.MAX_ITEMS:
+        raise HTTPException(status_code=400,
+                            detail=f"At most {closing_lines.MAX_ITEMS} bets per request.")
+    if not os.path.exists(ODDS_DB_PATH):
+        return {"results": [], "archive_first_tip": None, "heartbeat": False,
+                "error": "odds archive not present on this server"}
+    conn = sqlite3.connect(f"file:{ODDS_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return closing_lines.lookup(conn, payload.bets)
+    finally:
+        conn.close()
+
+
 @app.get("/api/games/{game_id}/officials")
 def get_game_officials(game_id: str):
     """The crew that worked one game (nba.com Officials feed via backfill_officials.py). Names only."""
@@ -3429,6 +3462,10 @@ async def ledger_sync_endpoint(request: Request):
                 try:
                     _ensure_prediction_log_schema(conn)
                     _ensure_ledger(conn)
+                    # The pick commitments are guarded too, and merge() will
+                    # not write into a guarded table the server lacks.
+                    from src.Utils import ledger_commit
+                    ledger_commit.ensure_schema(conn)
                     conn.commit()
                     return ledger_mirror.merge(conn, tmp)
                 finally:
@@ -3448,6 +3485,39 @@ async def ledger_sync_endpoint(request: Request):
     logger.info("Ledger sync applied: %s", result["tables"])
     return {"ok": True, "received_bytes": len(body),
             "synced_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(), **result}
+
+
+# --- Scheduled-job health (job_health.py), for the founder's /admin/health ---
+_JOB_HEALTH_CACHE: Dict[str, Any] = {"at": None, "report": None}
+_JOB_HEALTH_LOCK = threading.Lock()
+_JOB_HEALTH_TTL = timedelta(seconds=60)
+
+
+@app.get("/api/admin/health")
+def admin_job_health(request: Request, refresh: bool = False):
+    """Every scheduled job's last run, result, cadence and data traces.
+
+    Guarded by INTERNAL_API_KEY in X-Internal-Key: the secret the Next.js
+    server already holds and no browser ever sees. Unset = 503, like the
+    ledger sync route, so a server not meant to expose this cannot. The report
+    names file paths and task commands, so it is never public. Read-only (see
+    job_health.py); cached a minute because it asks PowerShell each time.
+    """
+    if not INTERNAL_API_KEY:
+        raise HTTPException(status_code=503, detail="Job health is not configured on this server "
+                                                    "(set INTERNAL_API_KEY here and in the frontend).")
+    supplied = request.headers.get(INTERNAL_KEY_HEADER) or ""
+    if not secrets.compare_digest(supplied.encode("utf-8"), INTERNAL_API_KEY.encode("utf-8")):
+        raise HTTPException(status_code=401, detail=f"Missing or invalid {INTERNAL_KEY_HEADER} header.")
+    import job_health
+    with _JOB_HEALTH_LOCK:
+        now = datetime.now(timezone.utc)
+        at = _JOB_HEALTH_CACHE["at"]
+        if refresh or at is None or now - at > _JOB_HEALTH_TTL:
+            report = job_health.collect()
+            report["summary_text"] = job_health.summarize(report)
+            _JOB_HEALTH_CACHE.update(at=now, report=report)
+        return _JOB_HEALTH_CACHE["report"]
 
 
 # --- Prediction track record endpoint ---
@@ -3534,6 +3604,75 @@ def get_prediction_log(days: int = 30, sportsbook: Optional[str] = None):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+
+@app.get("/api/track-record/clv")
+def get_track_record_clv():
+    """Closing line value of every settled pick, for /track-record.
+
+    Public for the same reason as /api/prediction-log, and it can reveal no
+    pick early: only games that have started count, and a pick is settled
+    only after its result is graded. Read-only; the pricing runs in the daily
+    job (grade_predictions.price_clv, rules in src/Utils/nba_clv.py). Watched
+    and reconstructed closes are reported apart, never pooled. Evidence about
+    the prices we took, not a profit figure.
+    """
+    from src.Utils import nba_clv
+    conn = _odds_snapshot_conn()
+    try:
+        return nba_clv.summary(conn, exclude_model=SIMULATED_MODEL_TAG)
+    except Exception as e:
+        logger.error(f"Error in /api/track-record/clv: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Closing line value is unavailable.")
+    finally:
+        conn.close()
+
+
+# --- Pick commitments: the track record, verifiable by anyone ---
+@app.get("/api/ledger/commitments")
+def get_ledger_commitments(days: int = 120):
+    """Each day's SHA-256 commitment to its picks, chained, for /track-record.
+
+    Written by the home PC before tip-off (commit_ledger.py, via the daily
+    and hourly jobs) and mirrored here by ledger_sync. A commitment's nonce
+    and picks are revealed only once every game it covers has tipped off, the
+    same seal /api/prediction-log applies; before that only its hashes show.
+    The canonical form is documented in src/Utils/ledger_commit.py and served
+    in `method` so a verifier does not have to read our code.
+    """
+    from src.Utils import ledger_commit
+    days = max(1, min(int(days), 1000))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    method = {
+        "version": ledger_commit.METHOD_VERSION,
+        "fields": list(ledger_commit.CANONICAL_FIELDS),
+        "numbers": "winner_confidence, home_ml and away_ml as strings with six decimals",
+        "preimage": '["bb-ledger-commit-v1", log_date, seq, nonce, [row, ...]] as compact JSON, UTF-8',
+        "picks_sha256": "SHA-256 of the preimage, lowercase hex",
+        "chain_sha256": ('SHA-256 of ["bb-ledger-commit-v1", "chain", prev_chain_sha256, log_date, '
+                         'seq, n_picks, committed_at, picks_sha256] as compact JSON; the first '
+                         'commitment\'s prev_chain_sha256 is 64 zeros'),
+        "source": "src/Utils/ledger_commit.py (backend repository)",
+    }
+    # Where the chain hashes are published outside our control, once they
+    # are (publish_commitments.py). Unset means they are not yet, and the page
+    # says so rather than implying a proof it cannot offer.
+    public_copy = (os.environ.get("LEDGER_COMMITMENTS_PUBLIC_URL") or "").strip() or None
+    now_iso = _utc_iso(datetime.now(timezone.utc))
+    empty = {"method": method, "public_copy_url": public_copy, "days": days, "now": now_iso,
+             "chain": {"length": 0, "head": None, "intact": True}, "commitments": []}
+    if not os.path.exists(ODDS_DB_PATH):
+        return empty
+    conn = sqlite3.connect(f"file:{ODDS_DB_PATH}?mode=ro", uri=True)
+    try:
+        if not ledger_commit.has_table(conn):
+            return empty
+        view = ledger_commit.public_view(conn, now=now_iso, since=since)
+    finally:
+        conn.close()
+    view["commitments"].reverse()  # newest first, like the ledger table
+    return {"method": method, "public_copy_url": public_copy, "days": days, **view}
+
 
 # --- Box scores by date (the daily scores archive) ---
 @app.get("/api/games/by-date/{game_date}")

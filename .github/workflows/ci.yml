@@ -1,0 +1,46 @@
+# Backend test suite on every push and pull request (added 2026-09-28).
+#
+# Runs Tests/run_ci.py: the unittest suite minus the modules that assert
+# against the local archive (Data/TeamData.sqlite and friends live only on the
+# home PC, are several GB and are not ours to publish, so a CI checkout has
+# none of them). The full suite, archive included, stays the local gate:
+#     venv/Scripts/python.exe -m unittest discover -s Tests -p "*_Test.py"
+#
+# Windows and Python 3.13 because that is where the suite is run and the model
+# was evaluated (the home PC). The Docker image is python:3.11-slim; if the
+# deploy target matters more than parity with the home PC, add 3.11 to the
+# matrix. No secrets are used and no test reaches stats.nba.com.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Test-only: fastapi.testclient needs httpx, which the server does not.
+          pip install "httpx>=0.28,<0.29"
+
+      - name: Test suite (archive-free)
+        run: python Tests/run_ci.py

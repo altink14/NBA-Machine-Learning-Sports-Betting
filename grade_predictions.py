@@ -86,141 +86,70 @@ def _find_result(team_conn, home_id: int, away_id: int, around_date: str):
     return row[0], row[1]
 
 
-#: Columns added 2026-09-19 for closing line value. Additive only.
-_CLV_COLUMNS = [
-    ("closing_home_ml", "REAL"),
-    ("closing_away_ml", "REAL"),
-    ("closing_captured_at", "TEXT"),
-    ("closing_minutes_before_tip", "REAL"),
-    # Whether the close we settled against is a price we watched or one
-    # rebuilt from a vendor archive. Pooling the two and publishing the
-    # average is the mistake this column exists to make impossible.
-    ("closing_provenance", "TEXT"),
-    ("clv", "REAL"),
-]
+def _played_on_date(team_conn, name_to_id: dict, pick) -> "bool | None":
+    """Is this game's box score on the logged tip's US Eastern date?
 
-
-def _ensure_clv_columns(conn: sqlite3.Connection) -> None:
-    have = {r[1] for r in conn.execute("PRAGMA table_info(predictions_log)")}
-    for col, decl in _CLV_COLUMNS:
-        if have and col not in have:
-            conn.execute(f"ALTER TABLE predictions_log ADD COLUMN {col} {decl}")
-            logger.info("predictions_log: added column %s", col)
-
-
-def _american_to_decimal(price):
-    if price is None:
+    The grader accepts +/-1 day so a game moved a day still gets its result;
+    closing line value must not, because the market we logged against was for
+    the original date. None when the teams are unknown to the archive.
+    """
+    home_id = name_to_id.get((pick["home_team"] or "").strip().lower())
+    away_id = name_to_id.get((pick["away_team"] or "").strip().lower())
+    if not home_id or not away_id:
         return None
-    p = float(price)
-    if -1.0 < p < 1.0:
-        return None
-    return 1.0 + (p / 100.0 if p > 0 else 100.0 / -p)
+    row = team_conn.execute(
+        "SELECT 1 FROM team_game_advanced WHERE team_id = ? AND opp_team_id = ? "
+        "AND game_date = ? LIMIT 1",
+        (home_id, away_id, _et_date(pick["game_start_time_utc"])),
+    ).fetchone()
+    return row is not None
 
 
-def price_clv(odds_db: str = None) -> dict:
-    """Attach closing line value to logged predictions, from our own snapshots.
+def price_clv(odds_db: str = None, team_db: str = None, now=None) -> dict:
+    """Attach closing line value to graded predictions, from our own snapshots.
 
     WHAT THIS ASKS, AND WHY IT IS NOT ROI. Did we take a better price than the
     market's last one before tip? Return on investment needs hundreds of
     settled bets to say anything; closing line value says something after a few
-    dozen, and it does not depend on who won. The NFL ledger has had this since
-    it was built; the NBA, which is the actual product, has not.
+    dozen, and it does not depend on who won. It is evidence, not profit.
 
-        clv = (decimal price we logged / decimal price at the close) - 1
+    The rules -- what "the close" is, per book and for the consensus, the
+    30-minute limit, the fallbacks, when a pick settles and why it settles
+    once -- live in src/Utils/nba_clv.py (method bb-nba-clv-v1), with the four
+    numbers it stores. Until 2026-09-28 this function priced against the same
+    book's latest pre-tip row however old it was (the distance was recorded,
+    not enforced), had no no-vig or consensus figure, and re-priced any row
+    whose clv was still NULL every morning. The table was empty throughout, so
+    nothing it wrote needs revisiting.
 
-    so +0.02 means the price we had was 2% better on the same side.
-
-    HOW CLOSE IS "CLOSING". This is the honest part and the NBA-specific
-    problem. The recorder is schedule-aware as of today, but the archive still
-    contains snapshots taken hours before tip from when it was not, and a price
-    from eight hours out is not a closing price. So every row records
-    `closing_minutes_before_tip` next to the number. Nothing here decides what
-    is close enough -- that is a judgement for whoever reports it -- but the
-    distance travels with the figure instead of being lost, and a CLV computed
-    against a snapshot from the morning must be described that way.
-
-    Only predictions whose game has actually started are priced: before tip
-    there is no close, whatever the newest snapshot says.
-
-    WHICH PRICE, AND WHOSE. The close is the same book's last price before
-    tip -- never a better one from a book we did not log -- and each row
-    records `closing_provenance` so a CLV settled against a rebuilt price is
-    never pooled with one settled against a price we watched. Report the two
-    apart or not at all.
+    Only the CLV columns are written; the pick's own columns are frozen by
+    the predictions_log triggers and are never in the UPDATE.
     """
+    from src.Utils import nba_clv
+
     odds_db = odds_db or ODDS_DB
+    team_db = team_db or TEAM_DB
     if not os.path.exists(odds_db):
-        return {"priced": 0, "no_close": 0, "not_started": 0}
+        return {}
     conn = sqlite3.connect(odds_db)
     conn.row_factory = sqlite3.Row
-    counts = {"priced": 0, "no_close": 0, "not_started": 0, "no_price": 0}
+    team_conn = (sqlite3.connect(f"file:{team_db}?mode=ro", uri=True)
+                 if os.path.exists(team_db) else None)
     try:
-        _ensure_clv_columns(conn)
-        now = datetime.now(timezone.utc).isoformat()
-        rows = conn.execute(
-            "SELECT id, sportsbook, game_key, game_start_time_utc, home_team, "
-            "predicted_winner, home_ml, away_ml FROM predictions_log WHERE clv IS NULL"
-        ).fetchall()
-        for r in rows:
-            tip = r["game_start_time_utc"]
-            if not tip or tip > now:
-                counts["not_started"] += 1
-                continue
-            # Latest price before tip, and where two share a timestamp the
-            # one we watched wins. Ordering by captured_at alone was fine
-            # while the live recorder was the only writer; a repair inserts
-            # reconstructed rows today carrying last week's captured_at, and
-            # an arbitrary tiebreak would let a rebuilt price outrank a
-            # watched one. Same rule as odds_recorder.seal().
-            close = conn.execute(
-                "SELECT captured_at, home_ml, away_ml, "
-                "COALESCE(provenance, 'observed') AS provenance FROM odds_snapshots "
-                # Both sides go through one Clippers spelling. The prediction
-                # path (SbrOddsProvider) rewrites the team to "LA Clippers" and
-                # the closing-line recorder stores The Odds API's own name, so an
-                # exact game_key match could never find a Clippers close and every
-                # Clippers game would quietly count as no_close all season. The
-                # REPLACE is a no-op for the other 29 teams.
-                "WHERE REPLACE(game_key, 'Los Angeles Clippers', 'LA Clippers') = "
-                "      REPLACE(?, 'Los Angeles Clippers', 'LA Clippers') "
-                "AND sportsbook = ? AND captured_at < ? "
-                "AND home_ml IS NOT NULL AND away_ml IS NOT NULL "
-                "ORDER BY captured_at DESC, "
-                "         CASE COALESCE(provenance, 'observed') "
-                "              WHEN 'observed' THEN 0 ELSE 1 END, "
-                "         id DESC "
-                "LIMIT 1",
-                (r["game_key"], r["sportsbook"], tip),
-            ).fetchone()
-            if not close:
-                counts["no_close"] += 1
-                continue
-            on_home = (r["predicted_winner"] or "") == (r["home_team"] or "")
-            ours = r["home_ml"] if on_home else r["away_ml"]
-            theirs = close["home_ml"] if on_home else close["away_ml"]
-            d_ours, d_theirs = _american_to_decimal(ours), _american_to_decimal(theirs)
-            if d_ours is None or d_theirs is None or d_theirs <= 1.0:
-                counts["no_price"] += 1
-                continue
-            try:
-                gap = (datetime.fromisoformat(tip.replace("Z", "+00:00"))
-                       - datetime.fromisoformat(str(close["captured_at"]).replace("Z", "+00:00")
-                                                )).total_seconds() / 60.0
-            except ValueError:
-                gap = None
-            conn.execute(
-                "UPDATE predictions_log SET closing_home_ml=?, closing_away_ml=?, "
-                "closing_captured_at=?, closing_minutes_before_tip=?, "
-                "closing_provenance=?, clv=? WHERE id=?",
-                (close["home_ml"], close["away_ml"], close["captured_at"], gap,
-                 close["provenance"], (d_ours / d_theirs) - 1.0, r["id"]),
-            )
-            counts["priced"] += 1
-        conn.commit()
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='predictions_log'").fetchone():
+            return {}
+        if team_conn is None:
+            logger.warning("TeamData not found: no pick can be checked as played on its "
+                           "date, so none is priced today.")
+            return nba_clv.price_all(conn, lambda _p: None, now=now)
+        name_to_id = _team_name_to_id(team_conn)
+        return nba_clv.price_all(
+            conn, lambda p: _played_on_date(team_conn, name_to_id, p), now=now)
     finally:
         conn.close()
-    logger.info("closing line value: %s", counts)
-    return counts
+        if team_conn is not None:
+            team_conn.close()
 
 
 def grade(odds_db: str = None, team_db: str = None) -> int:

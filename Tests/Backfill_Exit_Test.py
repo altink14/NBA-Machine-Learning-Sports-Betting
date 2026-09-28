@@ -289,6 +289,8 @@ class DailyUpdateBackfillTest(unittest.TestCase):
              mock.patch.object(daily_update, "snapshot_odds_board", return_value="ok"), \
              mock.patch.object(daily_update, "refresh_periodic_ingests", return_value=True), \
              mock.patch.object(daily_update, "publish_ledger", return_value="skipped"), \
+             mock.patch.object(daily_update, "commit_logged_picks", return_value="nothing"), \
+             mock.patch.object(daily_update, "publish_commitments", return_value="skipped"), \
              mock.patch.object(daily_update, "run_preflight", return_value=0), \
              mock.patch.object(daily_update.logger, "error") as err:
             code = daily_update.main()

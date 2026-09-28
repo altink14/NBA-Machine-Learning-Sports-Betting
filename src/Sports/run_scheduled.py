@@ -114,6 +114,13 @@ JOBS = {
         # an hour we could not see instead of saying "ok".
         ("injury recorder (NBA)", ["src/Sports/nba/poll_injuries.py"]),
         ("predictions (NFL)", ["src/Sports/nfl/predict.py"]),
+        # Added 2026-09-28. An NBA pick logged after the 9am run (a game added
+        # to the slate, or a /predictions request on this PC) gets its hash
+        # commitment within the hour, still before its tip-off. Idempotent:
+        # nothing new means nothing written. Publishing says SKIPPED until
+        # LEDGER_PUBLISH_REPO is set.
+        ("commit ledger (NBA)", ["commit_ledger.py"]),
+        ("publish commitments", ["publish_commitments.py", "--publish"]),
         # Last in the job, so the public copy gets this hour's picks. Says
         # SKIPPED (exit 0) until a public server is configured.
         ("publish ledger", ["push_ledger.py"]),

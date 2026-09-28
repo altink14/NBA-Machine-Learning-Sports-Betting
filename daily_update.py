@@ -13,7 +13,9 @@ morning (e.g. 9 AM via Windows Task Scheduler):
 4. Refreshes the team-stats snapshot the prediction model reads.
 5. Grades yesterday's logged predictions against final scores.
 6. Runs today's predictions and logs them PRE-GAME to predictions_log, which is
-   the evidence behind the public track record.
+   the evidence behind the public track record. Then hash-commits them,
+   chained to the previous day (commit_ledger.py), and publishes the hashes
+   if a public copy is configured (publish_commitments.py; SKIPPED until then).
 7. Re-runs any periodic ingest that has come due (refresh_registry.py) - the
    datasets with no live feed, like the Hall of Fame register.
 
@@ -464,6 +466,60 @@ def run_integrity_audit(season: str) -> int:
         return -1
 
 
+def commit_logged_picks() -> str:
+    """Hash-commit the picks just logged, chained to the last commitment.
+
+    'committed' | 'nothing' | 'failed'. Added 2026-09-28 (commit_ledger.py,
+    src/Utils/ledger_commit.py): it is what lets anyone check, once a day's
+    games have started, that the picks on the record are the ones we logged.
+    It runs right after logging and before the push, so the public copy
+    carries the commitment before the first tip. A failure never stops
+    anything else (the picks are already logged and still guarded by the
+    triggers) but it does turn the run red: a day without a commitment is a
+    day the record cannot be verified.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "commit_ledger.py")],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+            encoding="utf-8", errors="replace")
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        if r.returncode != 0:
+            for ln in lines or [(r.stderr or "").strip()[-300:]]:
+                logger.error("Ledger commitment: %s", ln)
+            return "failed"
+        for ln in lines:
+            logger.info("Ledger commitment: %s", ln)
+        return "nothing" if any(ln.startswith("NOTHING TO COMMIT") for ln in lines) else "committed"
+    except Exception as exc:
+        logger.error("Ledger commitment could not run: %s", exc, exc_info=True)
+        return "failed"
+
+
+def publish_commitments() -> str:
+    """Publish the commitment hashes to the owner's public repository.
+
+    'published' | 'skipped' | 'failed'. Says SKIPPED until LEDGER_PUBLISH_REPO
+    is set (publish_commitments.py; DEPLOY.md "Publishing the pick
+    commitments"), which is the owner's one switch.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "publish_commitments.py"), "--publish"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+            encoding="utf-8", errors="replace")
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        last = lines[-1] if lines else (r.stderr or "").strip()[-300:]
+        if r.returncode != 0:
+            logger.error("Commitment publish: %s", last)
+            return "failed"
+        logger.info("Commitment publish: %s", last)
+        return "skipped" if last.startswith("SKIPPED") else "published"
+    except Exception as exc:
+        logger.error("Commitment publish could not run: %s", exc, exc_info=True)
+        return "failed"
+
+
 def publish_ledger() -> str:
     """Mirror the ledger to the public server. 'published' | 'skipped' | 'failed'.
 
@@ -522,6 +578,10 @@ def main() -> int:
     stats_ok = refresh_team_stats_snapshot()
     grading_ok = grade_logged_predictions()
     prediction_status = log_todays_predictions()
+    # Straight after logging, whatever its status: a "failed" run may still
+    # have written some rows, and those deserve a commitment before tip-off.
+    commit_status = commit_logged_picks()
+    commitments_published = publish_commitments()
     odds_status = snapshot_odds_board()
     ingests_ok = refresh_periodic_ingests()
     # After everything that writes OddsData (grading, logging, the board
@@ -551,6 +611,10 @@ def main() -> int:
         failures.append("periodic ingests")
     if ledger_status == "failed":
         failures.append("ledger publish")
+    if commit_status == "failed":
+        failures.append("ledger commitment")
+    if commitments_published == "failed":
+        failures.append("commitment publish")
 
     if failures:
         logger.error("=== Daily update finished WITH ERRORS: %s ===", ", ".join(failures))

@@ -283,6 +283,8 @@ class DailyUpdateBackfillTest(unittest.TestCase):
         _FixedDate.fixed = today
         with mock.patch.object(daily_update, "date", _FixedDate), \
              mock.patch.object(daily_update, "run_backfill", side_effect=fake_backfill), \
+             mock.patch.object(daily_update, "espn_box_score_fallback", return_value=("covered", 0)), \
+             mock.patch.object(daily_update, "refresh_play_by_play", return_value=True), \
              mock.patch.object(daily_update, "refresh_team_stats_snapshot", return_value=True), \
              mock.patch.object(daily_update, "grade_logged_predictions", return_value=True), \
              mock.patch.object(daily_update, "log_todays_predictions", return_value="logged"), \

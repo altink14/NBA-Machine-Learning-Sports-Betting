@@ -35,8 +35,8 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date
-from typing import Optional
+from datetime import date, timedelta
+from typing import Optional, Tuple
 
 # Every child process this job starts writes UTF-8. Scheduled tasks run
 # without PYTHONIOENCODING, so children printed in the console code page; the
@@ -155,6 +155,93 @@ def refresh_team_stats_snapshot() -> bool:
     except Exception as exc:
         logger.error("Team-stats refresh failed: %s", exc, exc_info=True)
         return False
+
+
+#: The ESPN fallback checks at least this many days back, so a game that
+#: failed a few mornings ago is still picked up; it reaches back to the
+#: newest nba.com box score of the season (at most ESPN_MAX_LOOKBACK_DAYS)
+#: so a longer outage is covered from its first day.
+ESPN_LOOKBACK_DAYS = 10
+ESPN_MAX_LOOKBACK_DAYS = 45
+
+
+def espn_box_score_fallback(season: str, today: Optional[date] = None, client=None,
+                            db_path: Optional[str] = None) -> Tuple[str, int]:
+    """Fetch from ESPN the finished games the nba.com backfill did not land.
+
+    Runs only when the backfill step failed: stats.nba.com refused us (the
+    outbound guard's budget or circuit breaker, LiveFetchDisabled) or could
+    not be reached. Added 2026-09-28 after nba.com's edge blocked this PC.
+    ESPN rows go in their own tables with source = 'espn' and are read only
+    for games box_scores does not hold (src/Utils/espn_boxscore.py), so they
+    can never overwrite or mix with nba.com's.
+
+    Returns (status, games stored): 'covered' (every final game found was
+    stored or is already held), 'partial' (some could not be read),
+    'unavailable' (ESPN could not be read at all), 'skipped' (no NBA games
+    expected), 'failed' (the step itself broke). Never raises.
+    """
+    today = today or date.today()
+    if not _nba_games_expected(today):
+        logger.info("ESPN box-score fallback: no NBA games expected; skipped.")
+        return "skipped", 0
+    try:
+        import sqlite3
+        from src.Utils import espn_boxscore
+        conn = sqlite3.connect(db_path or os.path.join(REPO_ROOT, "Data", "TeamData.sqlite"), timeout=30)
+        try:
+            newest = conn.execute("SELECT MAX(game_date) FROM box_scores WHERE season = ?",
+                                  (season,)).fetchone()[0]
+            season_start = date(int(season[:4]), 10, 1)
+            start = today - timedelta(days=ESPN_LOOKBACK_DAYS)
+            start = min(start, date.fromisoformat(str(newest)[:10])) if newest else season_start
+            start = max(start, today - timedelta(days=ESPN_MAX_LOOKBACK_DAYS), season_start)
+            days = [start + timedelta(days=i) for i in range((today - start).days)]
+            if not days:
+                return "covered", 0
+            try:
+                res = espn_boxscore.ingest_dates(conn, days, client)
+            except espn_boxscore.EspnUnavailable as exc:
+                logger.error("ESPN box-score fallback could not read ESPN: %s", exc)
+                return "unavailable", 0
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("ESPN box-score fallback failed: %s", exc, exc_info=True)
+        return "failed", 0
+    stored = res["stored"]
+    logger.warning(
+        "ESPN box-score fallback %s..%s: %d final game(s) seen, %d already from nba.com, %d already "
+        "from ESPN, %d stored now, %d held but not counted, %d failure(s); %d ESPN request(s).",
+        days[0], days[-1], res["final_events"], res["in_box_scores"], res["already_from_espn"],
+        len(stored), len(res["excluded"]), len(res["failed"]), res["requests"])
+    for g in stored:
+        logger.warning("  ESPN stands in for %s %s (%s)", g["game_date"], g["model_game_id"], g["season_type"])
+    for g in res["excluded"]:
+        logger.info("  ESPN game held, not counted: %s %s: %s", g["game_date"], g["model_game_id"],
+                    g["exclude_reason"])
+    for f in res["failed"]:
+        logger.error("  ESPN fallback failure: %s", f)
+    return ("partial" if res["failed"] else "covered"), len(stored)
+
+
+def rebuild_team_stats_from_archive() -> Optional[str]:
+    """Today's team-stats snapshot rebuilt from the box-score archive
+    (team_stats_from_archive.py), for mornings when nba.com's dashboard
+    refused us. Never replaces a table nba.com wrote; records its provenance
+    in team_stats_snapshot_source. Returns the table written, or None."""
+    try:
+        from team_stats_from_archive import refresh as rebuild
+        written = rebuild()
+        if written:
+            logger.warning("Team-stats snapshot %s rebuilt FROM THE ARCHIVE (nba.com's dashboard "
+                           "could not be read).", written)
+        else:
+            logger.info("Archive rebuild: no completed games yet this season; nothing written.")
+        return written
+    except Exception as exc:
+        logger.error("Archive team-stats rebuild failed: %s", exc, exc_info=True)
+        return None
 
 
 def log_todays_predictions() -> str:
@@ -574,8 +661,28 @@ def main() -> int:
     # April-June only, so the rest of the year costs nothing.
     if date.today().month in (4, 5, 6):
         backfill_ok = run_backfill(season, "Playoffs") and backfill_ok
+    # Only when nba.com's box scores did not all land. On a normal morning
+    # this does nothing at all.
+    espn_status, espn_games = (None, 0)
+    if not backfill_ok:
+        espn_status, espn_games = espn_box_score_fallback(season)
     pbp_ok = refresh_play_by_play(season)
     stats_ok = refresh_team_stats_snapshot()
+    stats_source = "nba.com"
+    if not stats_ok:
+        # Same arithmetic nba.com's dashboard does, on the box scores we
+        # hold (99.97% of cells identical across 4,015 stored snapshots).
+        # Counted as a success only when those box scores are complete: a
+        # rebuild missing last night's games is a stale table, and stale
+        # input returning a plausible value is the bug this project keeps
+        # meeting.
+        if rebuild_team_stats_from_archive():
+            stats_source = "archive rebuild"
+            stats_ok = backfill_ok or espn_status == "covered"
+            if not stats_ok:
+                logger.error("The archive rebuild ran on an archive that is missing games (nba.com "
+                             "failed and the ESPN fallback was %s); today's team stats may be stale.",
+                             espn_status)
     grading_ok = grade_logged_predictions()
     prediction_status = log_todays_predictions()
     # Straight after logging, whatever its status: a "failed" run may still
@@ -596,7 +703,10 @@ def main() -> int:
     if not grading_ok:
         failures.append("grading / CLV")
     if not backfill_ok:
-        failures.append("backfill")
+        # Still a failure when ESPN covered it: nba.com did not answer, and
+        # the pages that read nba.com's advanced box score have nothing new.
+        failures.append("backfill" if espn_status is None
+                        else f"backfill (ESPN fallback {espn_status}: {espn_games} game(s))")
     if not stats_ok:
         failures.append("team-stats refresh")
     if not pbp_ok:
@@ -619,14 +729,16 @@ def main() -> int:
     if failures:
         logger.error("=== Daily update finished WITH ERRORS: %s ===", ", ".join(failures))
         return 1
-    logger.info("=== Daily update finished OK (predictions: %s, preflight: %s, audit: %s) ===",
+    logger.info("=== Daily update finished OK (predictions: %s, preflight: %s, audit: %s%s) ===",
                 prediction_status,
                 "clean" if preflight_wrong == 0
                 else "COULD NOT RUN" if preflight_wrong < 0
                 else f"{preflight_wrong} WRONG",
                 "clean" if audit_failed == 0
                 else "COULD NOT RUN" if audit_failed < 0
-                else f"{audit_failed} FAILED")
+                else f"{audit_failed} FAILED",
+                # Only on a morning nba.com's dashboard refused us.
+                "" if stats_source == "nba.com" else f", team stats: {stats_source}")
     return 0
 
 

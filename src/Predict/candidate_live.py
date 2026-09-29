@@ -46,6 +46,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from src.Utils import espn_boxscore
+
 logger = logging.getLogger(__name__)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -82,6 +84,7 @@ class CandidateLive:
         self.n_base = len(self.bm.FEATURE_ORDER)
         self._iso = self.config['calibrator']['isotonic']
         self._tg_max_date: Optional[str] = None
+        self._espn_stand_ins = 0
         self._refresh_locked()
 
     # ------------------------------------------------------------------ state
@@ -90,6 +93,12 @@ class CandidateLive:
         con = sqlite3.connect(_TEAMDATA_RO, uri=True)
         try:
             tg = self.bm.load_team_games(con)
+            # Games nba.com has not supplied yet, from ESPN (the daily job's
+            # fallback while stats.nba.com refuses us; src/Utils/espn_boxscore.py).
+            # Returns `tg` itself when there are none, which is every day
+            # nba.com answers: the state is then exactly what it always was.
+            tg = espn_boxscore.merge_team_games(con, tg)
+            self._espn_stand_ins = espn_boxscore.stand_in_count(con)
         finally:
             con.close()
         canon = self.bm.team_canonical_map(tg, self.rf)
@@ -115,16 +124,24 @@ class CandidateLive:
         logger.info(
             "CandidateLive state: %d team-game rows through %s; Elo continuation %d games",
             len(tg), self._tg_max_date, cont['n_continuation_games'])
+        if self._espn_stand_ins:
+            logger.warning("CandidateLive: %d game(s) in these inputs are ESPN box scores standing "
+                           "in for nba.com's.", self._espn_stand_ins)
 
     def _maybe_refresh(self) -> None:
         con = sqlite3.connect(_TEAMDATA_RO, uri=True)
         try:
-            row = con.execute("SELECT MAX(game_date) FROM box_scores").fetchone()
+            newest = espn_boxscore.latest_game_date(con)
+            stand_ins = espn_boxscore.stand_in_count(con)
         finally:
             con.close()
-        if row and row[0] and str(row[0]) != self._tg_max_date:
-            logger.info("box_scores advanced (%s -> %s); rebuilding candidate state",
-                        self._tg_max_date, row[0])
+        # The ESPN count is always 0 when nba.com is answering, so then this
+        # is the old test (newest box-score date) unchanged. It also catches an
+        # ESPN game landing on the newest date, or nba.com's own box score
+        # replacing an ESPN one, which the date alone would not.
+        if newest and (str(newest) != self._tg_max_date or stand_ins != self._espn_stand_ins):
+            logger.info("box_scores advanced (%s -> %s, ESPN stand-ins %d -> %d); rebuilding candidate state",
+                        self._tg_max_date, newest, self._espn_stand_ins, stand_ins)
             self._refresh_locked()
 
     # ------------------------------------------------------------- components

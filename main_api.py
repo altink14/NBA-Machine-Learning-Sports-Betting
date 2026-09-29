@@ -1065,6 +1065,14 @@ class PredictionRunner:
                     ORDER BY b.game_date DESC
                     """
                 ).fetchall()
+                # ESPN box scores standing in for games nba.com has not
+                # supplied (the daily job's fallback, src/Utils/espn_boxscore.py):
+                # the same games candidate_live's back-to-back and 3-in-4 see.
+                # Empty whenever nba.com is answering.
+                from src.Utils import espn_boxscore
+                espn_rows = espn_boxscore.team_date_rows(conn)
+                if espn_rows:
+                    rows = sorted(list(rows) + espn_rows, key=lambda r: str(r["d"]), reverse=True)
             finally:
                 conn.close()
         except Exception as e:

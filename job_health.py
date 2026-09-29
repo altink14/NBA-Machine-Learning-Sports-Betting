@@ -864,6 +864,62 @@ def check_archive_freshness(now: datetime, db: str = TEAM_DB) -> Dict[str, Any]:
                   f"than two days has play-by-play{tail}.", **ev)
 
 
+#: How far back the box-score source check looks.
+SOURCE_WINDOW_DAYS = 14
+
+
+def check_box_score_sources(now: datetime, db: str = TEAM_DB) -> Dict[str, Any]:
+    """Where the model's recent inputs came from: nba.com, or ESPN standing in.
+
+    Added 2026-09-28 with the ESPN fallback (src/Utils/espn_boxscore.py) and
+    the archive rebuild of the team-stats snapshot (team_stats_from_archive.py).
+    Both keep the picks going while stats.nba.com refuses us, and both are
+    exact to what the model reads; but a pick made from them was not made
+    from nba.com's own numbers, and that must be visible, not assumed. WARN,
+    not FAIL: the inputs are sound, the source is the news.
+    """
+    name = "Model inputs: which source each recent game came from"
+    today = now.astimezone().date()
+    since = (today - timedelta(days=SOURCE_WINDOW_DAYS)).isoformat()
+    try:
+        from src.Utils import espn_boxscore
+        conn = _ro(db)
+        try:
+            rep = espn_boxscore.recent_sources(conn, since)
+            newest = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB "
+                                  "'[12][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]' ORDER BY name DESC LIMIT 1").fetchone()
+            snap = None
+            if newest and _has_table(conn, "team_stats_snapshot_source"):
+                snap = conn.execute("SELECT source, games_through, n_games, n_games_espn FROM "
+                                    "team_stats_snapshot_source WHERE table_name=?", (newest[0],)).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return _check("input_sources", name, UNKNOWN, f"Cannot read the archive: {exc}")
+    ev = dict(since=since, nba_com_games=rep["nba_com"], espn_standing_in=rep["espn_only"],
+              espn_superseded_by_nba_com=rep["espn_shadowed"], espn_held_not_counted=rep["espn_excluded"],
+              espn_games=rep["espn_only_games"][:20] or None,
+              newest_snapshot=newest[0] if newest else None,
+              snapshot_source=(snap[0] if snap else "nba.com leaguedashteamstats"),
+              snapshot_espn_games=(snap[3] if snap else 0))
+    notes: List[str] = []
+    if rep["espn_only"]:
+        notes.append(f"{rep['espn_only']} game(s) since {since} are ESPN box scores standing in for "
+                     f"nba.com's (e.g. {', '.join(rep['espn_only_games'][:3])}); nba.com has "
+                     f"{rep['nba_com']}.")
+    if snap:
+        notes.append(f"The newest team-stats snapshot {newest[0]} was rebuilt from the archive, not "
+                     f"read from nba.com ({snap[2]} games through {snap[1]}, {snap[3]} of them from ESPN).")
+    if notes:
+        return _check("input_sources", name, WARN, " ".join(notes), **ev)
+    tail = f" {rep['espn_shadowed']} earlier ESPN stand-in(s) have since been replaced by nba.com's." \
+        if rep["espn_shadowed"] else ""
+    games = (f"no games since {since}" if not rep["nba_com"]
+             else f"since {since}, all {rep['nba_com']} game(s) are nba.com box scores")
+    return _check("input_sources", name, OK,
+                  f"No ESPN stand-ins: {games}, and the newest team-stats snapshot is nba.com's.{tail}", **ev)
+
+
 def check_odds_heartbeat(now: datetime, db: str = ODDS_DB) -> Dict[str, Any]:
     """The daily update's NBA board snapshot leaves an odds_polls row whether
     it succeeds or fails (the heartbeat added 2026-09-27)."""
@@ -1115,6 +1171,7 @@ def _collect(now: Optional[datetime] = None, sched: Optional[Dict[str, Any]] = N
         "daily_update": lambda runs: [
             _safe(lambda: check_team_stats_snapshot(now), "team_stats", "Team stats"),
             _safe(lambda: check_archive_freshness(now), "archive", "Archive"),
+            _safe(lambda: check_box_score_sources(now), "input_sources", "Model input sources"),
             _safe(lambda: check_nba_predictions_log(now), "nba_predictions", "NBA predictions"),
             _safe(lambda: check_odds_heartbeat(now), "odds_heartbeat", "Odds heartbeat"),
             _safe(lambda: check_periodic_ingests(now), "ingests", "Periodic ingests"),

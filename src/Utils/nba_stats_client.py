@@ -101,6 +101,22 @@ class LiveFetchDisabled(RuntimeError):
         )
 
 
+class OutboundRefused(LiveFetchDisabled):
+    """The outbound guard (src/Utils/nba_outbound_guard.py) refused a
+    stats.nba.com request: today's or this hour's budget is spent, or the
+    circuit breaker is open after a run of failures. Nothing was sent."""
+
+    def __init__(self, message: str):
+        self.endpoint = None
+        RuntimeError.__init__(self, message)
+
+
+from src.Utils import nba_outbound_guard as _outbound  # noqa: E402
+
+_outbound.OutboundRefused = OutboundRefused
+_outbound._refused = OutboundRefused
+
+
 def install_live_guard() -> None:
     """Make every nba_api stats.nba.com request honour the switch.
 
@@ -121,7 +137,18 @@ def install_live_guard() -> None:
     def guarded(self, endpoint, *args, **kwargs):
         if not live_fetch_enabled():
             raise LiveFetchDisabled(str(endpoint))
-        return original(self, endpoint, *args, **kwargs)
+        # Every stats.nba.com request in every process passes here, so the
+        # budget and the circuit breaker (2026-09-28, after a 12,000-request
+        # backfill got this PC's address blocked) cannot be bypassed.
+        _outbound.before_request(str(endpoint))
+        try:
+            response = original(self, endpoint, *args, **kwargs)
+        except Exception as exc:
+            _outbound.record_result(False, f"{type(exc).__name__}: {exc}")
+            raise
+        ok = _outbound.response_ok(response)
+        _outbound.record_result(ok, "" if ok else f"HTTP {getattr(response, '_status_code', None)} from {endpoint}")
+        return response
 
     guarded._live_guard = True
     NBAStatsHTTP.send_api_request = guarded
@@ -391,6 +418,10 @@ class NBAStatsClient:
                     
                     _write_cache(cache_file, data)
                     return data
+                except LiveFetchDisabled:
+                    # Refused before anything was sent (switch off, budget
+                    # spent, breaker open): retrying would only wait.
+                    raise
                 except Exception as exc:
                     self._last_request_time = time.time()
                     if attempt < _MAX_RETRIES:

@@ -418,6 +418,19 @@ class NBAStatsClient:
                     
                     _write_cache(cache_file, data)
                     return data
+                except OutboundRefused:
+                    # The outbound guard refused (breaker open or budget
+                    # spent) before anything was sent. The mirror answers
+                    # exactly as it does with live fetching switched off: it is
+                    # the same deliberate copy the public server reads. Without
+                    # this, the home PC served 503 for the 2026-27 schedule it
+                    # held a copy of, all through the 2026-09 nba.com block.
+                    mirrored = read_mirror(endpoint_name, params)
+                    if mirrored is not None:
+                        logger.info("nba.com request refused by the outbound guard; mirror HIT: %s",
+                                    endpoint_name)
+                        return mirrored
+                    raise
                 except LiveFetchDisabled:
                     # Refused before anything was sent (switch off, budget
                     # spent, breaker open): retrying would only wait.

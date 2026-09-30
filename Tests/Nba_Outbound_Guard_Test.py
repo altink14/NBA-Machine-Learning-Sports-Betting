@@ -134,6 +134,27 @@ class GuardTest(unittest.TestCase):
                 c._fetch("x", Endpoint, {"a": 1})
         slept.assert_not_called()
 
+    def test_a_refusal_falls_back_to_the_mirror(self):
+        """Breaker open on the home PC: the mirrored copy answers, as it does
+        with live fetching off (the 2026-27 schedule 503'd without this)."""
+        c = client.NBAStatsClient(rate_delay=0)
+
+        class Endpoint:
+            def __init__(self, **kw):
+                raise client.OutboundRefused("paused")
+
+        with mock.patch.object(client, "_read_cache", return_value=None), \
+                mock.patch.object(client, "live_fetch_enabled", return_value=True), \
+                mock.patch.object(client, "read_mirror", return_value={"leagueSchedule": {"x": 1}}) as mirror:
+            self.assertEqual(c._fetch("scheduleleaguev2", Endpoint, {"season": "2026-27"}),
+                             {"leagueSchedule": {"x": 1}})
+        mirror.assert_called_once()
+        with mock.patch.object(client, "_read_cache", return_value=None), \
+                mock.patch.object(client, "live_fetch_enabled", return_value=True), \
+                mock.patch.object(client, "read_mirror", return_value=None):
+            with self.assertRaises(client.OutboundRefused):     # no copy: still refused, still no retry
+                c._fetch("scheduleleaguev2", Endpoint, {"season": "2026-27"})
+
 
 if __name__ == "__main__":
     unittest.main()

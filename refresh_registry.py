@@ -212,6 +212,54 @@ def _officials() -> str:
     return f"{with_crew or 0} of {games} {season} games with a crew"
 
 
+def _game_summaries() -> str:
+    """Line scores, attendance, duration, national TV and inactive lists for
+    the newest season, from the game summaries already on disk.
+
+    No network: it reads the cache only. The officials job just before it is
+    what puts each new game's boxscoresummaryv3 there (v2 has been an empty
+    shell since 2025-04-10, so every crew comes from v3). Until 2026-09-29
+    this ingest had only ever been run by hand, which is how 1,203 of
+    2025-26's games had no attendance, line score or inactive list. Fails
+    only if the ingest itself fails; games still empty are counted, since the
+    newest night's summaries can lag a day.
+    """
+    import subprocess
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        season = conn.execute("SELECT MAX(season) FROM box_scores").fetchone()[0]
+    finally:
+        conn.close()
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO_ROOT, "src", "Process-Data", "ingest_game_summaries.py"),
+         "--season", season],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800,
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "ingest_game_summaries failed")[-300:])
+    return _summary_coverage(DB_PATH, season)
+
+
+def _summary_coverage(db_path: str, season: str) -> str:
+    """'<season>: N of M games with a line score (K from v3), E empty'."""
+    conn = sqlite3.connect(db_path)
+    try:
+        games, with_line, from_v3 = conn.execute(
+            """
+            SELECT COUNT(*),
+                   SUM(EXISTS (SELECT 1 FROM game_line_scores l
+                               WHERE l.game_id = b.game_id AND l.pts IS NOT NULL)),
+                   SUM(EXISTS (SELECT 1 FROM game_info i
+                               WHERE i.game_id = b.game_id AND i.source = 'boxscoresummaryv3'))
+            FROM box_scores b WHERE b.season = ?
+            """, (season,)).fetchone()
+    finally:
+        conn.close()
+    games, with_line, from_v3 = games or 0, with_line or 0, from_v3 or 0
+    return (f"{season}: {with_line} of {games} games with a line score "
+            f"({from_v3} from v3), {games - with_line} empty")
+
+
 def _server_mirror() -> str:
     """The public server's copy of the league-wide stats.nba.com tables.
 
@@ -254,6 +302,8 @@ JOBS: List[Job] = [
     Job("draft_bios", 7, _draft_bios, "Bios for the newest picks appear over the weeks after the draft"),
     Job("player_bios", 7, _player_bios, "Current-season bios; historical buckets never change"),
     Job("officials", 1, _officials, "New games need their crews; the newest can lag a day"),
+    # After officials: that job is what caches each new game's v3 summary.
+    Job("game_summaries", 1, _game_summaries, "New games need line scores, attendance and inactive lists"),
     Job("server_mirror", 1, _server_mirror, "The public server cannot reach stats.nba.com; it reads this copy"),
 ]
 

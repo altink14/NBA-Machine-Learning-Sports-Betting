@@ -2722,8 +2722,9 @@ def get_game_line_score(game_id: str):
             h, a = by_side.get("home"), by_side.get("away")
             # Since the v2 summary feed died (2025-04-10) nba.com answers with an
             # empty shell: the rows exist but every quarter and the total are NULL.
-            # NULL is "unknown", never 0, so such a row is skipped and the
-            # play-by-play below supplies the quarters instead.
+            # The ingest fills those from the v3 summary where one is cached; a
+            # shell left over (e.g. 0022500259-61) is "unknown", never 0, so it is
+            # skipped and the play-by-play below supplies the quarters instead.
             usable = h is not None and a is not None and all(
                 r[c] is not None for r in (h, a) for c in ("q1", "q2", "q3", "q4", "pts")
             )
@@ -2824,7 +2825,8 @@ def get_game_info(game_id: str):
         "game_id": game_id, "available": True,
         "attendance": info["attendance"],
         # "0:00" is what the dead v2 summary feed returns for every game since
-        # 2025-04-10 (1,212 of 2025-26's games): unknown, not a zero-minute game.
+        # 2025-04-10 (the ingest now takes those games from v3; three shells and
+        # one v3 "0:00" remain): unknown, not a zero-minute game.
         "game_time": None if shell else info["game_time"],
         "natl_tv": info["natl_tv"],
         "inactives": list(by_team.values()),
@@ -4026,8 +4028,9 @@ def get_player_availability(id: int, seasons: int = 6):
                     "SELECT COUNT(*) FROM box_scores WHERE season = ? AND season_type = 'Regular Season' "
                     "AND (home_team_id = ? OR away_team_id = ?)", (season, tid, tid)).fetchone()[0]
             # Share of the season's games with at least one inactive listed,
-            # league-wide. A normal season is 97-100%; 2025-26 is 2% because
-            # the feed stopped carrying the list, and 2004-05 is 5%.
+            # league-wide. A normal season is 97-100%; 2004-05 is 5%. 2025-26
+            # read 2% until 2026-09-29, when its lists came in from the v3
+            # summary (v2 stopped carrying them on 2025-04-10).
             cov = conn.execute(
                 """
                 SELECT COUNT(DISTINCT b.game_id) AS total, COUNT(DISTINCT i.game_id) AS with_list

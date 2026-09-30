@@ -645,6 +645,12 @@ class PredictionLogRow(Contract):
     clv_consensus_status: Optional[str] = None
     clv_method: Optional[str] = None
     clv_settled_at: Optional[str] = None
+    # Where the final score came from (grade_predictions, 2026-09-29): 'nba.com'
+    # or 'espn' (NULL = graded before the column, which was nba.com).
+    result_source: Optional[str] = None
+    result_source_ref: Optional[str] = None
+    result_confirmed_at: Optional[str] = None
+    result_conflict: Optional[str] = None
 
 
 class PredictionLogSummary(Contract):

@@ -97,6 +97,9 @@ class ContractShapeTest(unittest.TestCase):
             clv = {col for col, _ in nba_clv.CLV_COLUMNS}
         except ImportError:
             clv = set()
+        # So do the grade-source columns (grade_predictions.GRADE_COLUMNS, 2026-09-29).
+        import grade_predictions
+        clv |= {col for col, _ in grade_predictions.GRADE_COLUMNS}
         fields = ac.PredictionLogRow.model_fields
         required = {n for n, f in fields.items() if f.is_required()}
         self.assertEqual(required, served | {"sealed_until_tipoff"})

@@ -80,7 +80,7 @@ class _ClvCase(unittest.TestCase):
         c = sqlite3.connect(self.team_db)
         c.execute("CREATE TABLE IF NOT EXISTS team_metadata (team_id INTEGER, full_name TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS team_game_advanced (team_id INTEGER, "
-                  "opp_team_id INTEGER, pts INTEGER, opp_pts INTEGER, game_date TEXT)")
+                  "opp_team_id INTEGER, pts INTEGER, opp_pts INTEGER, game_date TEXT, game_id TEXT)")
         c.execute("DELETE FROM team_metadata")
         c.executemany("INSERT INTO team_metadata VALUES (?, ?)", [(1, HOME), (2, AWAY)])
         c.commit()
@@ -90,7 +90,7 @@ class _ClvCase(unittest.TestCase):
         """The game's final, on the logged tip's Eastern date (+ days_late)."""
         d = real_datetime.fromisoformat(gp._et_date(_iso(self.tip))) + timedelta(days=days_late)
         c = sqlite3.connect(self.team_db)
-        c.execute("INSERT INTO team_game_advanced VALUES (1, 2, 112, 104, ?)",
+        c.execute("INSERT INTO team_game_advanced VALUES (1, 2, 112, 104, ?, '0022600001')",
                   (d.date().isoformat(),))
         c.commit()
         c.close()

@@ -90,10 +90,13 @@ class BackfillSummary:
     not_final: List[str] = field(default_factory=list)
     failed: Dict[str, str] = field(default_factory=dict)
     #: Already-stored games whose game_date disagrees with the league game
-    #: log: {game_id: (stored, log)}. Reported loudly but NOT a failure -- the
-    #: rows predate this check and re-running the backfill cannot correct them
-    #: (see the note in find_date_disagreements).
+    #: log and could NOT be corrected, because the log does not prove the
+    #: date (see correctable_date): {game_id: (stored, log)}. Reported loudly
+    #: but not a failure.
     date_disagreements: Dict[str, tuple] = field(default_factory=dict)
+    #: Already-stored games whose game_date this run corrected to the league
+    #: game log's: {game_id: (was, now)}.
+    date_corrections: Dict[str, tuple] = field(default_factory=dict)
 
     @property
     def game_ids(self) -> List[str]:
@@ -116,6 +119,12 @@ class BackfillSummary:
             out.append(f"  FAILED     {gid}: {why}")
         if len(self.failed) > 25:
             out.append(f"  ... and {len(self.failed) - 25} more failed game(s)")
+        if self.date_corrections:
+            out.append(
+                f"  CORRECTED  {len(self.date_corrections)} stored game(s) moved to the league "
+                f"game log's date (was -> now): "
+                + ", ".join(f"{g} {s}->{l}" for g, (s, l) in
+                            sorted(self.date_corrections.items())[:15]))
         if self.date_disagreements:
             out.append(
                 f"  WARNING    {len(self.date_disagreements)} stored game(s) carry a game_date "
@@ -135,35 +144,106 @@ def _is_stored(db_path: str, game_id: str) -> bool:
         conn.close()
 
 
+#: Every table that holds a per-game copy of the box score's game_date. A date
+#: correction has to reach all of them at once, or the date browser, Elo and
+#: rest-day ordering, player logs and scoring runs would disagree with each
+#: other instead of with the league.
+GAME_DATE_TABLES = ("box_scores", "team_game_advanced", "player_game_log", "scoring_runs")
+
+
+def _day(value) -> str:
+    return (value or "").split("T")[0]
+
+
+def _date_tables(conn) -> List[str]:
+    """GAME_DATE_TABLES that exist in this database (scoring_runs is created
+    by the play-by-play ingest, not by ensure_schema)."""
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return [t for t in GAME_DATE_TABLES if t in have]
+
+
 def find_date_disagreements(db_path: str, season: str, season_type: str,
                             log_dates: Dict[str, str]) -> Dict[str, tuple]:
-    """Stored games of this season/type whose game_date differs from the log.
+    """Stored games of this season/type whose game_date differs from the log,
+    in ANY of GAME_DATE_TABLES: {game_id: (stored, log)}.
 
     Found 2026-09-23: eleven 2025-26 games (postponed and NBA Cup games,
     ingested 2026-07-07) carry their ORIGINAL schedule date -- 0022500651
     MEM-DEN is stored on 2026-01-25 but was played 2026-03-18 (the box
-    score's own gameCode says 20260318/DENMEM). A wrong date misplaces the
-    game on the date browser and in rest-day and Elo ordering, and a pick on a
-    rescheduled game would be looked up on the wrong day and never graded.
-    `process_game(overwrite=True)` would not fix it: team_game_advanced's
-    upsert does not update game_date. So this reports; repairing is a
-    separate, deliberate job.
+    score's own gameCode says 20260318/DENMEM). The stale date came from
+    boxscoresummaryv2, which still serves the pre-game shell (status 1,
+    original date) for those games; v3 and the league game log have the real
+    one. A wrong date misplaces the game on the date browser and in rest-day
+    and Elo ordering, and a pick on a rescheduled game would be looked up on
+    the wrong day and never graded. `process_game(overwrite=True)` would not
+    fix it: team_game_advanced's upsert does not update game_date. The
+    backfill corrects these through correct_game_dates when the log proves
+    the date (see correctable_date).
     """
     conn = get_connection(db_path)
     try:
-        rows = conn.execute(
-            "SELECT game_id, MIN(game_date) AS d FROM team_game_advanced "
-            "WHERE season = ? AND season_type = ? GROUP BY game_id",
-            (season, season_type)).fetchall()
+        stored: Dict[str, Set[str]] = {}
+        for t in _date_tables(conn):
+            if t == "team_game_advanced":
+                sql = ("SELECT DISTINCT game_id, game_date FROM team_game_advanced "
+                       "WHERE season = ? AND season_type = ?")
+            else:
+                sql = (f"SELECT DISTINCT x.game_id, x.game_date FROM {t} x "
+                       "WHERE x.game_id IN (SELECT game_id FROM team_game_advanced "
+                       "WHERE season = ? AND season_type = ?)")
+            for r in conn.execute(sql, (season, season_type)):
+                stored.setdefault(r["game_id"], set()).add(_day(r["game_date"]))
     finally:
         conn.close()
     out = {}
-    for r in rows:
-        want = (log_dates.get(r["game_id"]) or "").split("T")[0]
-        have = (r["d"] or "").split("T")[0]
-        if want and have != want:
-            out[r["game_id"]] = (have, want)
+    for gid, days in stored.items():
+        want = _day(log_dates.get(gid))
+        wrong = sorted(d for d in days if d != want)
+        if want and wrong:
+            out[gid] = (wrong[0], want)
     return out
+
+
+def correctable_date(log_days: Set[str], stored_score_problem: Optional[str]) -> bool:
+    """Whether the league game log PROVES a stored game's date.
+
+    Both conditions, or the disagreement is only reported:
+      * the log gives the game exactly one date (its two team rows agree), and
+      * the stored result is the log's result (check_stored_score is clean),
+        so the stored rows are the game the log is dating.
+    """
+    return len(log_days) == 1 and stored_score_problem is None
+
+
+def correct_game_dates(db_path: str, corrections: Dict[str, str]) -> Dict[str, int]:
+    """Set game_date to corrections[game_id] in every GAME_DATE_TABLES table,
+    in ONE transaction, then re-read. Any row still carrying another date
+    rolls the whole transaction back and raises. Returns rows changed per
+    table."""
+    changed = {}
+    conn = get_connection(db_path)
+    try:
+        tables = _date_tables(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        for t in tables:
+            n = 0
+            for gid, day in corrections.items():
+                n += conn.execute(f"UPDATE {t} SET game_date = ? WHERE game_id = ? "
+                                  "AND game_date IS NOT ?", (day, gid, day)).rowcount
+            changed[t] = n
+        for t in tables:
+            for gid, day in corrections.items():
+                left = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE game_id = ? "
+                                    "AND game_date IS NOT ?", (gid, day)).fetchone()[0]
+                if left:
+                    raise RuntimeError(f"{t}: {left} row(s) of {gid} still not on {day}")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return changed
 
 
 def check_stored_score(db_path: str, game_id: str, log_points: Dict[int, int]) -> Optional[str]:
@@ -220,6 +300,7 @@ def backfill_games(
 
     unique_game_ids: Set[str] = set()
     game_dates: Dict[str, str] = {}
+    log_days: Dict[str, Set[str]] = {}
     has_result: Dict[str, bool] = {}
     log_points: Dict[str, Dict[int, int]] = {}
     for row in game_log_rows:
@@ -229,6 +310,7 @@ def backfill_games(
         unique_game_ids.add(gid)
         if row.get("GAME_DATE"):
             game_dates[gid] = row["GAME_DATE"]
+            log_days.setdefault(gid, set()).add(_day(row["GAME_DATE"]))
         if row.get("WL") in ("W", "L"):
             has_result[gid] = True
             if row.get("TEAM_ID") is not None and row.get("PTS") is not None:
@@ -288,14 +370,24 @@ def backfill_games(
             summary.ingested.append(game_id)
 
     disagreements = find_date_disagreements(db_path, season, season_type, game_dates)
+    provable: Dict[str, str] = {}
     for gid, (have, want) in disagreements.items():
         if gid in summary.ingested:
             # Written by this run from the log's own date, so a disagreement
             # here is a defect in the write, not legacy data.
             summary.ingested.remove(gid)
             summary.failed[gid] = f"stored game_date {have} but the league game log says {want}"
+        elif correctable_date(log_days.get(gid, set()),
+                              check_stored_score(db_path, gid, log_points.get(gid, {}))):
+            provable[gid] = want
         else:
             summary.date_disagreements[gid] = (have, want)
+    if provable:
+        changed = correct_game_dates(db_path, provable)
+        logger.warning("Corrected game_date of %d stored game(s) to the league game log's "
+                       "(rows per table: %s)", len(provable), changed)
+        for gid, want in provable.items():
+            summary.date_corrections[gid] = (disagreements[gid][0], want)
 
     logger.info(
         "Finished game processing. Total: %d, Ingested: %d, Already present: %d, "

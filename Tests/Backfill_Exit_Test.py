@@ -88,6 +88,34 @@ class _Harness(unittest.TestCase):
         finally:
             conn.close()
 
+    def store_dated_copies(self, game_id, game_date, player_log_date=None):
+        """The other per-game copies of game_date: box_scores, one
+        player_game_log row, one scoring_runs row (that table is created by
+        the play-by-play ingest, so it is made here)."""
+        conn = get_connection(self.db)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS scoring_runs "
+                         "(id INTEGER PRIMARY KEY, game_id TEXT, game_date TEXT)")
+            conn.execute("INSERT INTO box_scores (game_id, fetched_at, home_team_id, away_team_id, "
+                         "season, season_type, game_date) VALUES (?,?,?,?,?,?,?)",
+                         (game_id, "t", HOME, AWAY, "2023-24", "PlayIn", game_date))
+            conn.execute("INSERT INTO player_game_log (game_id, player_id, team_id, game_date) "
+                         "VALUES (?,?,?,?)", (game_id, 1, HOME, player_log_date or game_date))
+            conn.execute("INSERT INTO scoring_runs (game_id, game_date) VALUES (?,?)",
+                         (game_id, game_date))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def stored_dates(self, game_id):
+        conn = get_connection(self.db)
+        try:
+            return {t: {r[0] for r in conn.execute(
+                        f"SELECT game_date FROM {t} WHERE game_id = ?", (game_id,))}
+                    for t in backfill._date_tables(conn)}
+        finally:
+            conn.close()
+
     def run_backfill(self, rows, season_type="PlayIn", **kw):
         client = mock.Mock()
         client.league_game_log.return_value = rows
@@ -177,13 +205,65 @@ class BackfillSummaryTest(_Harness):
         s = self.run_backfill(log_rows("0052300101", 110, 104, "2024-04-16"))
         self.assertIn("game_date", s.failed["0052300101"])
 
-    def test_an_old_wrong_date_is_a_warning_not_a_failure(self):
+    def test_an_old_wrong_date_the_log_proves_is_corrected(self):
+        # A postponed game stored under its original date, as 0022500651
+        # MEM-DEN was (2026-01-25 stored, played 2026-03-18).
         self.store("0052300101", 110, 104, "2024-04-01")
+        self.store_dated_copies("0052300101", "2024-04-01")
         s = self.run_backfill(log_rows("0052300101", 110, 104, "2024-04-16"))
-        self.assertEqual(s.date_disagreements, {"0052300101": ("2024-04-01", "2024-04-16")})
+        self.assertEqual(s.date_corrections, {"0052300101": ("2024-04-01", "2024-04-16")})
+        self.assertEqual(s.date_disagreements, {})
         self.assertEqual(s.failed, {})
         self.assertEqual(backfill.exit_code_for(s, False), backfill.EXIT_OK)
+        self.assertTrue(any(ln.lstrip().startswith("CORRECTED") for ln in s.lines()))
+        self.assertEqual(self.stored_dates("0052300101"),
+                         {t: {"2024-04-16"} for t in backfill.GAME_DATE_TABLES})
+        # And the next run finds nothing left to do.
+        s = self.run_backfill(log_rows("0052300101", 110, 104, "2024-04-16"))
+        self.assertEqual((s.date_corrections, s.date_disagreements), ({}, {}))
+
+    def test_a_wrong_date_in_one_derived_table_is_found_and_corrected(self):
+        self.store("0052300101", 110, 104, "2024-04-16")
+        self.store_dated_copies("0052300101", "2024-04-16", player_log_date="2024-04-15")
+        s = self.run_backfill(log_rows("0052300101", 110, 104, "2024-04-16"))
+        self.assertEqual(s.date_corrections, {"0052300101": ("2024-04-15", "2024-04-16")})
+        self.assertEqual(self.stored_dates("0052300101")["player_game_log"], {"2024-04-16"})
+
+    def test_a_date_the_log_contradicts_itself_on_is_only_reported(self):
+        self.store("0052300101", 110, 104, "2024-04-01")
+        rows = log_rows("0052300101", 110, 104, "2024-04-16")
+        rows[1]["GAME_DATE"] = "2024-04-17"
+        s = self.run_backfill(rows)
+        self.assertEqual(s.date_corrections, {})
+        self.assertIn("0052300101", s.date_disagreements)
+        self.assertEqual(self.stored_dates("0052300101")["team_game_advanced"], {"2024-04-01"})
         self.assertTrue(any(ln.lstrip().startswith("WARNING") for ln in s.lines()))
+
+    def test_a_date_on_a_game_whose_score_disagrees_is_only_reported(self):
+        # The stored rows may not be the game the log is dating: leave them.
+        self.store("0052300101", 110, 105, "2024-04-01")
+        s = self.run_backfill(log_rows("0052300101", 110, 104, "2024-04-16"))
+        self.assertEqual(s.date_corrections, {})
+        self.assertEqual(s.date_disagreements, {"0052300101": ("2024-04-01", "2024-04-16")})
+        self.assertEqual(self.stored_dates("0052300101")["team_game_advanced"], {"2024-04-01"})
+
+    def test_a_correction_that_cannot_complete_changes_nothing(self):
+        self.store("0052300101", 110, 104, "2024-04-01")
+        self.store_dated_copies("0052300101", "2024-04-01")
+        conn = get_connection(self.db)
+        try:
+            # A trigger that re-dates player rows after every write: the
+            # verify step must see it and roll every table back.
+            conn.execute("CREATE TRIGGER sabotage AFTER UPDATE OF game_date ON player_game_log "
+                         "BEGIN UPDATE player_game_log SET game_date = '1999-01-01' "
+                         "WHERE id = NEW.id; END")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(RuntimeError):
+            backfill.correct_game_dates(self.db, {"0052300101": "2024-04-16"})
+        self.assertEqual(self.stored_dates("0052300101"),
+                         {t: {"2024-04-01"} for t in backfill.GAME_DATE_TABLES})
 
     def test_an_empty_log_fails_only_when_games_are_expected(self):
         s = self.run_backfill([])
